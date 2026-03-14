@@ -1,10 +1,9 @@
 """Order executor for Polymarket CLOB.
 
-Handles the full order lifecycle: place → verify fill → resolve.
-Uses py-clob-client for all Polymarket interactions.
-
-Key principle: an order accepted by the book is NOT the same as an order
-that was filled. We never lie about what actually happened.
+v3 — Key changes:
+  - FOK (Fill or Kill) orders: fill instantly or cancel. No polling.
+  - Minimum 5 shares enforced (Polymarket CLOB requirement).
+  - Single verification call after FOK — no 30-second polling loop.
 """
 
 import time
@@ -21,32 +20,27 @@ from py_clob_client.clob_types import (
 from py_clob_client.constants import POLYGON
 
 
-# ── Order lifecycle states ──────────────────────────────────────────
+# ── Order states ────────────────────────────────────────────────────
 
-PLACED = "PLACED"       # Order accepted by the book, not yet matched
-FILLED = "FILLED"       # Fully matched — shares are ours
-PARTIAL = "PARTIAL"     # Some shares matched, some still on book
-CANCELLED = "CANCELLED" # We cancelled it or it expired
-FAILED = "FAILED"       # Never made it to the book
+FILLED = "FILLED"
+REJECTED = "REJECTED"
+CANCELLED = "CANCELLED"
+FAILED = "FAILED"
+
+# Polymarket CLOB minimum order size in shares
+MIN_SHARES = 5.0
 
 
 @dataclass
 class OrderResult:
-    """Tracks an order through its entire lifecycle.
-
-    `success` means the order was PLACED on the book.
-    `filled` means shares were actually MATCHED and we own them.
-    These are different things — that distinction is the whole point.
-    """
-    success: bool            # Was it placed on the book?
-    filled: bool = False     # Were shares actually matched?
+    success: bool            # Did shares actually change hands?
     order_id: str = ""
     status: str = FAILED
     side: str = ""
     price: float = 0.0
-    size_requested: float = 0.0   # Shares we asked for
-    size_filled: float = 0.0      # Shares we actually got
-    amount_spent: float = 0.0     # Actual USD committed
+    size_requested: float = 0.0
+    size_filled: float = 0.0
+    amount_spent: float = 0.0
     token_id: str = ""
     error: str = ""
     dry_run: bool = True
@@ -120,7 +114,7 @@ class Executor:
             print(f"[executor] Orderbook fetch failed: {e}")
             return 0.0, 0.0
 
-    # ── Place order ─────────────────────────────────────────────────
+    # ── Place FOK order ─────────────────────────────────────────────
 
     def place_order(
         self,
@@ -129,17 +123,25 @@ class Executor:
         price: float,
         amount_usd: float,
     ) -> OrderResult:
-        """Place a limit order on the book.
+        """Place a Fill-or-Kill order.
 
-        IMPORTANT: A successful return means the order was PLACED, not FILLED.
-        Call check_order() afterwards to verify if it actually matched.
+        FOK = fill the entire order immediately, or cancel it.
+        No sitting on the book. No polling. Instant truth.
+
+        Enforces Polymarket minimum of 5 shares.
         """
         shares = amount_usd / price
 
+        # ── Enforce minimum 5 shares ────────────────────────────────
+        if shares < MIN_SHARES:
+            shares = MIN_SHARES
+            amount_usd = shares * price
+            print(f"  📐 Bumped to minimum: {shares:.0f} shares (${amount_usd:.2f})")
+
+        # ── Dry run ─────────────────────────────────────────────────
         if self.dry_run:
             return OrderResult(
                 success=True,
-                filled=True,  # Dry run assumes instant fill
                 order_id=f"DRY-{int(time.time())}",
                 status=FILLED,
                 side=side,
@@ -152,8 +154,9 @@ class Executor:
             )
 
         if not self._initialized:
-            return OrderResult(success=False, error="Client not initialized")
+            return OrderResult(success=False, status=FAILED, error="Client not initialized")
 
+        # ── Live FOK order ──────────────────────────────────────────
         try:
             order_args = OrderArgs(
                 price=price,
@@ -163,157 +166,86 @@ class Executor:
             )
 
             signed_order = self.client.create_order(order_args)
-            result = self.client.post_order(signed_order, OrderType.GTC)
+            result = self.client.post_order(signed_order, OrderType.FOK)
 
             order_id = result.get("orderID", "")
             if not order_id:
                 return OrderResult(
                     success=False,
-                    status=FAILED,
+                    status=REJECTED,
                     error="No orderID in response",
                     side=side,
                     price=price,
                     token_id=token_id[:16] + "...",
                 )
 
+            # ── Single verification call ────────────────────────────
+            # FOK resolves instantly. One call to confirm fill details.
+            fill = self._check_order(order_id)
+
+            if fill:
+                size_matched = float(fill.get("size_matched", 0))
+                if size_matched > 0:
+                    fill_price = float(fill.get("price", price))
+                    return OrderResult(
+                        success=True,
+                        order_id=order_id,
+                        status=FILLED,
+                        side=side,
+                        price=fill_price,
+                        size_requested=shares,
+                        size_filled=size_matched,
+                        amount_spent=size_matched * fill_price,
+                        token_id=token_id[:16] + "...",
+                        dry_run=False,
+                    )
+
+            # FOK didn't match — no shares, no cost
             return OrderResult(
-                success=True,
-                filled=False,  # We don't know yet — must check
+                success=False,
                 order_id=order_id,
-                status=PLACED,
+                status=CANCELLED,
+                error="FOK not matched — no liquidity at this price",
                 side=side,
                 price=price,
                 size_requested=shares,
-                size_filled=0.0,
-                amount_spent=0.0,
                 token_id=token_id[:16] + "...",
                 dry_run=False,
             )
 
         except Exception as e:
+            error_msg = str(e)
+            if "lower than the minimum" in error_msg:
+                return OrderResult(
+                    success=False,
+                    status=REJECTED,
+                    error=f"Below minimum order size",
+                    side=side,
+                    price=price,
+                    token_id=token_id[:16] + "...",
+                )
             return OrderResult(
                 success=False,
                 status=FAILED,
-                error=str(e),
+                error=error_msg,
                 side=side,
                 price=price,
                 token_id=token_id[:16] + "...",
             )
 
-    # ── Check order fill status ─────────────────────────────────────
+    # ── Check order (single call) ───────────────────────────────────
 
-    def check_order(self, order_id: str) -> OrderResult:
-        """Check whether a placed order has been filled.
-
-        Queries the CLOB for the order's current state and returns
-        an honest account of what actually happened.
-        """
-        if not order_id or order_id.startswith("DRY-"):
-            return OrderResult(success=True, filled=True, status=FILLED, dry_run=True)
-
+    def _check_order(self, order_id: str) -> Optional[dict]:
+        """Single check of order status. Returns raw order dict or None."""
         if not self._initialized:
-            return OrderResult(success=False, error="Client not initialized")
-
+            return None
         try:
-            order = self.client.get_order(order_id)
-
-            status_raw = order.get("status", "UNKNOWN").upper()
-            size_matched = float(order.get("size_matched", 0))
-            original_size = float(order.get("original_size", order.get("size", 0)))
-            price = float(order.get("price", 0))
-            side = order.get("side", "")
-            token_id = order.get("asset_id", order.get("token_id", ""))
-
-            # Determine our canonical status
-            if status_raw in ("MATCHED", "FILLED"):
-                status = FILLED
-                filled = True
-            elif size_matched > 0:
-                status = PARTIAL
-                filled = True  # Partially filled still counts
-            elif status_raw in ("CANCELLED", "EXPIRED"):
-                status = CANCELLED
-                filled = False
-            else:
-                status = PLACED  # Still sitting on book
-                filled = False
-
-            return OrderResult(
-                success=True,
-                filled=filled,
-                order_id=order_id,
-                status=status,
-                side=side,
-                price=price,
-                size_requested=original_size,
-                size_filled=size_matched,
-                amount_spent=size_matched * price,
-                token_id=str(token_id)[:16] + "..." if token_id else "",
-                dry_run=False,
-            )
-
+            return self.client.get_order(order_id)
         except Exception as e:
-            return OrderResult(
-                success=False,
-                error=f"Order check failed: {e}",
-                order_id=order_id,
-            )
+            print(f"[executor] Order check failed: {e}")
+            return None
 
-    # ── Wait for fill with polling ──────────────────────────────────
-
-    def wait_for_fill(
-        self,
-        order_id: str,
-        timeout: float = 30.0,
-        poll_interval: float = 2.0,
-    ) -> OrderResult:
-        """Poll an order until it fills, times out, or is cancelled.
-
-        Returns the final state of the order. If it didn't fill within
-        the timeout, it gets cancelled automatically.
-        """
-        if not order_id or order_id.startswith("DRY-"):
-            return OrderResult(success=True, filled=True, status=FILLED, dry_run=True)
-
-        deadline = time.time() + timeout
-        last_result = None
-
-        while time.time() < deadline:
-            result = self.check_order(order_id)
-            last_result = result
-
-            if result.filled:
-                return result
-
-            if result.status in (CANCELLED, FAILED):
-                return result
-
-            time.sleep(poll_interval)
-
-        # Timed out — cancel the unfilled order
-        print(f"  ⏰ Order {order_id[:12]}... not filled after {timeout:.0f}s, cancelling")
-        self.cancel_order(order_id)
-
-        # One final check — it might have filled between our last poll and cancel
-        final = self.check_order(order_id)
-        if final.filled:
-            return final
-
-        # Genuinely unfilled
-        if last_result:
-            last_result.status = CANCELLED
-            last_result.filled = False
-            return last_result
-
-        return OrderResult(
-            success=True,
-            filled=False,
-            order_id=order_id,
-            status=CANCELLED,
-            error="Timed out waiting for fill",
-        )
-
-    # ── Cancel orders ───────────────────────────────────────────────
+    # ── Cancel ──────────────────────────────────────────────────────
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a specific order by ID."""
@@ -341,14 +273,15 @@ class Executor:
 if __name__ == "__main__":
     exe = Executor(private_key="0x" + "a" * 64, dry_run=True)
 
+    # Test: amount below minimum should auto-bump
     result = exe.place_order(
         token_id="fake_token_123",
         side="BUY",
         price=0.65,
-        amount_usd=5.0,
+        amount_usd=2.0,
     )
 
     print(f"Order: {result}")
     print(f"  Status: {result.status}")
-    print(f"  Filled: {result.filled}")
-    print(f"  Shares: {result.size_filled:.2f} / {result.size_requested:.2f}")
+    print(f"  Shares: {result.size_filled:.2f} (requested {result.size_requested:.2f})")
+    print(f"  Spent: ${result.amount_spent:.2f}")

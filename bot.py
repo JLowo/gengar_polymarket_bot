@@ -2,9 +2,12 @@
 """
 PolyBot v3 — Oracle Lag Scalper with Kelly Criterion
 
-Fixed version: trades are only counted when orders are actually FILLED
-on the Polymarket CLOB. P&L is derived from real USDC balance changes,
-not local guesswork.
+All four fixes applied:
+  1. Minimum 5 shares enforced (handled in executor)
+  2. P&L calculated from trade math, not balance comparison
+     (buying shares ≠ losing money — cost basis tracking)
+  3. FOK orders — instant fill or cancel, no 30s polling
+  4. Unclaimed winnings tracked — periodic claim reminders
 """
 
 import os
@@ -16,7 +19,7 @@ from dotenv import load_dotenv
 from market import get_current_market, current_window_ts, PERIOD_SECONDS
 from price_feed import BinancePriceFeed
 from strategy import evaluate, StrategyConfig, TradingStats
-from executor import Executor, PLACED, FILLED, PARTIAL, CANCELLED, FAILED
+from executor import Executor, FILLED, CANCELLED, FAILED
 from telegram_notifier import TelegramNotifier
 
 
@@ -54,14 +57,15 @@ class PolyBot:
         self._opening_price: float = 0.0
         self._last_hour_check: int = 0
 
-        # ── Order tracking (the fix) ───────────────────────────────
-        self._last_order_id: str = ""
+        # ── Trade tracking ──────────────────────────────────────────
         self._last_trade_side: str = ""
-        self._last_trade_price: float = 0.0
-        self._last_trade_amount: float = 0.0
+        self._last_trade_price: float = 0.0     # Price per share
+        self._last_trade_cost: float = 0.0       # Total USD spent
+        self._last_trade_shares: float = 0.0     # Shares filled
         self._last_order_filled: bool = False
-        self._last_fill_size: float = 0.0
-        self._balance_before_trade: float = 0.0
+
+        # ── Unclaimed winnings tracker ──────────────────────────────
+        self._unclaimed_winnings: float = 0.0
 
     def start(self):
         if not self.dry_run:
@@ -186,9 +190,7 @@ class PolyBot:
         self._current_window = window_ts
         self._window_traded = False
         self._opening_price = 0.0
-        self._last_order_id = ""
         self._last_order_filled = False
-        self._last_fill_size = 0.0
 
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
         print(f"\n{'─' * 55}")
@@ -232,11 +234,7 @@ class PolyBot:
               f"prob={sig.true_prob:.2f} | BTC Δ={sig.btc_delta_pct:+.3f}%")
         print(f"     Kelly: ${trade_amount:.2f} | mkt ${sig.market_price:.3f} | T-{seconds_remaining:.0f}s")
 
-        # Snapshot balance BEFORE placing the order
-        if not self.dry_run:
-            self._balance_before_trade = self.executor.get_balance()
-
-        # ── Place the order ─────────────────────────────────────────
+        # ── Place FOK order (instant fill or cancel) ────────────────
         result = self.executor.place_order(
             token_id=token_id,
             side="BUY",
@@ -244,144 +242,96 @@ class PolyBot:
             amount_usd=trade_amount,
         )
 
-        if not result.success:
-            print(f"  ❌ Order rejected: {result.error}")
-            self.telegram.error_alert(f"Order rejected: {result.error}")
-            return
-
-        print(f"  📤 Order placed: {result.order_id[:16]}... "
-              f"({result.size_requested:.2f} shares @ ${result.price:.3f})")
-
-        # ── Wait for fill confirmation ──────────────────────────────
-        if self.dry_run:
-            fill_result = result  # Dry run: instant fill
-        else:
-            # Poll for up to 30 seconds — these markets move fast
-            print(f"  ⏳ Waiting for fill...")
-            fill_result = self.executor.wait_for_fill(
-                order_id=result.order_id,
-                timeout=30.0,
-                poll_interval=2.0,
-            )
-
-        # ── Record what actually happened ───────────────────────────
-        self._last_order_id = result.order_id
-        self._last_trade_side = sig.side
-        self._last_trade_price = sig.market_price
-        self._last_trade_amount = trade_amount
-        self._last_order_filled = fill_result.filled
-        self._last_fill_size = fill_result.size_filled
-
-        if fill_result.filled:
+        if result.success:
+            # ── FOK filled — record the REAL fill data ──────────────
             self._window_traded = True
+            self._last_order_filled = True
+            self._last_trade_side = sig.side
+            self._last_trade_price = result.price
+            self._last_trade_cost = result.amount_spent
+            self._last_trade_shares = result.size_filled
+
+            # Deduct cost from bankroll (money is now in shares)
+            self.stats.bankroll -= result.amount_spent
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
 
             mode = "PAPER" if self.dry_run else "LIVE"
-            filled_amt = fill_result.size_filled * fill_result.price
-            print(f"  ✅ {mode}: {fill_result.size_filled:.2f} shares @ "
-                  f"${fill_result.price:.3f} = ${filled_amt:.2f}")
+            print(f"  ✅ {mode}: {result.size_filled:.2f} shares @ "
+                  f"${result.price:.3f} = ${result.amount_spent:.2f}")
 
             self.telegram.trade_alert(
                 side=sig.side,
-                price=sig.market_price,
-                amount=filled_amt,
+                price=result.price,
+                amount=result.amount_spent,
                 market_slug=slug,
                 dry_run=self.dry_run,
                 edge=sig.edge,
                 kelly_size=sig.kelly_size,
             )
         else:
-            print(f"  ⚠️  Order NOT filled (status: {fill_result.status})")
-            if fill_result.error:
-                print(f"     Reason: {fill_result.error}")
-            self.telegram.error_alert(
-                f"Order not filled: {fill_result.status} — {fill_result.error}"
-            )
+            # ── FOK didn't fill or was rejected ─────────────────────
+            print(f"  ⚠️  {result.status}: {result.error}")
+            if result.status == FAILED:
+                self.telegram.error_alert(f"Order failed: {result.error}")
 
     def _resolve_previous_trade(self):
-        """Resolve the previous window's trade using REAL data.
+        """Resolve the previous window's trade.
 
-        For dry run: use BTC price logic (simulation).
-        For live: check actual USDC balance change on Polymarket.
+        P&L is calculated from the trade itself:
+          - WIN:  payout ($1/share) minus cost = net profit
+          - LOSS: cost is gone, shares worth $0 = net loss
+
+        This works for both dry run and live because FOK guarantees
+        we only count trades that actually filled.
         """
-        # ── If the order never filled, there's nothing to resolve ───
         if not self._last_order_filled:
-            # Cancel any lingering order just in case
-            if self._last_order_id and not self._last_order_id.startswith("DRY-"):
-                self.executor.cancel_order(self._last_order_id)
-            print(f"  ⏭️  Skipped — order was not filled")
             return
 
-        # ── Dry run: simulate outcome from BTC price ────────────────
-        if self.dry_run:
-            btc_price, _ = self.price_feed.get_price()
-            if self._opening_price <= 0 or btc_price <= 0:
-                return
-
-            won = (btc_price >= self._opening_price) == (self._last_trade_side == "UP")
-            amount = self._last_trade_amount
-            price = self._last_trade_price
-
-            if won:
-                profit = amount * ((1.0 / price) - 1)
-                self.stats.record_win(profit)
-                print(f"  ✅ WIN +${profit:.2f} | P&L: ${self.stats.total_pnl:+.2f} | "
-                      f"Bank: ${self.stats.bankroll:.2f}")
-                self.telegram.win_alert(profit, self.stats.total_pnl)
-            else:
-                self.stats.record_loss(amount)
-                print(f"  ❌ LOSS -${amount:.2f} | P&L: ${self.stats.total_pnl:+.2f} | "
-                      f"Bank: ${self.stats.bankroll:.2f}")
-                self.telegram.loss_alert(amount, self.stats.total_pnl)
+        btc_price, _ = self.price_feed.get_price()
+        if self._opening_price <= 0 or btc_price <= 0:
             return
 
-        # ── Live: derive P&L from actual USDC balance change ────────
-        #
-        # This is the only source of truth. The market resolves on-chain,
-        # and our balance reflects the outcome. No guessing.
-        #
-        balance_now = self.executor.get_balance()
-        balance_change = balance_now - self._balance_before_trade
+        won = (btc_price >= self._opening_price) == (self._last_trade_side == "UP")
+        cost = self._last_trade_cost
+        shares = self._last_trade_shares
 
-        if balance_change > 0:
-            # We made money — balance went up
-            profit = balance_change
+        if won:
+            # Shares pay $1 each. Profit = payout - cost.
+            payout = shares * 1.0
+            profit = payout - cost
+
+            # Add payout back to bankroll (cost was already deducted on fill)
+            self.stats.bankroll += payout
             self.stats.record_win(profit)
-            self.stats.bankroll = balance_now
-            print(f"  ✅ WIN +${profit:.2f} | P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${balance_now:.2f} (verified)")
+
+            # Track unclaimed winnings (live only — must claim manually)
+            if not self.dry_run:
+                self._unclaimed_winnings += payout
+
+            print(f"  ✅ WIN +${profit:.2f} | "
+                  f"Cost ${cost:.2f} → Payout ${payout:.2f} | "
+                  f"P&L: ${self.stats.total_pnl:+.2f} | "
+                  f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.win_alert(profit, self.stats.total_pnl)
-
-        elif balance_change < 0:
-            # We lost money — balance went down
-            loss = abs(balance_change)
-            self.stats.record_loss(loss)
-            self.stats.bankroll = balance_now
-            print(f"  ❌ LOSS -${loss:.2f} | P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${balance_now:.2f} (verified)")
-            self.telegram.loss_alert(loss, self.stats.total_pnl)
-
         else:
-            # No balance change — could be pending settlement
-            # Sync balance anyway to stay honest
-            self.stats.bankroll = balance_now
-            print(f"  🔄 No balance change yet — may be settling | "
-                  f"Bank: ${balance_now:.2f} (verified)")
+            # Shares worth $0. We lose what we spent.
+            self.stats.record_loss(cost)
+
+            # Bankroll already had cost deducted on fill — no further change
+
+            print(f"  ❌ LOSS -${cost:.2f} | "
+                  f"P&L: ${self.stats.total_pnl:+.2f} | "
+                  f"Bank: ${self.stats.bankroll:.2f}")
+            self.telegram.loss_alert(cost, self.stats.total_pnl)
 
     def _check_hourly_summary(self):
-        """Send hourly summary and reset hourly stats."""
+        """Send hourly summary with claim reminder."""
         current_hour = int(time.time() // 3600)
         if current_hour != self._last_hour_check:
             self._last_hour_check = current_hour
 
             h = self.stats.hourly.to_dict()
             o = self.stats.to_dict()
-
-            # Sync real balance into stats if live
-            if not self.dry_run and self.executor._initialized:
-                real_balance = self.executor.get_balance()
-                self.stats.bankroll = real_balance
-                o["bankroll"] = real_balance
 
             print(f"\n{'═' * 55}")
             print(f"  📊 HOURLY SUMMARY")
@@ -398,6 +348,12 @@ class PolyBot:
             print(f"  Overall: {o['total_trades']} trades | "
                   f"P&L: ${o['pnl']:+.2f} | "
                   f"Bank: ${o['bankroll']:.2f}")
+
+            # ── Claim reminder ──────────────────────────────────────
+            if self._unclaimed_winnings > 0:
+                print(f"  💰 Unclaimed winnings: ${self._unclaimed_winnings:.2f} "
+                      f"— visit Polymarket to claim!")
+
             print(f"{'═' * 55}\n")
 
             self.telegram.hourly_summary(h, o)
@@ -410,17 +366,15 @@ class PolyBot:
         if self.executor._initialized:
             self.executor.cancel_all()
 
-        # Final balance sync
-        if not self.dry_run and self.executor._initialized:
-            real_balance = self.executor.get_balance()
-            self.stats.bankroll = real_balance
-
         o = self.stats.to_dict()
         print(f"\n{'═' * 55}")
         print(f"  FINAL: {o['total_trades']} trades | "
               f"{o['wins']}W/{o['losses']}L | "
               f"WR: {o['win_rate']:.1f}%")
         print(f"  P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
+        if self._unclaimed_winnings > 0:
+            print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f} "
+                  f"— claim at polymarket.com/portfolio")
         print(f"{'═' * 55}")
 
         self.telegram.status_update(o)
