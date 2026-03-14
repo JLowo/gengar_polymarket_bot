@@ -30,21 +30,42 @@ FAILED = "FAILED"
 # Polymarket CLOB minimum order size in shares
 MIN_SHARES = 5.0
 
-# Polymarket amount precision constraints (per API error messaging).
-# - "maker amount" (collateral for BUY) max 2 decimals (USDC cents)
-# - "taker amount" (shares) max 4 decimals
-MAKER_DECIMALS = 2
-TAKER_DECIMALS = 4
+# Polymarket constraint for FOK orders (server-side validation):
+# - maker amount (USDC) must have <= 2 decimals
+# - taker amount (shares) must have <= 4 decimals
 
 
-def _round_down(x: float, decimals: int) -> float:
-    """Round down (floor) to a fixed number of decimals to satisfy API precision caps."""
+def _choose_share_size(price: float, max_usd: float, min_shares: int = int(MIN_SHARES)) -> tuple[float, float]:
+    """Pick an integer share size so that shares * price has at most 2 decimals.
+
+    Returns (shares, spend_usd). If no valid combination exists within max_usd,
+    returns (0.0, 0.0).
+    """
     import math
 
-    if decimals < 0:
-        return x
-    factor = 10 ** decimals
-    return math.floor(x * factor) / factor
+    if price <= 0 or max_usd <= 0:
+        return 0.0, 0.0
+
+    # Cap max_usd to cents
+    max_usd_cents = int(math.floor(max_usd * 100))
+    if max_usd_cents <= 0:
+        return 0.0, 0.0
+
+    # Work backwards from the largest affordable share count
+    # Shares are whole contracts; taker amount will then have 0 decimals.
+    max_possible_shares = int(max_usd_cents / math.ceil(price * 100)) or 0
+    max_possible_shares = max(max_possible_shares, min_shares)
+
+    for shares in range(max_possible_shares, min_shares - 1, -1):
+        total = shares * price
+        # Check if total has at most 2 decimal places (no fractional cents).
+        total_cents = round(total * 100) / 100.0
+        if abs(total - total_cents) < 1e-9:
+            # Also ensure we do not exceed max_usd
+            if total_cents <= max_usd_cents / 100.0:
+                return float(shares), float(total_cents)
+
+    return 0.0, 0.0
 
 
 @dataclass
@@ -144,23 +165,29 @@ class Executor:
         FOK = fill the entire order immediately, or cancel it.
         No sitting on the book. No polling. Instant truth.
 
-        Enforces Polymarket minimum of 5 shares.
+        Enforces Polymarket minimum of 5 shares and adjusts size so that
+        maker amount (USD) has at most 2 decimals, as required by the API.
         """
-        # Polymarket enforces strict decimal limits on order amounts.
-        # We'll floor to be safe (never exceed requested spend).
         price = float(price)
         amount_usd = float(amount_usd)
 
-        amount_usd = _round_down(amount_usd, MAKER_DECIMALS)
-        shares = _round_down(amount_usd / price, TAKER_DECIMALS)
+        # Choose integer share size so that shares * price has <= 2 decimals.
+        shares, spend_usd = _choose_share_size(price, amount_usd)
 
         # ── Enforce minimum 5 shares ────────────────────────────────
         if shares < MIN_SHARES:
-            shares = MIN_SHARES
-            amount_usd = _round_down(shares * price, MAKER_DECIMALS)
-            # Recompute shares from amount to keep the two consistent with rounding
-            shares = _round_down(amount_usd / price, TAKER_DECIMALS)
-            print(f"  📐 Bumped to minimum: {shares:.0f} shares (${amount_usd:.2f})")
+            # Try again with minimum shares constraint.
+            shares, spend_usd = _choose_share_size(price, amount_usd, int(MIN_SHARES))
+
+        if shares < MIN_SHARES or spend_usd <= 0:
+            return OrderResult(
+                success=False,
+                status=REJECTED,
+                error="Unable to find valid share size within decimal constraints",
+                side=side,
+                price=price,
+                token_id=token_id[:16] + "...",
+            )
 
         # ── Dry run ─────────────────────────────────────────────────
         if self.dry_run:
@@ -172,7 +199,7 @@ class Executor:
                 price=price,
                 size_requested=shares,
                 size_filled=shares,
-                amount_spent=amount_usd,
+                amount_spent=spend_usd,
                 token_id=token_id[:16] + "...",
                 dry_run=True,
             )
