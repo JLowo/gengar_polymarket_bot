@@ -30,6 +30,22 @@ FAILED = "FAILED"
 # Polymarket CLOB minimum order size in shares
 MIN_SHARES = 5.0
 
+# Polymarket amount precision constraints (per API error messaging).
+# - "maker amount" (collateral for BUY) max 2 decimals (USDC cents)
+# - "taker amount" (shares) max 4 decimals
+MAKER_DECIMALS = 2
+TAKER_DECIMALS = 4
+
+
+def _round_down(x: float, decimals: int) -> float:
+    """Round down (floor) to a fixed number of decimals to satisfy API precision caps."""
+    import math
+
+    if decimals < 0:
+        return x
+    factor = 10 ** decimals
+    return math.floor(x * factor) / factor
+
 
 @dataclass
 class OrderResult:
@@ -130,12 +146,20 @@ class Executor:
 
         Enforces Polymarket minimum of 5 shares.
         """
-        shares = amount_usd / price
+        # Polymarket enforces strict decimal limits on order amounts.
+        # We'll floor to be safe (never exceed requested spend).
+        price = float(price)
+        amount_usd = float(amount_usd)
+
+        amount_usd = _round_down(amount_usd, MAKER_DECIMALS)
+        shares = _round_down(amount_usd / price, TAKER_DECIMALS)
 
         # ── Enforce minimum 5 shares ────────────────────────────────
         if shares < MIN_SHARES:
             shares = MIN_SHARES
-            amount_usd = shares * price
+            amount_usd = _round_down(shares * price, MAKER_DECIMALS)
+            # Recompute shares from amount to keep the two consistent with rounding
+            shares = _round_down(amount_usd / price, TAKER_DECIMALS)
             print(f"  📐 Bumped to minimum: {shares:.0f} shares (${amount_usd:.2f})")
 
         # ── Dry run ─────────────────────────────────────────────────
