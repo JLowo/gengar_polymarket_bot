@@ -35,7 +35,12 @@ MIN_SHARES = 5.0
 # - taker amount (shares) must have <= 4 decimals
 
 
-def _choose_share_size(price: float, max_usd: float, min_shares: int = int(MIN_SHARES)) -> tuple[float, float]:
+def _choose_share_size(
+    price: float,
+    max_usd: float,
+    min_shares: int = int(MIN_SHARES),
+    max_shares: Optional[int] = None,
+) -> tuple[float, float]:
     """Pick an integer share size so that shares * price has at most 2 decimals.
 
     Returns (shares, spend_usd). If no valid combination exists within max_usd,
@@ -54,6 +59,8 @@ def _choose_share_size(price: float, max_usd: float, min_shares: int = int(MIN_S
     # Work backwards from the largest affordable share count
     # Shares are whole contracts; taker amount will then have 0 decimals.
     max_possible_shares = int(max_usd_cents / math.ceil(price * 100)) or 0
+    if max_shares is not None:
+        max_possible_shares = min(max_possible_shares, max_shares)
     max_possible_shares = max(max_possible_shares, min_shares)
 
     for shares in range(max_possible_shares, min_shares - 1, -1):
@@ -151,6 +158,34 @@ class Executor:
             print(f"[executor] Orderbook fetch failed: {e}")
             return 0.0, 0.0
 
+    def _max_fillable_shares(self, token_id: str, side: str, price: float) -> float:
+        """Estimate max shares fillable at or better than price from the order book."""
+        if not self._initialized:
+            return 0.0
+        try:
+            book = self.client.get_order_book(token_id)
+            if side.upper() == "BUY":
+                asks = book.get("asks", [])
+                qty = 0.0
+                for level in asks:
+                    lvl_price = float(level.get("price", 0))
+                    lvl_size = float(level.get("size", 0))
+                    if lvl_price <= price:
+                        qty += lvl_size
+                return qty
+            else:
+                bids = book.get("bids", [])
+                qty = 0.0
+                for level in bids:
+                    lvl_price = float(level.get("price", 0))
+                    lvl_size = float(level.get("size", 0))
+                    if lvl_price >= price:
+                        qty += lvl_size
+                return qty
+        except Exception as e:
+            print(f"[executor] Liquidity check failed: {e}")
+            return 0.0
+
     # ── Place FOK order ─────────────────────────────────────────────
 
     def place_order(
@@ -171,13 +206,26 @@ class Executor:
         price = float(price)
         amount_usd = float(amount_usd)
 
-        # Choose integer share size so that shares * price has <= 2 decimals.
-        shares, spend_usd = _choose_share_size(price, amount_usd)
+        # Cap by available liquidity at or better than price (FOK requirement).
+        max_liq_shares = self._max_fillable_shares(token_id, side, price)
+
+        # Choose integer share size so that shares * price has <= 2 decimals,
+        # and does not exceed liquidity.
+        shares, spend_usd = _choose_share_size(
+            price,
+            amount_usd,
+            max_shares=int(max_liq_shares) if max_liq_shares > 0 else None,
+        )
 
         # ── Enforce minimum 5 shares ────────────────────────────────
         if shares < MIN_SHARES:
-            # Try again with minimum shares constraint.
-            shares, spend_usd = _choose_share_size(price, amount_usd, int(MIN_SHARES))
+            # Try again with minimum shares constraint, still respecting liquidity.
+            shares, spend_usd = _choose_share_size(
+                price,
+                amount_usd,
+                min_shares=int(MIN_SHARES),
+                max_shares=int(max_liq_shares) if max_liq_shares > 0 else None,
+            )
 
         if shares < MIN_SHARES or spend_usd <= 0:
             return OrderResult(
