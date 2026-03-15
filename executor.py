@@ -1,11 +1,14 @@
 """Order executor for Polymarket CLOB.
 
-v3 — Key changes:
-  - FOK (Fill or Kill) orders: fill instantly or cancel. No polling.
-  - Minimum 5 shares enforced (Polymarket CLOB requirement).
-  - Single verification call after FOK — no 30-second polling loop.
+v4 — Fixes and features:
+  - FOK (Fill or Kill) orders with liquidity-aware sizing
+  - Minimum 5 shares enforced (Polymarket CLOB requirement)
+  - Maker amount rounded to 2 decimals, taker to 4 (API constraint)
+  - OrderBookSummary handled as object (not dict)
+  - Auto-claim winnings via SELL at $0.99
 """
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -20,64 +23,20 @@ from py_clob_client.clob_types import (
 from py_clob_client.constants import POLYGON
 
 
-# ── Order states ────────────────────────────────────────────────────
+# ── Constants ───────────────────────────────────────────────────────
 
 FILLED = "FILLED"
 REJECTED = "REJECTED"
 CANCELLED = "CANCELLED"
 FAILED = "FAILED"
 
-# Polymarket CLOB minimum order size in shares
 MIN_SHARES = 5.0
-
-# Polymarket constraint for FOK orders (server-side validation):
-# - maker amount (USDC) must have <= 2 decimals
-# - taker amount (shares) must have <= 4 decimals
-
-
-def _choose_share_size(
-    price: float,
-    max_usd: float,
-    min_shares: int = int(MIN_SHARES),
-    max_shares: Optional[int] = None,
-) -> tuple[float, float]:
-    """Pick an integer share size so that shares * price has at most 2 decimals.
-
-    Returns (shares, spend_usd). If no valid combination exists within max_usd,
-    returns (0.0, 0.0).
-    """
-    import math
-
-    if price <= 0 or max_usd <= 0:
-        return 0.0, 0.0
-
-    # Cap max_usd to cents
-    max_usd_cents = int(math.floor(max_usd * 100))
-    if max_usd_cents <= 0:
-        return 0.0, 0.0
-
-    # Work backwards from the largest affordable share count
-    # Shares are whole contracts; taker amount will then have 0 decimals.
-    max_possible_shares = int(max_usd_cents / math.ceil(price * 100)) or 0
-    if max_shares is not None:
-        max_possible_shares = min(max_possible_shares, max_shares)
-    max_possible_shares = max(max_possible_shares, min_shares)
-
-    for shares in range(max_possible_shares, min_shares - 1, -1):
-        total = shares * price
-        # Check if total has at most 2 decimal places (no fractional cents).
-        total_cents = round(total * 100) / 100.0
-        if abs(total - total_cents) < 1e-9:
-            # Also ensure we do not exceed max_usd
-            if total_cents <= max_usd_cents / 100.0:
-                return float(shares), float(total_cents)
-
-    return 0.0, 0.0
+CLAIM_SELL_PRICE = 0.99   # Sell winning shares at 99¢ to auto-collect
 
 
 @dataclass
 class OrderResult:
-    success: bool            # Did shares actually change hands?
+    success: bool
     order_id: str = ""
     status: str = FAILED
     side: str = ""
@@ -88,6 +47,44 @@ class OrderResult:
     token_id: str = ""
     error: str = ""
     dry_run: bool = True
+
+
+# ── Decimal-safe share sizing ───────────────────────────────────────
+
+def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
+    """Find the largest whole-number share count where shares × price
+    has at most 2 decimal places, and total ≤ max_usd.
+
+    Returns (shares, spend_usd). Returns (0, 0) if no valid size found.
+    """
+    if price <= 0 or max_usd <= 0:
+        return 0.0, 0.0
+
+    # Price in cents (integer). Polymarket prices are multiples of $0.01.
+    price_cents = round(price * 100)
+    max_usd_cents = int(max_usd * 100)
+
+    # Max shares we could possibly afford
+    max_shares = max_usd_cents // price_cents if price_cents > 0 else 0
+
+    # Enforce minimum
+    if max_shares < MIN_SHARES:
+        # Check if we can afford the minimum
+        min_cost_cents = int(MIN_SHARES) * price_cents
+        if min_cost_cents <= max_usd_cents:
+            max_shares = int(MIN_SHARES)
+        else:
+            return 0.0, 0.0
+
+    # With integer shares and price as cents/100:
+    # spend = shares * price_cents / 100 → always has ≤ 2 decimals ✓
+    shares = int(max_shares)
+    spend = shares * price_cents / 100.0
+
+    if shares < MIN_SHARES:
+        return 0.0, 0.0
+
+    return float(shares), spend
 
 
 class Executor:
@@ -106,7 +103,6 @@ class Executor:
     # ── Initialization ──────────────────────────────────────────────
 
     def initialize(self) -> bool:
-        """Initialize the CLOB client and derive API credentials."""
         try:
             self.client = ClobClient(
                 host="https://clob.polymarket.com",
@@ -115,14 +111,11 @@ class Executor:
                 funder=self.safe_address if self.safe_address else None,
                 signature_type=2 if self.safe_address else 0,
             )
-
             self.client.set_api_creds(self.client.create_or_derive_api_creds())
-
             self._initialized = True
             print(f"[executor] Initialized ({'DRY RUN' if self.dry_run else 'LIVE'})")
             print(f"[executor] Address: {self.client.get_address()}")
             return True
-
         except Exception as e:
             print(f"[executor] Init failed: {e}")
             return False
@@ -130,7 +123,6 @@ class Executor:
     # ── Balance ─────────────────────────────────────────────────────
 
     def get_balance(self) -> float:
-        """Get current USDC balance on Polymarket."""
         if not self._initialized:
             return 0.0
         try:
@@ -141,50 +133,63 @@ class Executor:
             print(f"[executor] Balance check failed: {e}")
             return 0.0
 
-    # ── Order book ──────────────────────────────────────────────────
+    # ── Order book (handles both dict and object responses) ─────────
+
+    def _read_book(self, token_id: str) -> tuple[list, list]:
+        """Read order book, returning (asks, bids) as lists of (price, size).
+
+        Handles both dict responses and OrderBookSummary objects.
+        """
+        if not self._initialized:
+            return [], []
+        try:
+            book = self.client.get_order_book(token_id)
+
+            # Try object attributes first, fall back to dict access
+            if hasattr(book, 'asks'):
+                raw_asks = book.asks or []
+                raw_bids = book.bids or []
+            else:
+                raw_asks = book.get("asks", [])
+                raw_bids = book.get("bids", [])
+
+            # Normalize each level to (price, size) tuples
+            asks, bids = [], []
+            for level in raw_asks:
+                p = float(level.price if hasattr(level, 'price') else level.get("price", 0))
+                s = float(level.size if hasattr(level, 'size') else level.get("size", 0))
+                asks.append((p, s))
+            for level in raw_bids:
+                p = float(level.price if hasattr(level, 'price') else level.get("price", 0))
+                s = float(level.size if hasattr(level, 'size') else level.get("size", 0))
+                bids.append((p, s))
+
+            return asks, bids
+
+        except Exception as e:
+            print(f"[executor] Book read failed: {e}")
+            return [], []
 
     def get_orderbook_price(self, token_id: str) -> tuple[float, float]:
-        """Get best bid and ask. Returns (best_bid, best_ask)."""
-        if not self._initialized:
-            return 0.0, 0.0
-        try:
-            book = self.client.get_order_book(token_id)
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
-            best_bid = float(bids[0]["price"]) if bids else 0.0
-            best_ask = float(asks[0]["price"]) if asks else 0.0
-            return best_bid, best_ask
-        except Exception as e:
-            print(f"[executor] Orderbook fetch failed: {e}")
-            return 0.0, 0.0
+        """Get best bid and ask."""
+        asks, bids = self._read_book(token_id)
+        best_bid = bids[0][0] if bids else 0.0
+        best_ask = asks[0][0] if asks else 0.0
+        return best_bid, best_ask
 
-    def _max_fillable_shares(self, token_id: str, side: str, price: float) -> float:
-        """Estimate max shares fillable at or better than price from the order book."""
-        if not self._initialized:
-            return 0.0
-        try:
-            book = self.client.get_order_book(token_id)
-            if side.upper() == "BUY":
-                asks = book.get("asks", [])
-                qty = 0.0
-                for level in asks:
-                    lvl_price = float(level.get("price", 0))
-                    lvl_size = float(level.get("size", 0))
-                    if lvl_price <= price:
-                        qty += lvl_size
-                return qty
-            else:
-                bids = book.get("bids", [])
-                qty = 0.0
-                for level in bids:
-                    lvl_price = float(level.get("price", 0))
-                    lvl_size = float(level.get("size", 0))
-                    if lvl_price >= price:
-                        qty += lvl_size
-                return qty
-        except Exception as e:
-            print(f"[executor] Liquidity check failed: {e}")
-            return 0.0
+    def _available_liquidity(self, token_id: str, side: str, price: float) -> float:
+        """How many shares can we BUY (or SELL) at this price or better?"""
+        asks, bids = self._read_book(token_id)
+        total = 0.0
+        if side.upper() == "BUY":
+            for lvl_price, lvl_size in asks:
+                if lvl_price <= price:
+                    total += lvl_size
+        else:
+            for lvl_price, lvl_size in bids:
+                if lvl_price >= price:
+                    total += lvl_size
+        return total
 
     # ── Place FOK order ─────────────────────────────────────────────
 
@@ -195,43 +200,34 @@ class Executor:
         price: float,
         amount_usd: float,
     ) -> OrderResult:
-        """Place a Fill-or-Kill order.
+        """Place a Fill-or-Kill order with liquidity-aware sizing.
 
-        FOK = fill the entire order immediately, or cancel it.
-        No sitting on the book. No polling. Instant truth.
-
-        Enforces Polymarket minimum of 5 shares and adjusts size so that
-        maker amount (USD) has at most 2 decimals, as required by the API.
+        1. Check available liquidity at our price
+        2. Cap order to what the book can fill
+        3. Round to clean decimals (API constraint)
+        4. FOK: fills instantly or cancels — one verification call
         """
         price = float(price)
         amount_usd = float(amount_usd)
 
-        # Cap by available liquidity at or better than price (FOK requirement).
-        max_liq_shares = self._max_fillable_shares(token_id, side, price)
+        # ── Check liquidity first ───────────────────────────────────
+        if not self.dry_run and self._initialized:
+            liq = self._available_liquidity(token_id, side, price)
+            if liq > 0:
+                # Cap USD spend to what the book can actually fill
+                max_from_liq = liq * price
+                if amount_usd > max_from_liq:
+                    amount_usd = max_from_liq
+                    print(f"  📉 Capped to book liquidity: {liq:.0f} shares (${amount_usd:.2f})")
 
-        # Choose integer share size so that shares * price has <= 2 decimals,
-        # and does not exceed liquidity.
-        shares, spend_usd = _choose_share_size(
-            price,
-            amount_usd,
-            max_shares=int(max_liq_shares) if max_liq_shares > 0 else None,
-        )
+        # ── Calculate clean share size ──────────────────────────────
+        shares, spend = calculate_order_size(price, amount_usd)
 
-        # ── Enforce minimum 5 shares ────────────────────────────────
-        if shares < MIN_SHARES:
-            # Try again with minimum shares constraint, still respecting liquidity.
-            shares, spend_usd = _choose_share_size(
-                price,
-                amount_usd,
-                min_shares=int(MIN_SHARES),
-                max_shares=int(max_liq_shares) if max_liq_shares > 0 else None,
-            )
-
-        if shares < MIN_SHARES or spend_usd <= 0:
+        if shares < MIN_SHARES or spend <= 0:
             return OrderResult(
                 success=False,
                 status=REJECTED,
-                error="Unable to find valid share size within decimal constraints",
+                error=f"Can't meet min {MIN_SHARES:.0f} shares within ${amount_usd:.2f} at ${price}",
                 side=side,
                 price=price,
                 token_id=token_id[:16] + "...",
@@ -247,15 +243,15 @@ class Executor:
                 price=price,
                 size_requested=shares,
                 size_filled=shares,
-                amount_spent=spend_usd,
+                amount_spent=spend,
                 token_id=token_id[:16] + "...",
                 dry_run=True,
             )
 
         if not self._initialized:
-            return OrderResult(success=False, status=FAILED, error="Client not initialized")
+            return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        # ── Live FOK order ──────────────────────────────────────────
+        # ── Send FOK ────────────────────────────────────────────────
         try:
             order_args = OrderArgs(
                 price=price,
@@ -270,22 +266,26 @@ class Executor:
             order_id = result.get("orderID", "")
             if not order_id:
                 return OrderResult(
-                    success=False,
-                    status=REJECTED,
+                    success=False, status=REJECTED,
                     error="No orderID in response",
-                    side=side,
-                    price=price,
+                    side=side, price=price,
                     token_id=token_id[:16] + "...",
                 )
 
-            # ── Single verification call ────────────────────────────
-            # FOK resolves instantly. One call to confirm fill details.
+            # Single verification — FOK is instant
             fill = self._check_order(order_id)
-
             if fill:
-                size_matched = float(fill.get("size_matched", 0))
+                size_matched = float(
+                    fill.get("size_matched", 0)
+                    if isinstance(fill, dict)
+                    else getattr(fill, "size_matched", 0)
+                )
                 if size_matched > 0:
-                    fill_price = float(fill.get("price", price))
+                    fill_price = float(
+                        fill.get("price", price)
+                        if isinstance(fill, dict)
+                        else getattr(fill, "price", price)
+                    )
                     return OrderResult(
                         success=True,
                         order_id=order_id,
@@ -299,43 +299,117 @@ class Executor:
                         dry_run=False,
                     )
 
-            # FOK didn't match — no shares, no cost
             return OrderResult(
                 success=False,
                 order_id=order_id,
                 status=CANCELLED,
-                error="FOK not matched — no liquidity at this price",
-                side=side,
-                price=price,
+                error="FOK not matched — no liquidity",
+                side=side, price=price,
                 size_requested=shares,
                 token_id=token_id[:16] + "...",
                 dry_run=False,
             )
 
         except Exception as e:
-            error_msg = str(e)
-            if "lower than the minimum" in error_msg:
-                return OrderResult(
-                    success=False,
-                    status=REJECTED,
-                    error=f"Below minimum order size",
-                    side=side,
-                    price=price,
-                    token_id=token_id[:16] + "...",
-                )
             return OrderResult(
-                success=False,
-                status=FAILED,
-                error=error_msg,
-                side=side,
-                price=price,
+                success=False, status=FAILED,
+                error=str(e), side=side, price=price,
                 token_id=token_id[:16] + "...",
             )
 
-    # ── Check order (single call) ───────────────────────────────────
+    # ── Auto-claim: sell winning shares at $0.99 ────────────────────
+
+    def claim_winnings(self, token_id: str, shares: float) -> OrderResult:
+        """Sell resolved winning shares at $0.99 to convert back to USDC.
+
+        Loses ~1¢/share but eliminates manual claiming.
+        The market must be resolved (shares worth $1) for this to work.
+        """
+        if self.dry_run:
+            payout = shares * CLAIM_SELL_PRICE
+            return OrderResult(
+                success=True,
+                order_id=f"DRY-CLAIM-{int(time.time())}",
+                status=FILLED,
+                side="SELL",
+                price=CLAIM_SELL_PRICE,
+                size_requested=shares,
+                size_filled=shares,
+                amount_spent=payout,  # USD received
+                token_id=token_id[:16] + "...",
+                dry_run=True,
+            )
+
+        if not self._initialized:
+            return OrderResult(success=False, status=FAILED, error="Not initialized")
+
+        # Use integer shares for clean decimals
+        sell_shares = int(shares)
+        if sell_shares < 1:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error="Less than 1 share to claim",
+            )
+
+        try:
+            order_args = OrderArgs(
+                price=CLAIM_SELL_PRICE,
+                size=float(sell_shares),
+                side="SELL",
+                token_id=token_id,
+            )
+
+            signed_order = self.client.create_order(order_args)
+            result = self.client.post_order(signed_order, OrderType.FOK)
+
+            order_id = result.get("orderID", "")
+            if not order_id:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error="No orderID from claim sell",
+                    side="SELL", price=CLAIM_SELL_PRICE,
+                )
+
+            # Verify fill
+            fill = self._check_order(order_id)
+            if fill:
+                size_matched = float(
+                    fill.get("size_matched", 0)
+                    if isinstance(fill, dict)
+                    else getattr(fill, "size_matched", 0)
+                )
+                if size_matched > 0:
+                    payout = size_matched * CLAIM_SELL_PRICE
+                    return OrderResult(
+                        success=True,
+                        order_id=order_id,
+                        status=FILLED,
+                        side="SELL",
+                        price=CLAIM_SELL_PRICE,
+                        size_requested=float(sell_shares),
+                        size_filled=size_matched,
+                        amount_spent=payout,
+                        token_id=token_id[:16] + "...",
+                        dry_run=False,
+                    )
+
+            return OrderResult(
+                success=False, order_id=order_id,
+                status=CANCELLED,
+                error="Claim sell not matched — market may not be settled yet",
+                side="SELL", price=CLAIM_SELL_PRICE,
+            )
+
+        except Exception as e:
+            return OrderResult(
+                success=False, status=FAILED,
+                error=f"Claim failed: {e}",
+                side="SELL", price=CLAIM_SELL_PRICE,
+            )
+
+    # ── Check order ─────────────────────────────────────────────────
 
     def _check_order(self, order_id: str) -> Optional[dict]:
-        """Single check of order status. Returns raw order dict or None."""
         if not self._initialized:
             return None
         try:
@@ -347,7 +421,6 @@ class Executor:
     # ── Cancel ──────────────────────────────────────────────────────
 
     def cancel_order(self, order_id: str) -> bool:
-        """Cancel a specific order by ID."""
         if self.dry_run or not self._initialized:
             return True
         try:
@@ -358,7 +431,6 @@ class Executor:
             return False
 
     def cancel_all(self) -> bool:
-        """Cancel all open orders."""
         if self.dry_run or not self._initialized:
             return True
         try:
@@ -370,17 +442,13 @@ class Executor:
 
 
 if __name__ == "__main__":
+    # Test decimal sizing
+    print("=== Decimal sizing tests ===")
+    for price, usd in [(0.58, 15.0), (0.535, 20.0), (0.685, 10.0), (0.50, 3.0)]:
+        shares, spend = calculate_order_size(price, usd)
+        print(f"  ${usd:.2f} @ ${price:.3f} → {shares:.0f} shares, ${spend:.2f} spend")
+
+    print("\n=== Dry run order test ===")
     exe = Executor(private_key="0x" + "a" * 64, dry_run=True)
-
-    # Test: amount below minimum should auto-bump
-    result = exe.place_order(
-        token_id="fake_token_123",
-        side="BUY",
-        price=0.65,
-        amount_usd=2.0,
-    )
-
-    print(f"Order: {result}")
-    print(f"  Status: {result.status}")
-    print(f"  Shares: {result.size_filled:.2f} (requested {result.size_requested:.2f})")
-    print(f"  Spent: ${result.amount_spent:.2f}")
+    result = exe.place_order("fake_token", "BUY", 0.65, 2.0)
+    print(f"  {result.status}: {result.size_filled:.0f} shares @ ${result.price} = ${result.amount_spent:.2f}")

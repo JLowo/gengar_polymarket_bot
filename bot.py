@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-PolyBot v3 — Oracle Lag Scalper with Kelly Criterion
+PolyBot v4 — Oracle Lag Scalper with Kelly Criterion
 
-All four fixes applied:
-  1. Minimum 5 shares enforced (handled in executor)
-  2. P&L calculated from trade math, not balance comparison
-     (buying shares ≠ losing money — cost basis tracking)
-  3. FOK orders — instant fill or cancel, no 30s polling
-  4. Unclaimed winnings tracked — periodic claim reminders
+Fixes applied:
+  1. Minimum 5 shares enforced, decimals cleaned (executor)
+  2. P&L from trade math — buying shares ≠ losing money
+  3. FOK orders — instant fill or cancel, liquidity-aware sizing
+  4. Auto-claim via SELL at $0.99 after win (loses ~1¢/share)
 """
 
 import os
@@ -59,12 +58,13 @@ class PolyBot:
 
         # ── Trade tracking ──────────────────────────────────────────
         self._last_trade_side: str = ""
-        self._last_trade_price: float = 0.0     # Price per share
-        self._last_trade_cost: float = 0.0       # Total USD spent
-        self._last_trade_shares: float = 0.0     # Shares filled
+        self._last_trade_price: float = 0.0
+        self._last_trade_cost: float = 0.0
+        self._last_trade_shares: float = 0.0
+        self._last_trade_token_id: str = ""   # Full token ID for claiming
         self._last_order_filled: bool = False
 
-        # ── Unclaimed winnings tracker ──────────────────────────────
+        # ── Unclaimed winnings (claim failed or pending) ────────────
         self._unclaimed_winnings: float = 0.0
 
     def start(self):
@@ -79,7 +79,7 @@ class PolyBot:
 
         kf = self.strategy_config.kelly_fraction
         print("=" * 55)
-        print(f"  PolyBot v3 — Oracle Lag Scalper + Kelly")
+        print(f"  PolyBot v4 — Oracle Lag Scalper + Kelly")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
@@ -87,6 +87,7 @@ class PolyBot:
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
+        print(f"  Auto-claim: SELL @ $0.99 (loses ~1¢/share)")
         print("=" * 55)
 
         if not self.dry_run:
@@ -234,7 +235,7 @@ class PolyBot:
               f"prob={sig.true_prob:.2f} | BTC Δ={sig.btc_delta_pct:+.3f}%")
         print(f"     Kelly: ${trade_amount:.2f} | mkt ${sig.market_price:.3f} | T-{seconds_remaining:.0f}s")
 
-        # ── Place FOK order (instant fill or cancel) ────────────────
+        # ── Place FOK order ─────────────────────────────────────────
         result = self.executor.place_order(
             token_id=token_id,
             side="BUY",
@@ -243,20 +244,20 @@ class PolyBot:
         )
 
         if result.success:
-            # ── FOK filled — record the REAL fill data ──────────────
             self._window_traded = True
             self._last_order_filled = True
             self._last_trade_side = sig.side
             self._last_trade_price = result.price
             self._last_trade_cost = result.amount_spent
             self._last_trade_shares = result.size_filled
+            self._last_trade_token_id = token_id  # Full ID for claiming later
 
-            # Deduct cost from bankroll (money is now in shares)
+            # Cost deducted from bankroll (money → shares)
             self.stats.bankroll -= result.amount_spent
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
 
             mode = "PAPER" if self.dry_run else "LIVE"
-            print(f"  ✅ {mode}: {result.size_filled:.2f} shares @ "
+            print(f"  ✅ {mode}: {result.size_filled:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_spent:.2f}")
 
             self.telegram.trade_alert(
@@ -269,7 +270,6 @@ class PolyBot:
                 kelly_size=sig.kelly_size,
             )
         else:
-            # ── FOK didn't fill or was rejected ─────────────────────
             print(f"  ⚠️  {result.status}: {result.error}")
             if result.status == FAILED:
                 self.telegram.error_alert(f"Order failed: {result.error}")
@@ -277,12 +277,8 @@ class PolyBot:
     def _resolve_previous_trade(self):
         """Resolve the previous window's trade.
 
-        P&L is calculated from the trade itself:
-          - WIN:  payout ($1/share) minus cost = net profit
-          - LOSS: cost is gone, shares worth $0 = net loss
-
-        This works for both dry run and live because FOK guarantees
-        we only count trades that actually filled.
+        WIN:  profit = payout - cost.  Attempt auto-claim (sell @ $0.99).
+        LOSS: loss = cost.  Shares are worthless, nothing to claim.
         """
         if not self._last_order_filled:
             return
@@ -296,36 +292,62 @@ class PolyBot:
         shares = self._last_trade_shares
 
         if won:
-            # Shares pay $1 each. Profit = payout - cost.
+            # ── WIN: shares pay $1 each ─────────────────────────────
             payout = shares * 1.0
             profit = payout - cost
 
-            # Add payout back to bankroll (cost was already deducted on fill)
-            self.stats.bankroll += payout
-            self.stats.record_win(profit)
+            # Try auto-claim: sell shares at $0.99
+            claimed = False
+            claim_payout = 0.0
 
-            # Track unclaimed winnings (live only — must claim manually)
-            if not self.dry_run:
+            if self._last_trade_token_id and not self._last_trade_token_id.startswith("DRY-"):
+                print(f"  💰 Claiming: selling {shares:.0f} shares @ $0.99...")
+                claim = self.executor.claim_winnings(
+                    token_id=self._last_trade_token_id,
+                    shares=shares,
+                )
+                if claim.success:
+                    claimed = True
+                    claim_payout = claim.amount_spent  # USD received from sell
+                    claim_loss = payout - claim_payout
+                    print(f"  💰 Claimed ${claim_payout:.2f} "
+                          f"(lost ${claim_loss:.2f} in fees)")
+                else:
+                    print(f"  ⚠️  Claim failed: {claim.error}")
+                    print(f"     Claim manually at polymarket.com/portfolio")
+            else:
+                claimed = True  # Dry run, auto-claim assumed
+                claim_payout = payout
+
+            if claimed:
+                # Money is back in USDC
+                self.stats.bankroll += claim_payout
+                actual_profit = claim_payout - cost
+                self.stats.record_win(actual_profit)
+                print(f"  ✅ WIN +${actual_profit:.2f} | "
+                      f"P&L: ${self.stats.total_pnl:+.2f} | "
+                      f"Bank: ${self.stats.bankroll:.2f}")
+                self.telegram.win_alert(actual_profit, self.stats.total_pnl)
+            else:
+                # Claim failed — track theoretical profit, remind user
+                self.stats.bankroll += payout  # Optimistic: shares exist
+                self.stats.record_win(profit)
                 self._unclaimed_winnings += payout
+                print(f"  ✅ WIN +${profit:.2f} (unclaimed) | "
+                      f"P&L: ${self.stats.total_pnl:+.2f} | "
+                      f"Bank: ${self.stats.bankroll:.2f}")
+                self.telegram.win_alert(profit, self.stats.total_pnl)
 
-            print(f"  ✅ WIN +${profit:.2f} | "
-                  f"Cost ${cost:.2f} → Payout ${payout:.2f} | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.win_alert(profit, self.stats.total_pnl)
         else:
-            # Shares worth $0. We lose what we spent.
+            # ── LOSS: shares worth $0 ───────────────────────────────
             self.stats.record_loss(cost)
-
-            # Bankroll already had cost deducted on fill — no further change
-
+            # Bankroll already had cost deducted on fill
             print(f"  ❌ LOSS -${cost:.2f} | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(cost, self.stats.total_pnl)
 
     def _check_hourly_summary(self):
-        """Send hourly summary with claim reminder."""
         current_hour = int(time.time() // 3600)
         if current_hour != self._last_hour_check:
             self._last_hour_check = current_hour
@@ -348,12 +370,9 @@ class PolyBot:
             print(f"  Overall: {o['total_trades']} trades | "
                   f"P&L: ${o['pnl']:+.2f} | "
                   f"Bank: ${o['bankroll']:.2f}")
-
-            # ── Claim reminder ──────────────────────────────────────
             if self._unclaimed_winnings > 0:
-                print(f"  💰 Unclaimed winnings: ${self._unclaimed_winnings:.2f} "
-                      f"— visit Polymarket to claim!")
-
+                print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f} "
+                      f"— claim at polymarket.com/portfolio")
             print(f"{'═' * 55}\n")
 
             self.telegram.hourly_summary(h, o)
