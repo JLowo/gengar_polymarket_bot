@@ -21,6 +21,9 @@ from strategy import evaluate, StrategyConfig, TradingStats
 from executor import Executor, FILLED, FAILED
 from telegram_notifier import TelegramNotifier
 
+import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 EXIT_WINDOW_START = 5
 EXIT_WINDOW_END = 1
