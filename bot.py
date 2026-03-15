@@ -1,22 +1,12 @@
 #!/usr/bin/env python3
 """
-PolyBot v8 — Market Orders via Complement Engine
+PolyBot v8.1 — Complement Engine + Clean Decimals
 
-The breakthrough: Polymarket's order book has two layers.
-  - Raw token book: $0.06 bid / $0.94 ask (the void we kept hitting)
-  - Merged book: $0.50 bid / $0.51 ask (where all $10K/window flows)
-
-The merged book works through complement matching — buying UP at $0.51
-is the same as someone selling DOWN at $0.49. Market orders go through
-this engine and fill instantly.
-
-Flow per window:
-  1. Wait for BTC to move (signal from Binance WebSocket)
-  2. Preview market price via calculate_market_price()
-  3. Check: does edge still exist at this price?
-  4. Buy at market → instant fill through complement engine
-  5. At T-5s: if profitable, sell at market → instant exit
-  6. If held through close: resolve from BTC outcome
+Fixes from v8:
+  - Price caching: queries complement engine every 5s, not every tick
+  - Clean decimals: uses regular OrderArgs (not create_market_order)
+  - GTC orders: tolerates tiny slippage instead of FOK killing
+  - Sell takes shares directly (not notional USD)
 """
 
 import os
@@ -69,7 +59,7 @@ class PolyBot:
         self._opening_price: float = 0.0
         self._last_hour_check: int = 0
 
-        # ── Trade state ─────────────────────────────────────────────
+        # Trade state
         self._traded: bool = False
         self._trade_attempted: bool = False
         self._trade_side: str = ""
@@ -78,13 +68,19 @@ class PolyBot:
         self._trade_shares: float = 0.0
         self._trade_token_id: str = ""
 
-        # ── Exit state ──────────────────────────────────────────────
+        # Exit state
         self._exited: bool = False
         self._exit_attempted: bool = False
         self._exit_revenue: float = 0.0
 
-        # ── Unclaimed ───────────────────────────────────────────────
+        # Unclaimed
         self._unclaimed_winnings: float = 0.0
+
+        # Price cache
+        self._cached_up: float = 0.50
+        self._cached_down: float = 0.50
+        self._price_last_fetched: float = 0.0
+        self._PRICE_REFRESH: float = 5.0
 
     def start(self):
         if not self.dry_run:
@@ -98,7 +94,7 @@ class PolyBot:
 
         kf = self.strategy_config.kelly_fraction
         print("=" * 55)
-        print(f"  PolyBot v8 — Market Orders + Complement Engine")
+        print(f"  PolyBot v8.1 — Complement Engine")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
@@ -106,6 +102,7 @@ class PolyBot:
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
         print(f"  Exit:  T-{EXIT_WINDOW_START}s to T-{EXIT_WINDOW_END}s")
+        print(f"  Price refresh: every {self._PRICE_REFRESH:.0f}s")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
 
@@ -155,8 +152,6 @@ class PolyBot:
                 self.telegram.error_alert(str(e))
             time.sleep(1)
 
-    # ── Main tick ───────────────────────────────────────────────────
-
     def _tick(self):
         now = time.time()
         period_secs = PERIOD_SECONDS[self.period]
@@ -175,18 +170,18 @@ class PolyBot:
             self._opening_price = btc_price
             print(f"  📌 Open: ${btc_price:,.2f}")
 
-        # ── Holding: watch for exit ─────────────────────────────────
+        # Holding: watch for exit
         if self._traded and not self._exited:
             if EXIT_WINDOW_START >= seconds_remaining >= EXIT_WINDOW_END:
                 if not self._exit_attempted:
                     self._attempt_exit(seconds_remaining)
             return
 
-        # ── Already done for this window ────────────────────────────
+        # Already done
         if self._traded or self._trade_attempted:
             return
 
-        # ── Look for entry ──────────────────────────────────────────
+        # Look for entry
         up_price, down_price = self._get_market_prices(btc_price, seconds_remaining)
 
         signal_result = evaluate(
@@ -202,7 +197,7 @@ class PolyBot:
         if signal_result:
             self._execute_trade(signal_result, seconds_remaining)
 
-        # Status line
+        # Status line every 30s
         if int(now) % 30 == 0:
             delta = ((btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0
             d = "↑" if delta > 0 else "↓" if delta < 0 else "→"
@@ -213,8 +208,6 @@ class PolyBot:
                 f"UP ${up_price:.3f} DN ${down_price:.3f} | "
                 f"P&L ${self.stats.total_pnl:+.2f} [{state}]"
             )
-
-    # ── Window management ───────────────────────────────────────────
 
     def _on_new_window(self, window_ts: int):
         if self._current_window > 0:
@@ -229,6 +222,9 @@ class PolyBot:
         self._exited = False
         self._exit_attempted = False
         self._exit_revenue = 0.0
+        self._cached_up = 0.50
+        self._cached_down = 0.50
+        self._price_last_fetched = 0.0
 
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
         print(f"\n{'─' * 55}")
@@ -237,13 +233,7 @@ class PolyBot:
               f"P&L: ${self.stats.total_pnl:+.2f}")
         print(f"{'─' * 55}")
 
-# ── Market prices (merged book via complement engine) ───────────
-
-    # Cache to avoid hammering the API every tick
-    _cached_up: float = 0.50
-    _cached_down: float = 0.50
-    _price_last_fetched: float = 0.0
-    _PRICE_REFRESH_INTERVAL: float = 5.0  # Query every 5 seconds
+    # ── Market prices (cached, complement engine) ───────────────────
 
     def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
         if self.dry_run or not self.executor._initialized:
@@ -257,9 +247,9 @@ class PolyBot:
             up = round(min(max(implied, 0.02), 0.98), 3)
             return up, round(1.0 - up, 3)
 
-        # Return cached prices if fetched recently
+        # Return cached if fresh enough
         now = time.time()
-        if now - self._price_last_fetched < self._PRICE_REFRESH_INTERVAL:
+        if now - self._price_last_fetched < self._PRICE_REFRESH:
             return self._cached_up, self._cached_down
 
         try:
@@ -288,7 +278,7 @@ class PolyBot:
             print(f"[price] Error: {e}")
             return self._cached_up, self._cached_down
 
-    # ── Entry: buy at market ────────────────────────────────────────
+    # ── Entry ───────────────────────────────────────────────────────
 
     def _execute_trade(self, sig, seconds_remaining: float):
         self._trade_attempted = True
@@ -307,19 +297,17 @@ class PolyBot:
               f"prob={sig.true_prob:.2f} | BTC Δ={sig.btc_delta_pct:+.3f}%")
         print(f"     Kelly: ${trade_amount:.2f} | mkt ${sig.market_price:.3f} | T-{seconds_remaining:.0f}s")
 
-        # ── Preview: what would we actually pay? ────────────────────
+        # Preview actual market price and re-check edge
         if not self.dry_run and self.executor._initialized:
             actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
             if actual_price > 0:
                 actual_edge = sig.true_prob - actual_price
-                print(f"  📊 Actual market price: ${actual_price:.3f} "
-                      f"(edge at this price: {actual_edge:.3f})")
+                print(f"  📊 Actual price: ${actual_price:.3f} (edge: {actual_edge:.3f})")
 
                 if actual_edge < self.strategy_config.min_edge:
                     print(f"  ⚠️  Edge gone at market price — skipping")
                     return
 
-        # ── Buy at market ───────────────────────────────────────────
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount)
 
         if result.success:
@@ -336,7 +324,6 @@ class PolyBot:
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
-            print(f"     Exit window: T-{EXIT_WINDOW_START}s to T-{EXIT_WINDOW_END}s")
 
             self.telegram.trade_alert(
                 side=sig.side, price=result.price, amount=result.amount_usd,
@@ -346,7 +333,7 @@ class PolyBot:
         else:
             print(f"  ❌ Buy failed: {result.error}")
 
-    # ── Exit: sell at market before close ───────────────────────────
+    # ── Exit ────────────────────────────────────────────────────────
 
     def _attempt_exit(self, seconds_remaining: float):
         self._exit_attempted = True
@@ -372,15 +359,14 @@ class PolyBot:
                           f"${sim_price:.3f} | Profit: ${profit:.2f}")
             return
 
-        # ── Live: preview sell price ────────────────────────────────
-        sell_notional = round(self._trade_shares * self._trade_price, 2)
+        # Live: get sell price
         sell_price = self.executor.get_market_price(
-            self._trade_token_id, "SELL", sell_notional
+            self._trade_token_id, "SELL",
+            round(self._trade_shares * self._trade_price, 2),
         )
 
         if sell_price <= 0 or sell_price <= self._trade_price:
-            print(f"  ⏳ Sell price ${sell_price:.3f} not profitable "
-                  f"(bought at ${self._trade_price:.3f}) — holding")
+            print(f"  ⏳ Sell @ ${sell_price:.3f} not profitable — holding")
             return
 
         print(f"  💰 Exiting: sell @ ${sell_price:.3f} > buy ${self._trade_price:.3f} | "
@@ -388,7 +374,8 @@ class PolyBot:
 
         result = self.executor.sell(
             token_id=self._trade_token_id,
-            amount_usd=sell_notional,
+            shares=self._trade_shares,
+            price=sell_price,
         )
 
         if result.success:
@@ -413,7 +400,6 @@ class PolyBot:
             self.telegram.win_alert(profit, self.stats.total_pnl)
             return
 
-        # Held through resolution
         btc_price, _ = self.price_feed.get_price()
         if self._opening_price <= 0 or btc_price <= 0:
             return
@@ -426,13 +412,12 @@ class PolyBot:
             payout = shares * 1.0
             profit = payout - cost
 
-            # Try to sell at $0.99 to claim
             if self._trade_token_id and not self._trade_token_id.startswith("DRY-"):
-                print(f"  💰 Claiming: sell {shares:.0f} shares @ market...")
-                claim_notional = round(shares * 0.99, 2)
+                print(f"  💰 Claiming: sell {shares:.0f} shares @ $0.99...")
                 claim = self.executor.sell(
                     token_id=self._trade_token_id,
-                    amount_usd=claim_notional,
+                    shares=shares,
+                    price=0.99,
                 )
                 if claim.success:
                     self.stats.bankroll += claim.amount_usd
@@ -446,7 +431,6 @@ class PolyBot:
                 else:
                     print(f"  ⚠️  Claim failed: {claim.error}")
 
-            # Fallback: count theoretical payout
             self.stats.bankroll += payout
             self.stats.record_win(profit)
             self._unclaimed_winnings += payout
@@ -461,7 +445,7 @@ class PolyBot:
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(cost, self.stats.total_pnl)
 
-    # ── Hourly summary ──────────────────────────────────────────────
+    # ── Hourly + shutdown ───────────────────────────────────────────
 
     def _check_hourly_summary(self):
         current_hour = int(time.time() // 3600)
@@ -485,8 +469,6 @@ class PolyBot:
             print(f"{'═' * 55}\n")
             self.telegram.hourly_summary(h, o)
             self.stats.hourly.reset()
-
-    # ── Shutdown ────────────────────────────────────────────────────
 
     def _handle_shutdown(self, signum, frame):
         print(f"\n\n🛑 Shutting down...")

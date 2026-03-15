@@ -1,15 +1,13 @@
 """Order executor for Polymarket CLOB.
 
-v8 — Market orders via complement matching engine.
+v8.1 — Complement engine pricing + clean decimal execution.
 
-Previous versions placed limit orders on the raw token book, which has
-a $0.94/$0.06 void in the middle. All real volume flows through the
-complement engine, which matches UP buyers with DOWN sellers.
+Strategy:
+  1. calculate_market_price() → get real price from merged book
+  2. calculate_order_size() → round to clean decimals
+  3. create_order() + post_order(GTC) → fill with slippage tolerance
 
-Now we use:
-  - calculate_market_price() to preview what we'd actually pay
-  - create_market_order() + post_order() to fill instantly
-  - Same methods for selling (exit + claim)
+This avoids create_market_order() which has internal rounding issues.
 """
 
 import time
@@ -18,7 +16,7 @@ from typing import Optional
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
-    MarketOrderArgs,
+    OrderArgs,
     OrderType,
     BalanceAllowanceParams,
     AssetType,
@@ -26,13 +24,12 @@ from py_clob_client.clob_types import (
 from py_clob_client.constants import POLYGON
 
 
-# ── Constants ───────────────────────────────────────────────────────
-
 FILLED = "FILLED"
 REJECTED = "REJECTED"
 FAILED = "FAILED"
 
-MIN_AMOUNT_USD = 1.0   # Minimum trade in USD
+MIN_SHARES = 5.0
+MIN_AMOUNT_USD = 1.0
 
 
 @dataclass
@@ -41,12 +38,34 @@ class OrderResult:
     order_id: str = ""
     status: str = FAILED
     side: str = ""
-    price: float = 0.0          # Effective price per share
-    amount_usd: float = 0.0     # USD spent (buy) or received (sell)
-    shares: float = 0.0         # Shares received (buy) or sold (sell)
+    price: float = 0.0
+    amount_usd: float = 0.0
+    shares: float = 0.0
     token_id: str = ""
     error: str = ""
     dry_run: bool = True
+
+
+def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
+    """Integer shares × price = clean 2-decimal USD amount."""
+    if price <= 0 or max_usd <= 0:
+        return 0.0, 0.0
+    price_cents = round(price * 100)
+    max_usd_cents = int(max_usd * 100)
+    max_shares = max_usd_cents // price_cents if price_cents > 0 else 0
+
+    if max_shares < MIN_SHARES:
+        min_cost_cents = int(MIN_SHARES) * price_cents
+        if min_cost_cents <= max_usd_cents:
+            max_shares = int(MIN_SHARES)
+        else:
+            return 0.0, 0.0
+
+    shares = int(max_shares)
+    spend = shares * price_cents / 100.0
+    if shares < MIN_SHARES:
+        return 0.0, 0.0
+    return float(shares), spend
 
 
 class Executor:
@@ -56,8 +75,6 @@ class Executor:
         self.safe_address = safe_address
         self.client: Optional[ClobClient] = None
         self._initialized = False
-
-    # ── Init ────────────────────────────────────────────────────────
 
     def initialize(self) -> bool:
         try:
@@ -77,8 +94,6 @@ class Executor:
             print(f"[executor] Init failed: {e}")
             return False
 
-    # ── Balance ─────────────────────────────────────────────────────
-
     def get_balance(self) -> float:
         if not self._initialized:
             return 0.0
@@ -90,15 +105,10 @@ class Executor:
             print(f"[executor] Balance check failed: {e}")
             return 0.0
 
-    # ── Price check (merged book via complement engine) ─────────────
+    # ── Price from complement engine ────────────────────────────────
 
     def get_market_price(self, token_id: str, side: str, amount_usd: float) -> float:
-        """Get the effective price we'd pay/receive for a market order.
-
-        This queries the MERGED book (complement engine) — the same
-        book the Polymarket UI shows. Returns price per share.
-        Returns 0.0 on error.
-        """
+        """What would we actually pay/receive? Queries the merged book."""
         if not self._initialized:
             return 0.0
         try:
@@ -106,156 +116,132 @@ class Executor:
                 token_id=token_id,
                 side=side,
                 amount=amount_usd,
-                order_type=OrderType.FOK,
+                order_type=OrderType.GTC,
             )
             return float(price) if price else 0.0
         except Exception as e:
             print(f"[executor] Price check failed: {e}")
             return 0.0
 
-    # ── Buy (market order) ──────────────────────────────────────────
+    # ── Buy ─────────────────────────────────────────────────────────
 
     def buy(self, token_id: str, amount_usd: float) -> OrderResult:
-        """Buy shares at market price via complement engine.
+        """Buy shares using complement engine price + clean decimals.
 
-        amount_usd: how much to spend.
-        Returns shares received and effective price.
+        1. Get real market price via calculate_market_price
+        2. Round to integer shares for clean decimals
+        3. Place as regular GTC order (tolerates tiny slippage)
         """
-        amount_usd = float(amount_usd)
+        amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Amount ${amount_usd:.2f} below minimum ${MIN_AMOUNT_USD:.2f}",
-                side="BUY",
+                error=f"Amount ${amount_usd:.2f} below min", side="BUY",
             )
 
-        # Round to 2 decimals (API requirement)
-        amount_usd = round(amount_usd, 2)
-
-        # ── Dry run ─────────────────────────────────────────────────
         if self.dry_run:
-            # Simulate: assume we'd pay roughly $0.55 per share
             sim_price = 0.55
-            sim_shares = amount_usd / sim_price
             return OrderResult(
                 success=True, order_id=f"DRY-{int(time.time())}",
-                status=FILLED, side="BUY",
-                price=sim_price, amount_usd=amount_usd,
-                shares=sim_shares,
+                status=FILLED, side="BUY", price=sim_price,
+                amount_usd=amount_usd, shares=amount_usd / sim_price,
                 token_id=token_id[:16] + "...", dry_run=True,
             )
 
         if not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        # ── Preview price ───────────────────────────────────────────
-        preview_price = self.get_market_price(token_id, "BUY", amount_usd)
-        if preview_price > 0:
-            preview_shares = amount_usd / preview_price
-            print(f"  📊 Market price: ${preview_price:.3f}/share "
-                  f"→ ~{preview_shares:.0f} shares for ${amount_usd:.2f}")
-
-        # ── Send market order ───────────────────────────────────────
-        try:
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=amount_usd,
-                side="BUY",
-            )
-
-            signed_order = self.client.create_market_order(order_args)
-            result = self.client.post_order(signed_order, OrderType.GTC)
-
-            order_id = result.get("orderID", "")
-            if not order_id:
-                return OrderResult(
-                    success=False, status=REJECTED,
-                    error="No orderID in response",
-                    side="BUY", token_id=token_id[:16] + "...",
-                )
-
-            # Verify fill
-            fill = self._check_order(order_id)
-            if fill:
-                size_matched = float(
-                    fill.get("size_matched", 0) if isinstance(fill, dict)
-                    else getattr(fill, "size_matched", 0)
-                )
-                if size_matched > 0:
-                    fill_price = float(
-                        fill.get("price", preview_price) if isinstance(fill, dict)
-                        else getattr(fill, "price", preview_price)
-                    )
-                    actual_price = amount_usd / size_matched if size_matched > 0 else fill_price
-                    return OrderResult(
-                        success=True, order_id=order_id,
-                        status=FILLED, side="BUY",
-                        price=actual_price, amount_usd=amount_usd,
-                        shares=size_matched,
-                        token_id=token_id[:16] + "...", dry_run=False,
-                    )
-
+        # Step 1: get real price from complement engine
+        market_price = self.get_market_price(token_id, "BUY", amount_usd)
+        if market_price <= 0:
             return OrderResult(
-                success=False, order_id=order_id, status=FAILED,
-                error="Market order not filled — unexpected",
-                side="BUY", token_id=token_id[:16] + "...",
+                success=False, status=FAILED,
+                error="Could not get market price", side="BUY",
+                token_id=token_id[:16] + "...",
             )
 
-        except Exception as e:
-            return OrderResult(
-                success=False, status=FAILED, error=str(e),
-                side="BUY", token_id=token_id[:16] + "...",
-            )
-
-    # ── Sell (market order) ─────────────────────────────────────────
-
-    def sell(self, token_id: str, amount_usd: float) -> OrderResult:
-        """Sell shares at market price. amount_usd = notional value to sell."""
-        amount_usd = float(round(amount_usd, 2))
-        if amount_usd < MIN_AMOUNT_USD:
+        # Step 2: clean decimal sizing
+        shares, spend = calculate_order_size(market_price, amount_usd)
+        if shares < MIN_SHARES or spend <= 0:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Amount ${amount_usd:.2f} below minimum",
-                side="SELL",
+                error=f"Can't get {MIN_SHARES:.0f}+ shares at ${market_price:.3f} "
+                      f"within ${amount_usd:.2f}",
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
+        print(f"  📊 Market price: ${market_price:.3f}/share "
+              f"→ {shares:.0f} shares for ${spend:.2f}")
+
+        # Step 3: place regular order at market price, GTC for slippage
+        return self._place_order(token_id, "BUY", market_price, shares, spend)
+
+    # ── Sell ────────────────────────────────────────────────────────
+
+    def sell(self, token_id: str, shares: float, price: float = 0.0) -> OrderResult:
+        """Sell shares. If price=0, gets market price automatically."""
+        sell_shares = int(shares)
+        if sell_shares < 1:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error="Less than 1 share", side="SELL",
             )
 
         if self.dry_run:
-            sim_price = 0.95
-            sim_shares = amount_usd / sim_price
+            sim_price = price if price > 0 else 0.90
+            revenue = sell_shares * sim_price
             return OrderResult(
                 success=True, order_id=f"DRY-SELL-{int(time.time())}",
-                status=FILLED, side="SELL",
-                price=sim_price, amount_usd=amount_usd,
-                shares=sim_shares,
+                status=FILLED, side="SELL", price=sim_price,
+                amount_usd=revenue, shares=float(sell_shares),
                 token_id=token_id[:16] + "...", dry_run=True,
             )
 
         if not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        # Preview
-        preview_price = self.get_market_price(token_id, "SELL", amount_usd)
-        if preview_price > 0:
-            print(f"  📊 Sell price: ${preview_price:.3f}/share")
+        # Get sell price from complement engine if not provided
+        if price <= 0:
+            notional = float(sell_shares) * 0.50  # rough estimate for price query
+            price = self.get_market_price(token_id, "SELL", notional)
+            if price <= 0:
+                return OrderResult(
+                    success=False, status=FAILED,
+                    error="Could not get sell price", side="SELL",
+                    token_id=token_id[:16] + "...",
+                )
 
+        spend = round(sell_shares * price, 2)
+        print(f"  📊 Sell: {sell_shares} shares @ ${price:.3f} = ${spend:.2f}")
+
+        return self._place_order(token_id, "SELL", price, float(sell_shares), spend)
+
+    # ── Internal: place order with clean decimals ───────────────────
+
+    def _place_order(
+        self, token_id: str, side: str, price: float, shares: float, spend: float,
+    ) -> OrderResult:
+        """Place a regular order at a specific price. GTC for slippage tolerance."""
         try:
-            order_args = MarketOrderArgs(
+            order_args = OrderArgs(
+                price=price,
+                size=shares,
+                side=side,
                 token_id=token_id,
-                amount=amount_usd,
-                side="SELL",
             )
 
-            signed_order = self.client.create_market_order(order_args)
+            signed_order = self.client.create_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
 
             order_id = result.get("orderID", "")
             if not order_id:
                 return OrderResult(
                     success=False, status=REJECTED,
-                    error="No orderID from sell",
-                    side="SELL", token_id=token_id[:16] + "...",
+                    error="No orderID", side=side, price=price,
+                    token_id=token_id[:16] + "...",
                 )
 
+            # Check fill
             fill = self._check_order(order_id)
             if fill:
                 size_matched = float(
@@ -264,31 +250,50 @@ class Executor:
                 )
                 if size_matched > 0:
                     fill_price = float(
-                        fill.get("price", preview_price) if isinstance(fill, dict)
-                        else getattr(fill, "price", preview_price)
+                        fill.get("price", price) if isinstance(fill, dict)
+                        else getattr(fill, "price", price)
                     )
-                    received = size_matched * fill_price
+                    actual_usd = size_matched * fill_price
                     return OrderResult(
-                        success=True, order_id=order_id,
-                        status=FILLED, side="SELL",
-                        price=fill_price, amount_usd=received,
-                        shares=size_matched,
+                        success=True, order_id=order_id, status=FILLED,
+                        side=side, price=fill_price,
+                        amount_usd=actual_usd, shares=size_matched,
                         token_id=token_id[:16] + "...", dry_run=False,
                     )
 
+            # GTC on book but not instantly filled — wait briefly
+            time.sleep(2)
+            fill = self._check_order(order_id)
+            if fill:
+                size_matched = float(
+                    fill.get("size_matched", 0) if isinstance(fill, dict)
+                    else getattr(fill, "size_matched", 0)
+                )
+                if size_matched > 0:
+                    fill_price = float(
+                        fill.get("price", price) if isinstance(fill, dict)
+                        else getattr(fill, "price", price)
+                    )
+                    return OrderResult(
+                        success=True, order_id=order_id, status=FILLED,
+                        side=side, price=fill_price,
+                        amount_usd=size_matched * fill_price, shares=size_matched,
+                        token_id=token_id[:16] + "...", dry_run=False,
+                    )
+
+            # Still not filled — cancel
+            self.cancel_order(order_id)
             return OrderResult(
                 success=False, order_id=order_id, status=FAILED,
-                error="Sell not filled",
-                side="SELL", token_id=token_id[:16] + "...",
+                error="Order not filled within 2s",
+                side=side, price=price, token_id=token_id[:16] + "...",
             )
 
         except Exception as e:
             return OrderResult(
                 success=False, status=FAILED, error=str(e),
-                side="SELL", token_id=token_id[:16] + "...",
+                side=side, price=price, token_id=token_id[:16] + "...",
             )
-
-    # ── Helpers ─────────────────────────────────────────────────────
 
     def _check_order(self, order_id: str) -> Optional[dict]:
         if not self._initialized:
@@ -298,6 +303,16 @@ class Executor:
         except Exception as e:
             print(f"[executor] Order check failed: {e}")
             return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        if self.dry_run or not self._initialized:
+            return True
+        try:
+            self.client.cancel(order_id=order_id)
+            return True
+        except Exception as e:
+            print(f"[executor] Cancel failed: {e}")
+            return False
 
     def cancel_all(self) -> bool:
         if self.dry_run or not self._initialized:
