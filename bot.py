@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-PolyBot v4 — Oracle Lag Scalper with Kelly Criterion
+PolyBot v6 — Oracle Lag Scalper with Kelly Criterion
 
-Fixes applied:
-  1. Minimum 5 shares enforced, decimals cleaned (executor)
-  2. P&L from trade math — buying shares ≠ losing money
-  3. FOK orders — instant fill or cancel, liquidity-aware sizing
-  4. Auto-claim via SELL at $0.99 after win (loses ~1¢/share)
+Execution improvements:
+  - FOK first, GTC fallback (handled in executor)
+  - Max 1 trade attempt per window (executor handles retries internally)
+  - Detailed pre-order diagnostics
+  - Two-phase exit: sell before close → fallback claim after resolution
 """
 
 import os
@@ -20,6 +20,10 @@ from price_feed import BinancePriceFeed
 from strategy import evaluate, StrategyConfig, TradingStats
 from executor import Executor, FILLED, CANCELLED, FAILED
 from telegram_notifier import TelegramNotifier
+
+
+EXIT_WINDOW_START = 5
+EXIT_WINDOW_END = 1
 
 
 class PolyBot:
@@ -53,18 +57,23 @@ class PolyBot:
         self._running = False
         self._current_window: int = 0
         self._window_traded: bool = False
+        self._trade_attempted: bool = False   # Prevents retry spam
         self._opening_price: float = 0.0
         self._last_hour_check: int = 0
 
-        # ── Trade tracking ──────────────────────────────────────────
+        # Trade tracking
         self._last_trade_side: str = ""
         self._last_trade_price: float = 0.0
         self._last_trade_cost: float = 0.0
         self._last_trade_shares: float = 0.0
-        self._last_trade_token_id: str = ""   # Full token ID for claiming
+        self._last_trade_token_id: str = ""
         self._last_order_filled: bool = False
 
-        # ── Unclaimed winnings (claim failed or pending) ────────────
+        # Exit tracking
+        self._position_exited: bool = False
+        self._exit_revenue: float = 0.0
+
+        # Unclaimed
         self._unclaimed_winnings: float = 0.0
 
     def start(self):
@@ -79,15 +88,16 @@ class PolyBot:
 
         kf = self.strategy_config.kelly_fraction
         print("=" * 55)
-        print(f"  PolyBot v4 — Oracle Lag Scalper + Kelly")
+        print(f"  PolyBot v6 — Oracle Lag Scalper + Kelly")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
         print(f"  Min edge: {self.strategy_config.min_edge*100:.1f}%")
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
+        print(f"  Exit:  T-{EXIT_WINDOW_START}s to T-{EXIT_WINDOW_END}s")
+        print(f"  Order: FOK → GTC (10s timeout)")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
-        print(f"  Auto-claim: SELL @ $0.99 (loses ~1¢/share)")
         print("=" * 55)
 
         if not self.dry_run:
@@ -154,9 +164,19 @@ class PolyBot:
             self._opening_price = btc_price
             print(f"  📌 Open: ${btc_price:,.2f}")
 
+        # ── If holding shares, watch for exit window ────────────────
         if self._window_traded:
+            if self._position_exited:
+                return
+            if EXIT_WINDOW_START >= seconds_remaining >= EXIT_WINDOW_END:
+                self._attempt_exit(seconds_remaining)
             return
 
+        # ── Already attempted this window (and failed) → skip ───────
+        if self._trade_attempted:
+            return
+
+        # ── Look for entry signals ──────────────────────────────────
         up_price, down_price = self._get_market_prices(btc_price, seconds_remaining)
 
         signal_result = evaluate(
@@ -190,8 +210,11 @@ class PolyBot:
 
         self._current_window = window_ts
         self._window_traded = False
+        self._trade_attempted = False
         self._opening_price = 0.0
         self._last_order_filled = False
+        self._position_exited = False
+        self._exit_revenue = 0.0
 
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
         print(f"\n{'─' * 55}")
@@ -220,7 +243,12 @@ class PolyBot:
         except Exception:
             return 0.50, 0.50
 
+    # ── Entry ───────────────────────────────────────────────────────
+
     def _execute_trade(self, sig, seconds_remaining: float):
+        # Mark as attempted regardless of outcome — no retry spam
+        self._trade_attempted = True
+
         market = get_current_market(self.period) if not self.dry_run else None
         token_id = ""
         if market:
@@ -235,7 +263,7 @@ class PolyBot:
               f"prob={sig.true_prob:.2f} | BTC Δ={sig.btc_delta_pct:+.3f}%")
         print(f"     Kelly: ${trade_amount:.2f} | mkt ${sig.market_price:.3f} | T-{seconds_remaining:.0f}s")
 
-        # ── Place FOK order ─────────────────────────────────────────
+        # place_order handles FOK → GTC fallback internally
         result = self.executor.place_order(
             token_id=token_id,
             side="BUY",
@@ -250,15 +278,15 @@ class PolyBot:
             self._last_trade_price = result.price
             self._last_trade_cost = result.amount_spent
             self._last_trade_shares = result.size_filled
-            self._last_trade_token_id = token_id  # Full ID for claiming later
+            self._last_trade_token_id = token_id
 
-            # Cost deducted from bankroll (money → shares)
             self.stats.bankroll -= result.amount_spent
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
 
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.size_filled:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_spent:.2f}")
+            print(f"     Exit window: T-{EXIT_WINDOW_START}s to T-{EXIT_WINDOW_END}s")
 
             self.telegram.trade_alert(
                 side=sig.side,
@@ -270,19 +298,75 @@ class PolyBot:
                 kelly_size=sig.kelly_size,
             )
         else:
-            print(f"  ⚠️  {result.status}: {result.error}")
-            if result.status == FAILED:
-                self.telegram.error_alert(f"Order failed: {result.error}")
+            print(f"  ❌ Not filled (FOK + GTC both failed): {result.error}")
+            print(f"     Skipping this window")
+
+    # ── Phase 1: sell before close ──────────────────────────────────
+
+    def _attempt_exit(self, seconds_remaining: float):
+        if not self._last_order_filled or self._position_exited:
+            return
+
+        if self.dry_run:
+            btc_price, _ = self.price_feed.get_price()
+            if self._opening_price <= 0:
+                return
+            delta_pct = (btc_price - self._opening_price) / self._opening_price
+            on_our_side = (delta_pct > 0 and self._last_trade_side == "UP") or \
+                          (delta_pct < 0 and self._last_trade_side == "DOWN")
+            if on_our_side and abs(delta_pct) > 0.0001:
+                import math
+                sim_bid = min(0.50 + abs(delta_pct) * 5000 * 0.45, 0.97)
+                sim_bid = round(sim_bid, 2)
+                if sim_bid > self._last_trade_price:
+                    revenue = self._last_trade_shares * sim_bid
+                    self._position_exited = True
+                    self._exit_revenue = revenue
+                    self.stats.bankroll += revenue
+                    profit = revenue - self._last_trade_cost
+                    print(f"  💰 EXIT (paper): {self._last_trade_shares:.0f} shares @ "
+                          f"${sim_bid:.3f} = ${revenue:.2f} | Profit: ${profit:.2f}")
+            return
+
+        best_bid = self.executor.get_best_bid(self._last_trade_token_id)
+        if best_bid <= 0 or best_bid <= self._last_trade_price:
+            return
+
+        print(f"  💰 Exiting: bid ${best_bid:.3f} > buy ${self._last_trade_price:.3f} | T-{seconds_remaining:.0f}s")
+
+        result = self.executor.sell_shares(
+            token_id=self._last_trade_token_id,
+            shares=self._last_trade_shares,
+            price=best_bid,
+        )
+
+        if result.success:
+            self._position_exited = True
+            self._exit_revenue = result.amount_spent
+            self.stats.bankroll += self._exit_revenue
+            profit = self._exit_revenue - self._last_trade_cost
+            print(f"  💰 SOLD: {result.size_filled:.0f} shares @ ${result.price:.3f} "
+                  f"= ${self._exit_revenue:.2f} | Profit: ${profit:+.2f}")
+        else:
+            print(f"  ⚠️  Exit failed: {result.error} — holding through resolution")
+
+    # ── Resolve ─────────────────────────────────────────────────────
 
     def _resolve_previous_trade(self):
-        """Resolve the previous window's trade.
-
-        WIN:  profit = payout - cost.  Attempt auto-claim (sell @ $0.99).
-        LOSS: loss = cost.  Shares are worthless, nothing to claim.
-        """
         if not self._last_order_filled:
             return
 
+        # Already exited before close
+        if self._position_exited:
+            profit = self._exit_revenue - self._last_trade_cost
+            self.stats.record_win(profit)
+            print(f"  ✅ WIN (pre-close) +${profit:.2f} | "
+                  f"P&L: ${self.stats.total_pnl:+.2f} | "
+                  f"Bank: ${self.stats.bankroll:.2f}")
+            self.telegram.win_alert(profit, self.stats.total_pnl)
+            return
+
+        # Held through resolution
         btc_price, _ = self.price_feed.get_price()
         if self._opening_price <= 0 or btc_price <= 0:
             return
@@ -292,66 +376,56 @@ class PolyBot:
         shares = self._last_trade_shares
 
         if won:
-            # ── WIN: shares pay $1 each ─────────────────────────────
             payout = shares * 1.0
             profit = payout - cost
-
-            # Try auto-claim: sell shares at $0.99
             claimed = False
             claim_payout = 0.0
 
             if self._last_trade_token_id and not self._last_trade_token_id.startswith("DRY-"):
-                print(f"  💰 Claiming: selling {shares:.0f} shares @ $0.99...")
+                print(f"  💰 Fallback claim: selling {shares:.0f} shares @ $0.99...")
                 claim = self.executor.claim_winnings(
-                    token_id=self._last_trade_token_id,
-                    shares=shares,
+                    token_id=self._last_trade_token_id, shares=shares,
                 )
                 if claim.success:
                     claimed = True
-                    claim_payout = claim.amount_spent  # USD received from sell
-                    claim_loss = payout - claim_payout
-                    print(f"  💰 Claimed ${claim_payout:.2f} "
-                          f"(lost ${claim_loss:.2f} in fees)")
+                    claim_payout = claim.amount_spent
+                    print(f"  💰 Claimed ${claim_payout:.2f}")
                 else:
                     print(f"  ⚠️  Claim failed: {claim.error}")
                     print(f"     Claim manually at polymarket.com/portfolio")
             else:
-                claimed = True  # Dry run, auto-claim assumed
+                claimed = True
                 claim_payout = payout
 
             if claimed:
-                # Money is back in USDC
                 self.stats.bankroll += claim_payout
                 actual_profit = claim_payout - cost
                 self.stats.record_win(actual_profit)
-                print(f"  ✅ WIN +${actual_profit:.2f} | "
+                print(f"  ✅ WIN (claimed) +${actual_profit:.2f} | "
                       f"P&L: ${self.stats.total_pnl:+.2f} | "
                       f"Bank: ${self.stats.bankroll:.2f}")
                 self.telegram.win_alert(actual_profit, self.stats.total_pnl)
             else:
-                # Claim failed — track theoretical profit, remind user
-                self.stats.bankroll += payout  # Optimistic: shares exist
+                self.stats.bankroll += payout
                 self.stats.record_win(profit)
                 self._unclaimed_winnings += payout
                 print(f"  ✅ WIN +${profit:.2f} (unclaimed) | "
                       f"P&L: ${self.stats.total_pnl:+.2f} | "
                       f"Bank: ${self.stats.bankroll:.2f}")
                 self.telegram.win_alert(profit, self.stats.total_pnl)
-
         else:
-            # ── LOSS: shares worth $0 ───────────────────────────────
             self.stats.record_loss(cost)
-            # Bankroll already had cost deducted on fill
             print(f"  ❌ LOSS -${cost:.2f} | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(cost, self.stats.total_pnl)
 
+    # ── Hourly + shutdown ───────────────────────────────────────────
+
     def _check_hourly_summary(self):
         current_hour = int(time.time() // 3600)
         if current_hour != self._last_hour_check:
             self._last_hour_check = current_hour
-
             h = self.stats.hourly.to_dict()
             o = self.stats.to_dict()
 
@@ -363,16 +437,13 @@ class PolyBot:
             if h['trades'] > 0:
                 print(f"  Avg edge: {h['avg_edge']*100:.1f}% | "
                       f"Avg delta: {h['avg_delta']:.3f}%")
-                print(f"  Best: ${h['best_trade']:+.2f} | "
-                      f"Worst: ${h['worst_trade']:+.2f}")
             print(f"  Windows: {h['windows_seen']} seen, "
                   f"{h['windows_skipped']} skipped")
             print(f"  Overall: {o['total_trades']} trades | "
                   f"P&L: ${o['pnl']:+.2f} | "
                   f"Bank: ${o['bankroll']:.2f}")
             if self._unclaimed_winnings > 0:
-                print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f} "
-                      f"— claim at polymarket.com/portfolio")
+                print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
             print(f"{'═' * 55}\n")
 
             self.telegram.hourly_summary(h, o)
@@ -392,8 +463,7 @@ class PolyBot:
               f"WR: {o['win_rate']:.1f}%")
         print(f"  P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
         if self._unclaimed_winnings > 0:
-            print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f} "
-                  f"— claim at polymarket.com/portfolio")
+            print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
         print(f"{'═' * 55}")
 
         self.telegram.status_update(o)
