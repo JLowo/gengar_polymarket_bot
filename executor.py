@@ -1,11 +1,11 @@
 """Order executor for Polymarket CLOB.
 
-v6 — Execution improvements:
-  - FOK first, GTC fallback with 10s timeout
-  - Detailed pre-order diagnostics (shares, liquidity, spread)
-  - Minimum 5 shares, clean decimals
-  - sell_shares() for pre-close exit
-  - claim_winnings() for post-resolution fallback
+v7 — Maker-first strategy:
+  - If book has liquidity at our price → FOK (instant taker fill)
+  - If book is thin/empty → GTC (sit on book as maker, catch volume)
+  - Persistent fill checking for GTC orders across ticks
+  - Detailed diagnostics before every order
+  - sell_shares() for exit, claim_winnings() for post-resolution
 """
 
 import math
@@ -26,19 +26,19 @@ from py_clob_client.constants import POLYGON
 # ── Constants ───────────────────────────────────────────────────────
 
 FILLED = "FILLED"
+PLACED = "PLACED"       # GTC on book, not yet matched
 REJECTED = "REJECTED"
 CANCELLED = "CANCELLED"
 FAILED = "FAILED"
 
 MIN_SHARES = 5.0
 CLAIM_SELL_PRICE = 0.99
-GTC_TIMEOUT = 10.0       # Seconds to wait for GTC fill before cancelling
-GTC_POLL_INTERVAL = 2.0  # Poll every 2s during GTC wait
 
 
 @dataclass
 class OrderResult:
-    success: bool
+    success: bool           # For FOK: did it fill? For GTC: is it on the book?
+    filled: bool = False    # Actually matched with a counterparty?
     order_id: str = ""
     status: str = FAILED
     side: str = ""
@@ -53,23 +53,19 @@ class OrderResult:
 
 @dataclass
 class BookSnapshot:
-    """Pre-order diagnostics about the order book."""
     best_bid: float = 0.0
     best_ask: float = 0.0
     spread: float = 0.0
-    liquidity_at_price: float = 0.0   # Shares available at our price
-    total_ask_depth: float = 0.0      # Total shares on ask side
-    total_bid_depth: float = 0.0      # Total shares on bid side
+    liquidity_at_price: float = 0.0
+    total_ask_depth: float = 0.0
+    total_bid_depth: float = 0.0
 
 
 # ── Decimal-safe share sizing ───────────────────────────────────────
 
 def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
-    """Largest whole-number share count where shares × price ≤ max_usd
-    and has at most 2 decimal places."""
     if price <= 0 or max_usd <= 0:
         return 0.0, 0.0
-
     price_cents = round(price * 100)
     max_usd_cents = int(max_usd * 100)
     max_shares = max_usd_cents // price_cents if price_cents > 0 else 0
@@ -89,12 +85,7 @@ def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
 
 
 class Executor:
-    def __init__(
-        self,
-        private_key: str,
-        safe_address: str = "",
-        dry_run: bool = True,
-    ):
+    def __init__(self, private_key: str, safe_address: str = "", dry_run: bool = True):
         self.dry_run = dry_run
         self.private_key = private_key
         self.safe_address = safe_address
@@ -130,10 +121,9 @@ class Executor:
             print(f"[executor] Balance check failed: {e}")
             return 0.0
 
-    # ── Order book reading ──────────────────────────────────────────
+    # ── Order book ──────────────────────────────────────────────────
 
     def _read_book(self, token_id: str) -> tuple[list, list]:
-        """Read order book → (asks, bids) as lists of (price, size)."""
         if not self._initialized:
             return [], []
         try:
@@ -144,7 +134,6 @@ class Executor:
             else:
                 raw_asks = book.get("asks", [])
                 raw_bids = book.get("bids", [])
-
             asks, bids = [], []
             for level in raw_asks:
                 p = float(level.price if hasattr(level, 'price') else level.get("price", 0))
@@ -160,33 +149,27 @@ class Executor:
             return [], []
 
     def get_book_snapshot(self, token_id: str, our_price: float, side: str = "BUY") -> BookSnapshot:
-        """Get a diagnostic snapshot of the order book."""
         asks, bids = self._read_book(token_id)
         snap = BookSnapshot()
-
         if bids:
             snap.best_bid = bids[0][0]
             snap.total_bid_depth = sum(s for _, s in bids)
         if asks:
             snap.best_ask = asks[0][0]
             snap.total_ask_depth = sum(s for _, s in asks)
-
         if snap.best_bid > 0 and snap.best_ask > 0:
             snap.spread = snap.best_ask - snap.best_bid
-
-        # Liquidity available at our target price
         if side.upper() == "BUY":
             snap.liquidity_at_price = sum(s for p, s in asks if p <= our_price)
         else:
             snap.liquidity_at_price = sum(s for p, s in bids if p >= our_price)
-
         return snap
 
     def get_best_bid(self, token_id: str) -> float:
         _, bids = self._read_book(token_id)
         return bids[0][0] if bids else 0.0
 
-    # ── Place order: FOK first, GTC fallback ────────────────────────
+    # ── Smart order placement ───────────────────────────────────────
 
     def place_order(
         self,
@@ -195,31 +178,30 @@ class Executor:
         price: float,
         amount_usd: float,
     ) -> OrderResult:
-        """Place order with FOK → GTC fallback strategy.
+        """Smart order routing: FOK if liquidity exists, GTC maker if not.
 
-        1. Try FOK (instant fill or cancel)
-        2. If FOK fails, place GTC and wait up to 10 seconds
-        3. If GTC doesn't fill in time, cancel it
-
-        Prints detailed diagnostics before placing.
+        Returns OrderResult with:
+          - filled=True → instant fill (FOK matched)
+          - filled=False, status=PLACED → GTC on book, check later
+          - success=False → rejected/failed
         """
         price = float(price)
         amount_usd = float(amount_usd)
 
-        # ── Calculate share size ────────────────────────────────────
+        # Size calculation
         shares, spend = calculate_order_size(price, amount_usd)
         if shares < MIN_SHARES or spend <= 0:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Can't meet min {MIN_SHARES:.0f} shares (got {shares:.0f}) "
-                      f"within ${amount_usd:.2f} at ${price}",
+                error=f"Can't meet min {MIN_SHARES:.0f} shares within ${amount_usd:.2f} at ${price}",
                 side=side, price=price, token_id=token_id[:16] + "...",
             )
 
-        # ── Dry run ─────────────────────────────────────────────────
+        # Dry run
         if self.dry_run:
             return OrderResult(
-                success=True, order_id=f"DRY-{int(time.time())}",
+                success=True, filled=True,
+                order_id=f"DRY-{int(time.time())}",
                 status=FILLED, side=side, price=price,
                 size_requested=shares, size_filled=shares, amount_spent=spend,
                 token_id=token_id[:16] + "...", dry_run=True,
@@ -235,37 +217,85 @@ class Executor:
         print(f"     Liq @ ${price:.3f}: {snap.liquidity_at_price:.0f} shares | "
               f"We want: {shares:.0f} shares (${spend:.2f})")
 
-        if snap.liquidity_at_price < shares:
-            print(f"  ⚠️  Only {snap.liquidity_at_price:.0f} of {shares:.0f} shares "
-                  f"available — FOK will likely fail")
+        # ── Route: FOK if liquidity exists, GTC if not ──────────────
+        if snap.liquidity_at_price >= shares:
+            # Enough liquidity → try instant fill
+            print(f"  ⚡ Liquidity available — trying FOK")
+            result = self._send_order(token_id, side, price, shares, OrderType.FOK)
+            if result.filled:
+                return result
+            print(f"  ⚡ FOK killed despite apparent liquidity — falling through to GTC")
 
-        # ── Step 1: Try FOK ─────────────────────────────────────────
-        fok_result = self._send_order(token_id, side, price, shares, OrderType.FOK)
-        if fok_result.success:
-            print(f"  ⚡ FOK filled!")
-            return fok_result
+        # Place as maker (GTC) — sit on the book
+        print(f"  📋 Placing GTC maker order — sitting on the book")
+        return self._send_order(token_id, side, price, shares, OrderType.GTC)
 
-        print(f"  ⚡ FOK killed — trying GTC fallback ({GTC_TIMEOUT:.0f}s timeout)")
+    # ── Check if a pending order has filled ─────────────────────────
 
-        # ── Step 2: GTC fallback ────────────────────────────────────
-        gtc_result = self._send_order(token_id, side, price, shares, OrderType.GTC)
-        if not gtc_result.success and not gtc_result.order_id:
-            # GTC also rejected outright
-            return gtc_result
+    def check_fill(self, order_id: str, price: float = 0) -> OrderResult:
+        """Check whether a GTC order on the book has been filled.
 
-        if gtc_result.success:
-            # Rare: GTC filled instantly
-            return gtc_result
+        Call this each tick for pending orders.
+        Returns filled=True if matched, filled=False if still waiting.
+        """
+        if not order_id or order_id.startswith("DRY-"):
+            return OrderResult(success=True, filled=True, status=FILLED, dry_run=True)
 
-        # GTC is on the book — poll for fill
-        order_id = gtc_result.order_id
-        return self._wait_for_gtc_fill(order_id, side, price, shares, token_id)
+        if not self._initialized:
+            return OrderResult(success=False, error="Not initialized")
+
+        fill = self._check_order(order_id)
+        if not fill:
+            return OrderResult(
+                success=True, filled=False, order_id=order_id,
+                status=PLACED, error="Still on book",
+            )
+
+        size_matched = float(
+            fill.get("size_matched", 0) if isinstance(fill, dict)
+            else getattr(fill, "size_matched", 0)
+        )
+
+        if size_matched > 0:
+            fill_price = float(
+                fill.get("price", price) if isinstance(fill, dict)
+                else getattr(fill, "price", price)
+            )
+            return OrderResult(
+                success=True, filled=True,
+                order_id=order_id, status=FILLED,
+                price=fill_price,
+                size_filled=size_matched,
+                amount_spent=size_matched * fill_price,
+                dry_run=False,
+            )
+
+        # Check if cancelled/expired
+        status_raw = ""
+        if isinstance(fill, dict):
+            status_raw = fill.get("status", "").upper()
+        else:
+            status_raw = getattr(fill, "status", "").upper()
+
+        if status_raw in ("CANCELLED", "EXPIRED"):
+            return OrderResult(
+                success=False, filled=False,
+                order_id=order_id, status=CANCELLED,
+                error="Order was cancelled/expired",
+            )
+
+        # Still on book
+        return OrderResult(
+            success=True, filled=False,
+            order_id=order_id, status=PLACED,
+        )
+
+    # ── Internal: send a single order ───────────────────────────────
 
     def _send_order(
         self, token_id: str, side: str, price: float, shares: float,
         order_type: OrderType,
     ) -> OrderResult:
-        """Send a single order (FOK or GTC). Returns result."""
         try:
             order_args = OrderArgs(
                 price=price, size=shares, side=side, token_id=token_id,
@@ -281,7 +311,7 @@ class Executor:
                     side=side, price=price, token_id=token_id[:16] + "...",
                 )
 
-            # Check fill
+            # Check immediate fill
             fill = self._check_order(order_id)
             if fill:
                 size_matched = float(
@@ -294,18 +324,27 @@ class Executor:
                         else getattr(fill, "price", price)
                     )
                     return OrderResult(
-                        success=True, order_id=order_id, status=FILLED,
+                        success=True, filled=True,
+                        order_id=order_id, status=FILLED,
                         side=side, price=fill_price,
                         size_requested=shares, size_filled=size_matched,
                         amount_spent=size_matched * fill_price,
                         token_id=token_id[:16] + "...", dry_run=False,
                     )
 
-            # Order placed but not filled (GTC on book, or FOK killed)
+            if order_type == OrderType.FOK:
+                return OrderResult(
+                    success=False, filled=False,
+                    order_id=order_id, status=CANCELLED,
+                    error="FOK not matched",
+                    side=side, price=price, size_requested=shares,
+                    token_id=token_id[:16] + "...", dry_run=False,
+                )
+
+            # GTC: on the book, waiting
             return OrderResult(
-                success=False, order_id=order_id,
-                status=CANCELLED if order_type == OrderType.FOK else "PLACED",
-                error="Not matched" if order_type == OrderType.FOK else "On book, waiting",
+                success=True, filled=False,
+                order_id=order_id, status=PLACED,
                 side=side, price=price, size_requested=shares,
                 token_id=token_id[:16] + "...", dry_run=False,
             )
@@ -316,106 +355,21 @@ class Executor:
                 side=side, price=price, token_id=token_id[:16] + "...",
             )
 
-    def _wait_for_gtc_fill(
-        self, order_id: str, side: str, price: float, shares: float,
-        token_id: str,
-    ) -> OrderResult:
-        """Poll a GTC order for up to GTC_TIMEOUT seconds."""
-        deadline = time.time() + GTC_TIMEOUT
-        polls = 0
-
-        while time.time() < deadline:
-            time.sleep(GTC_POLL_INTERVAL)
-            polls += 1
-
-            fill = self._check_order(order_id)
-            if not fill:
-                continue
-
-            size_matched = float(
-                fill.get("size_matched", 0) if isinstance(fill, dict)
-                else getattr(fill, "size_matched", 0)
-            )
-
-            if size_matched > 0:
-                fill_price = float(
-                    fill.get("price", price) if isinstance(fill, dict)
-                    else getattr(fill, "price", price)
-                )
-                print(f"  📋 GTC filled after {polls * GTC_POLL_INTERVAL:.0f}s!")
-                return OrderResult(
-                    success=True, order_id=order_id, status=FILLED,
-                    side=side, price=fill_price,
-                    size_requested=shares, size_filled=size_matched,
-                    amount_spent=size_matched * fill_price,
-                    token_id=token_id[:16] + "...", dry_run=False,
-                )
-
-            status_raw = ""
-            if isinstance(fill, dict):
-                status_raw = fill.get("status", "").upper()
-            else:
-                status_raw = getattr(fill, "status", "").upper()
-
-            if status_raw in ("CANCELLED", "EXPIRED"):
-                return OrderResult(
-                    success=False, order_id=order_id, status=CANCELLED,
-                    error="GTC cancelled/expired during wait",
-                    side=side, price=price, size_requested=shares,
-                    token_id=token_id[:16] + "...", dry_run=False,
-                )
-
-        # Timed out — cancel
-        print(f"  ⏰ GTC not filled after {GTC_TIMEOUT:.0f}s — cancelling")
-        self.cancel_order(order_id)
-
-        # Final check — might have filled between last poll and cancel
-        final = self._check_order(order_id)
-        if final:
-            size_matched = float(
-                final.get("size_matched", 0) if isinstance(final, dict)
-                else getattr(final, "size_matched", 0)
-            )
-            if size_matched > 0:
-                fill_price = float(
-                    final.get("price", price) if isinstance(final, dict)
-                    else getattr(final, "price", price)
-                )
-                print(f"  📋 GTC filled just before cancel!")
-                return OrderResult(
-                    success=True, order_id=order_id, status=FILLED,
-                    side=side, price=fill_price,
-                    size_requested=shares, size_filled=size_matched,
-                    amount_spent=size_matched * fill_price,
-                    token_id=token_id[:16] + "...", dry_run=False,
-                )
-
-        return OrderResult(
-            success=False, order_id=order_id, status=CANCELLED,
-            error=f"GTC not filled in {GTC_TIMEOUT:.0f}s",
-            side=side, price=price, size_requested=shares,
-            token_id=token_id[:16] + "...", dry_run=False,
-        )
-
-    # ── Sell shares (for exit or claim) ─────────────────────────────
+    # ── Sell / claim ────────────────────────────────────────────────
 
     def sell_shares(self, token_id: str, shares: float, price: float) -> OrderResult:
-        """Sell shares via FOK. Used for pre-close exit and fallback claim."""
         sell_int = int(shares)
         if sell_int < 1:
             return OrderResult(
                 success=False, status=REJECTED,
-                error="Less than 1 share to sell", side="SELL", price=price,
+                error="Less than 1 share", side="SELL", price=price,
             )
-        notional = sell_int * price
-        # Use FOK only for sells — we don't want sells sitting on book
         return self._send_order(token_id, "SELL", price, float(sell_int), OrderType.FOK)
 
     def claim_winnings(self, token_id: str, shares: float) -> OrderResult:
-        """Sell resolved shares at $0.99 — post-resolution fallback."""
         return self.sell_shares(token_id, shares, CLAIM_SELL_PRICE)
 
-    # ── Check order ─────────────────────────────────────────────────
+    # ── Helpers ─────────────────────────────────────────────────────
 
     def _check_order(self, order_id: str) -> Optional[dict]:
         if not self._initialized:
@@ -425,8 +379,6 @@ class Executor:
         except Exception as e:
             print(f"[executor] Order check failed: {e}")
             return None
-
-    # ── Cancel ──────────────────────────────────────────────────────
 
     def cancel_order(self, order_id: str) -> bool:
         if self.dry_run or not self._initialized:
