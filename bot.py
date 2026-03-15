@@ -237,25 +237,41 @@ class PolyBot:
               f"P&L: ${self.stats.total_pnl:+.2f}")
         print(f"{'─' * 55}")
 
-    def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
-        if self.dry_run or not self.executor._initialized:
-            if self._opening_price <= 0:
-                return 0.50, 0.50
-            delta_pct = (btc_price - self._opening_price) / self._opening_price
-            time_factor = 1 - (seconds_remaining / PERIOD_SECONDS[self.period])
-            import math
-            lag_factor = min(time_factor * 0.7, 0.85)
-            implied = 0.5 + lag_factor * math.tanh(delta_pct * 500) * 0.45
-            up = round(min(max(implied, 0.02), 0.98), 3)
-            return up, round(1.0 - up, 3)
-
-        try:
-            market = get_current_market(self.period)
-            if not market:
-                return 0.50, 0.50
-            return market.up_price, market.down_price
-        except Exception:
+def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
+    if self.dry_run or not self.executor._initialized:
+        if self._opening_price <= 0:
             return 0.50, 0.50
+        delta_pct = (btc_price - self._opening_price) / self._opening_price
+        time_factor = 1 - (seconds_remaining / PERIOD_SECONDS[self.period])
+        import math
+        lag_factor = min(time_factor * 0.7, 0.85)
+        implied = 0.5 + lag_factor * math.tanh(delta_pct * 500) * 0.45
+        up = round(min(max(implied, 0.02), 0.98), 3)
+        return up, round(1.0 - up, 3)
+
+    try:
+        market = get_current_market(self.period)
+        if not market:
+            return 0.50, 0.50
+
+        # Query the MERGED book (complement engine) — same prices the UI shows
+        probe_amount = 5.0  # Small probe to get current price
+        up_price = self.executor.get_market_price(market.token_id_up, "BUY", probe_amount)
+        down_price = self.executor.get_market_price(market.token_id_down, "BUY", probe_amount)
+
+        # Fallback if price check fails
+        if up_price <= 0 and down_price <= 0:
+            return 0.50, 0.50
+        if up_price <= 0:
+            up_price = round(1.0 - down_price, 3)
+        if down_price <= 0:
+            down_price = round(1.0 - up_price, 3)
+
+        return up_price, down_price
+
+    except Exception as e:
+        print(f"[price] Error: {e}")
+        return 0.50, 0.50
 
     # ── Entry: buy at market ────────────────────────────────────────
 
