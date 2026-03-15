@@ -237,7 +237,13 @@ class PolyBot:
               f"P&L: ${self.stats.total_pnl:+.2f}")
         print(f"{'─' * 55}")
 
-    # ── Market prices (merged book via complement engine) ───────────
+# ── Market prices (merged book via complement engine) ───────────
+
+    # Cache to avoid hammering the API every tick
+    _cached_up: float = 0.50
+    _cached_down: float = 0.50
+    _price_last_fetched: float = 0.0
+    _PRICE_REFRESH_INTERVAL: float = 5.0  # Query every 5 seconds
 
     def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
         if self.dry_run or not self.executor._initialized:
@@ -251,29 +257,36 @@ class PolyBot:
             up = round(min(max(implied, 0.02), 0.98), 3)
             return up, round(1.0 - up, 3)
 
+        # Return cached prices if fetched recently
+        now = time.time()
+        if now - self._price_last_fetched < self._PRICE_REFRESH_INTERVAL:
+            return self._cached_up, self._cached_down
+
         try:
             market = get_current_market(self.period)
             if not market:
-                return 0.50, 0.50
+                return self._cached_up, self._cached_down
 
-            # Query the MERGED book (complement engine) — same prices the UI shows
-            probe_amount = 5.0  # Small probe to get current price
+            probe_amount = 5.0
             up_price = self.executor.get_market_price(market.token_id_up, "BUY", probe_amount)
             down_price = self.executor.get_market_price(market.token_id_down, "BUY", probe_amount)
 
-            # Fallback if price check fails
             if up_price <= 0 and down_price <= 0:
-                return 0.50, 0.50
+                return self._cached_up, self._cached_down
             if up_price <= 0:
                 up_price = round(1.0 - down_price, 3)
             if down_price <= 0:
                 down_price = round(1.0 - up_price, 3)
 
+            self._cached_up = up_price
+            self._cached_down = down_price
+            self._price_last_fetched = now
+
             return up_price, down_price
 
         except Exception as e:
             print(f"[price] Error: {e}")
-            return 0.50, 0.50
+            return self._cached_up, self._cached_down
 
     # ── Entry: buy at market ────────────────────────────────────────
 

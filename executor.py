@@ -164,7 +164,7 @@ class Executor:
             )
 
             signed_order = self.client.create_market_order(order_args)
-            result = self.client.post_order(signed_order, OrderType.FOK)
+            result = self.client.post_order(signed_order, OrderType.GTC)
 
             order_id = result.get("orderID", "")
             if not order_id:
@@ -246,7 +246,7 @@ class Executor:
             )
 
             signed_order = self.client.create_market_order(order_args)
-            result = self.client.post_order(signed_order, OrderType.FOK)
+            result = self.client.post_order(signed_order, OrderType.GTC)
 
             order_id = result.get("orderID", "")
             if not order_id:
