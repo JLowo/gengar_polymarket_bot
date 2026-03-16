@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-PolyBot v9.1 — Active Position Management (improved)
+PolyBot v9.2 — Active Position Management (sell fix)
 
-Fixes from v9 live data:
-  1. Price-based stop loss: if sell price < buy price × 0.60, exit
-     regardless of what the probability model says. The market knows
-     things our model doesn't. (Fixes 11:05, 11:35 failures)
-  2. Relaxed prob threshold: 0.40 instead of 0.50. The Brownian model
-     overreacts to tiny BTC bounces. (Fixes 11:25 premature exit)
-  3. Ghost fill recovery: if buy() throws a network error, check if
-     the order actually went through before declaring failure.
-     (Fixes 11:10 phantom trade)
+Fixes from v9.1:
+  - Executor now approves CONDITIONAL tokens (fixes sell failures)
+  - Exit retries: max 3 attempts with 10s cooldown (fixes spam)
+  - After 3 failures: hold to resolution (chance of $1 payout)
 
-Position management triggers (checked every 3s):
-  1. Take-profit: sell price > buy price × (1 + TP%)  → sell
-  2. Price stop-loss: sell price < buy price × (1 - SL%)  → sell
-  3. Prob stop-loss: updated probability < threshold  → sell
+Position management (unchanged from v9.1):
+  1. Price stop-loss: sell price < buy price × (1 - 40%)
+  2. Prob stop-loss: probability < 40%
+  3. Take-profit: return ≥ 30%
   4. Forced exit: T-5s, sell if profitable
 """
 
@@ -39,6 +34,8 @@ from telegram_notifier import TelegramNotifier
 FORCED_EXIT_START = 5
 FORCED_EXIT_END = 1
 POSITION_CHECK_INTERVAL = 3
+MAX_EXIT_RETRIES = 3
+EXIT_RETRY_COOLDOWN = 10  # Seconds between retry attempts
 
 
 class PolyBot:
@@ -57,10 +54,9 @@ class PolyBot:
             max_bet=float(os.getenv("MAX_BET", "25.0")),
         )
 
-        # ── Position management params ──────────────────────────────
         self.take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
-        self.stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.40"))     # Exit if lost 40% of position value
-        self.stop_loss_prob = float(os.getenv("STOP_LOSS_PROB", "0.40"))    # Relaxed from 0.50
+        self.stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.40"))
+        self.stop_loss_prob = float(os.getenv("STOP_LOSS_PROB", "0.40"))
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
 
@@ -92,6 +88,8 @@ class PolyBot:
         self._exited: bool = False
         self._exit_revenue: float = 0.0
         self._last_position_check: float = 0.0
+        self._exit_retries: int = 0
+        self._exit_gave_up: bool = False  # True = stop trying, hold to resolution
 
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
@@ -117,7 +115,7 @@ class PolyBot:
         sl_price = self.stop_loss_pct * 100
         sl_prob = self.stop_loss_prob * 100
         print("=" * 55)
-        print(f"  PolyBot v9.1 — Active Position Management")
+        print(f"  PolyBot v9.2 — Active Position Management")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
@@ -126,6 +124,7 @@ class PolyBot:
               f"T-{self.strategy_config.entry_window_end}s")
         print(f"  Take profit: {tp:.0f}%")
         print(f"  Stop loss: price -{sl_price:.0f}% OR prob < {sl_prob:.0f}%")
+        print(f"  Exit retries: max {MAX_EXIT_RETRIES} (then hold to resolution)")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
 
@@ -194,7 +193,7 @@ class PolyBot:
             print(f"  📌 Open: ${btc_price:,.2f}")
 
         # HOLDING: active position management
-        if self._traded and not self._exited:
+        if self._traded and not self._exited and not self._exit_gave_up:
             self._manage_position(btc_price, seconds_remaining, now)
             return
 
@@ -232,14 +231,6 @@ class PolyBot:
     # ── Active position management ──────────────────────────────────
 
     def _manage_position(self, btc_price: float, seconds_remaining: float, now: float):
-        """Every 3s while holding: update probability, check all exits.
-
-        Exit triggers (priority order):
-          1. Price stop-loss: sell price < buy price × (1 - SL%)
-          2. Prob stop-loss: updated probability < threshold
-          3. Take-profit: sell price > buy price × (1 + TP%)
-          4. Forced exit: T-5s, sell if profitable
-        """
         if self._opening_price <= 0:
             return
 
@@ -252,7 +243,7 @@ class PolyBot:
         else:
             our_prob = updated_prob
 
-        # Throttled sell price check
+        # Throttled check
         if now - self._last_position_check < POSITION_CHECK_INTERVAL:
             if int(now) % 30 == 0:
                 d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
@@ -284,18 +275,15 @@ class PolyBot:
         return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
 
         # ── Check 1: Price stop-loss ────────────────────────────────
-        # The market is the ultimate judge. If sell price collapsed,
-        # get out regardless of what our model thinks.
         price_floor = self._trade_price * (1.0 - self.stop_loss_pct)
         if current_sell_price <= price_floor:
             print(f"\n  🛑 PRICE STOP: sell ${current_sell_price:.3f} ≤ "
-                  f"floor ${price_floor:.3f} (-{self.stop_loss_pct:.0%} from buy) | "
+                  f"floor ${price_floor:.3f} (-{self.stop_loss_pct:.0%}) | "
                   f"Saving ${current_value:.2f} of ${self._trade_cost:.2f}")
             self._exit_position(current_sell_price, seconds_remaining, "price-stop")
             return
 
         # ── Check 2: Prob stop-loss ─────────────────────────────────
-        # Our model says BTC has likely reversed direction.
         if our_prob < self.stop_loss_prob:
             print(f"\n  🛑 PROB STOP: prob {our_prob:.2f} < {self.stop_loss_prob:.2f} | "
                   f"BTC Δ{btc_delta_pct:+.3f}% | "
@@ -332,7 +320,7 @@ class PolyBot:
             f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
         )
 
-    # ── Execute exit ────────────────────────────────────────────────
+    # ── Execute exit (with retry limit) ─────────────────────────────
 
     def _exit_position(self, sell_price: float, seconds_remaining: float, reason: str):
         if self.dry_run:
@@ -360,7 +348,16 @@ class PolyBot:
                   f"${result.price:.3f} = ${result.amount_usd:.2f} | "
                   f"Profit: ${profit:+.2f}")
         else:
-            print(f"  ⚠️  Exit failed ({reason}): {result.error}")
+            self._exit_retries += 1
+            if self._exit_retries >= MAX_EXIT_RETRIES:
+                print(f"  ❌ Exit failed {MAX_EXIT_RETRIES} times ({reason}) — "
+                      f"holding to resolution")
+                self._exit_gave_up = True
+            else:
+                print(f"  ⚠️  Exit failed ({reason}, attempt "
+                      f"{self._exit_retries}/{MAX_EXIT_RETRIES}): {result.error}")
+                # Cooldown: don't retry for 10 seconds
+                self._last_position_check = time.time() + EXIT_RETRY_COOLDOWN - POSITION_CHECK_INTERVAL
 
     # ── Window management ───────────────────────────────────────────
 
@@ -377,6 +374,8 @@ class PolyBot:
         self._exited = False
         self._exit_revenue = 0.0
         self._last_position_check = 0.0
+        self._exit_retries = 0
+        self._exit_gave_up = False
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
@@ -488,9 +487,7 @@ class PolyBot:
                 edge=sig.edge, kelly_size=sig.kelly_size,
             )
         else:
-            # ── Ghost fill recovery ─────────────────────────────────
-            # Network errors don't mean the order didn't go through.
-            # Check balance to detect phantom fills.
+            # Ghost fill recovery
             if "exception" in result.error.lower() or "timeout" in result.error.lower():
                 print(f"  ⚠️  Network error: {result.error}")
                 if not self.dry_run and self.executor._initialized:
@@ -533,7 +530,7 @@ class PolyBot:
                 self.telegram.loss_alert(abs(profit), self.stats.total_pnl)
             return
 
-        # Held through resolution
+        # Held through resolution (exit gave up or no exit triggered)
         btc_price, _ = self.price_feed.get_price()
         if self._opening_price <= 0 or btc_price <= 0:
             return

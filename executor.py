@@ -1,13 +1,10 @@
 """Order executor for Polymarket CLOB.
 
-v8.1 — Complement engine pricing + clean decimal execution.
-
-Strategy:
-  1. calculate_market_price() → get real price from merged book
-  2. calculate_order_size() → round to clean decimals
-  3. create_order() + post_order(GTC) → fill with slippage tolerance
-
-This avoids create_market_order() which has internal rounding issues.
+v9.2 — Fixes:
+  - Approves CONDITIONAL token transfers on init (fixes sell failures)
+  - Complement engine pricing via calculate_market_price
+  - Clean decimal sizing via regular OrderArgs
+  - GTC for slippage tolerance
 """
 
 import time
@@ -86,8 +83,20 @@ class Executor:
                 signature_type=2 if self.safe_address else 0,
             )
             self.client.set_api_creds(self.client.create_or_derive_api_creds())
+
             self._initialized = True
+
+            # Approve BOTH collateral (USDC) and conditional (shares) transfers
+            # Without conditional approval, sells fail with "not enough balance/allowance"
+            self.client.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            self.client.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL)
+            )
+
             print(f"[executor] Initialized ({'DRY RUN' if self.dry_run else 'LIVE'})")
+            print(f"[executor] Approved: COLLATERAL + CONDITIONAL")
             print(f"[executor] Address: {self.client.get_address()}")
             return True
         except Exception as e:
@@ -126,12 +135,7 @@ class Executor:
     # ── Buy ─────────────────────────────────────────────────────────
 
     def buy(self, token_id: str, amount_usd: float) -> OrderResult:
-        """Buy shares using complement engine price + clean decimals.
-
-        1. Get real market price via calculate_market_price
-        2. Round to integer shares for clean decimals
-        3. Place as regular GTC order (tolerates tiny slippage)
-        """
+        """Buy shares using complement engine price + clean decimals."""
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
             return OrderResult(
@@ -151,7 +155,7 @@ class Executor:
         if not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        # Step 1: get real price from complement engine
+        # Get real price from complement engine
         market_price = self.get_market_price(token_id, "BUY", amount_usd)
         if market_price <= 0:
             return OrderResult(
@@ -160,7 +164,7 @@ class Executor:
                 token_id=token_id[:16] + "...",
             )
 
-        # Step 2: clean decimal sizing
+        # Clean decimal sizing
         shares, spend = calculate_order_size(market_price, amount_usd)
         if shares < MIN_SHARES or spend <= 0:
             return OrderResult(
@@ -173,7 +177,6 @@ class Executor:
         print(f"  📊 Market price: ${market_price:.3f}/share "
               f"→ {shares:.0f} shares for ${spend:.2f}")
 
-        # Step 3: place regular order at market price, GTC for slippage
         return self._place_order(token_id, "BUY", market_price, shares, spend)
 
     # ── Sell ────────────────────────────────────────────────────────
@@ -202,7 +205,7 @@ class Executor:
 
         # Get sell price from complement engine if not provided
         if price <= 0:
-            notional = float(sell_shares) * 0.50  # rough estimate for price query
+            notional = float(sell_shares) * 0.50
             price = self.get_market_price(token_id, "SELL", notional)
             if price <= 0:
                 return OrderResult(
@@ -216,18 +219,14 @@ class Executor:
 
         return self._place_order(token_id, "SELL", price, float(sell_shares), spend)
 
-    # ── Internal: place order with clean decimals ───────────────────
+    # ── Internal: place order ───────────────────────────────────────
 
     def _place_order(
         self, token_id: str, side: str, price: float, shares: float, spend: float,
     ) -> OrderResult:
-        """Place a regular order at a specific price. GTC for slippage tolerance."""
         try:
             order_args = OrderArgs(
-                price=price,
-                size=shares,
-                side=side,
-                token_id=token_id,
+                price=price, size=shares, side=side, token_id=token_id,
             )
 
             signed_order = self.client.create_order(order_args)
@@ -261,7 +260,7 @@ class Executor:
                         token_id=token_id[:16] + "...", dry_run=False,
                     )
 
-            # GTC on book but not instantly filled — wait briefly
+            # GTC on book — wait briefly
             time.sleep(2)
             fill = self._check_order(order_id)
             if fill:
