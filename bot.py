@@ -101,6 +101,16 @@ class PolyBot:
         self._exit_retries: int = 0
         self._exit_gave_up: bool = False
 
+        # Pending buy (unverified — Polygon settlement too slow)
+        self._pending_buy_side: str = ""
+        self._pending_buy_price: float = 0.0
+        self._pending_buy_amount: float = 0.0
+        self._pending_buy_shares: float = 0.0
+        self._pending_buy_token_id: str = ""
+        self._pending_buy_edge: float = 0.0
+        self._pending_buy_delta: float = 0.0
+        self._balance_before_buy: float = 0.0
+
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
 
@@ -397,6 +407,30 @@ class PolyBot:
 
     def _on_new_window(self, window_ts: int):
         if self._current_window > 0:
+            # Detect pending buy that settled after our verification timeout
+            if self._pending_buy_side and not self._traded:
+                if not self.dry_run and self.executor._initialized:
+                    real_bal = self.executor.get_balance()
+                    if real_bal > 0 and self._balance_before_buy > 0:
+                        spent = self._balance_before_buy - real_bal
+                        if spent > 1.0:
+                            # The buy DID go through — retroactively track it
+                            est_shares = spent / self._pending_buy_price if self._pending_buy_price > 0 else 0
+                            print(f"\n  👻 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
+                            print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
+                                  f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
+
+                            self._traded = True
+                            self._trade_side = self._pending_buy_side
+                            self._trade_price = self._pending_buy_price
+                            self._trade_cost = spent
+                            self._trade_shares = est_shares
+                            self._trade_token_id = self._pending_buy_token_id
+                            self.stats.bankroll = real_bal
+                            self._last_real_balance = real_bal
+                            self.stats.hourly.record_trade(
+                                self._pending_buy_edge, self._pending_buy_delta)
+
             self.stats.hourly.record_window(self._traded)
             if self._traded:
                 self._resolve_previous_trade()
@@ -426,6 +460,14 @@ class PolyBot:
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
+        self._pending_buy_side = ""
+        self._pending_buy_price = 0.0
+        self._pending_buy_amount = 0.0
+        self._pending_buy_shares = 0.0
+        self._pending_buy_token_id = ""
+        self._pending_buy_edge = 0.0
+        self._pending_buy_delta = 0.0
+        self._balance_before_buy = 0.0
 
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
         print(f"\n{'─' * 55}")
@@ -534,7 +576,20 @@ class PolyBot:
                 edge=sig.edge, kelly_size=sig.kelly_size,
             )
         else:
-            print(f"  ❌ Buy failed: {result.error}")
+            if result.error == "UNVERIFIED_BUY":
+                # Order likely filled but Polygon hasn't settled.
+                # Save details — window boundary sync will detect the fill.
+                self._pending_buy_side = sig.side
+                self._pending_buy_price = result.price
+                self._pending_buy_amount = result.amount_usd
+                self._pending_buy_shares = result.shares
+                self._pending_buy_token_id = token_id
+                self._pending_buy_edge = sig.edge
+                self._pending_buy_delta = sig.btc_delta_pct
+                self._balance_before_buy = self.stats.bankroll
+                print(f"  ⏳ Buy sent but unverified — will detect via balance sync")
+            else:
+                print(f"  ❌ Buy failed: {result.error}")
 
     # ── Resolve (partial fill aware) ────────────────────────────────
 

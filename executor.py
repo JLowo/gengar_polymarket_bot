@@ -133,11 +133,16 @@ class Executor:
                 print(f"[executor] Price check failed: {e}")
             return 0.0
 
-    # ── Buy (clean OrderArgs + GTC + price cap) ─────────────────────
+    # ── Buy (market order via complement engine) ─────────────────────
 
     def buy(self, token_id: str, amount_usd: float) -> OrderResult:
-        """Buy via market order. Balance-verified: snapshots USDC before/after
-        to detect ghost fills and get the real cost paid."""
+        """Buy via create_market_order (complement engine).
+
+        Same mechanism as sell() — routes through the merged book where
+        all the volume actually flows. Limit orders via create_order()
+        sit on the raw token book and take 5-15s to match via Polygon.
+        Market orders fill instantly.
+        """
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
             return OrderResult(
@@ -174,26 +179,28 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        shares, spend = calculate_order_size(market_price, amount_usd)
-        if shares < MIN_SHARES or spend <= 0:
+        # Check minimum notional
+        if amount_usd < POLY_MIN_NOTIONAL:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Can't get {MIN_SHARES:.0f}+ shares at ${market_price:.3f} "
-                      f"within ${amount_usd:.2f}",
+                error=f"Amount ${amount_usd:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
+        est_shares = amount_usd / market_price if market_price > 0 else 0
         print(f"  📊 Market price: ${market_price:.3f}/share "
-              f"→ {shares:.0f} shares for ${spend:.2f}")
+              f"→ ~{est_shares:.0f} shares for ${amount_usd:.2f}")
 
         # Snapshot balance BEFORE buy
         balance_before = self.get_balance()
 
         try:
-            order_args = OrderArgs(
-                price=market_price, size=shares, side="BUY", token_id=token_id,
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount_usd,
+                side="BUY",
             )
-            signed_order = self.client.create_order(order_args)
+            signed_order = self.client.create_market_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
 
             order_id = result.get("orderID", "")
@@ -204,25 +211,26 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
-            # Wait for settlement then verify via balance
-            time.sleep(2)
+            # Market orders fill instantly via complement engine.
+            # Wait for balance to settle, then verify.
+            time.sleep(3)
             return self._verify_buy_via_balance(
-                order_id, market_price, shares, token_id, balance_before,
+                order_id, market_price, est_shares, token_id, balance_before,
             )
 
         except Exception as e:
             # Ghost fill defense: order may have gone through despite exception
-            time.sleep(2)
+            time.sleep(3)
             balance_after = self.get_balance()
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 1.0:
-                est_shares = spent / market_price if market_price > 0 else 0
+                actual_shares = spent / market_price if market_price > 0 else 0
                 print(f"  👻 GHOST BUY: balance dropped ${spent:.2f} despite error")
                 return OrderResult(
                     success=True, order_id="ghost-buy",
                     status=FILLED, side="BUY", price=market_price,
-                    amount_usd=spent, shares=est_shares,
+                    amount_usd=spent, shares=actual_shares,
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
 
@@ -235,54 +243,57 @@ class Executor:
         self, order_id: str, price: float, shares: float,
         token_id: str, balance_before: float,
     ) -> OrderResult:
-        """Verify buy fill via balance change (source of truth), with order API fallback."""
-        balance_after = self.get_balance()
-        spent = balance_before - balance_after if balance_before > 0 else 0
+        """Verify buy fill. Tries 3 rounds of balance + order API checks.
 
-        if spent > 0.50:
-            actual_shares = spent / price if price > 0 else shares
-            print(f"  ✓ Balance verified: spent ${spent:.2f} "
-                  f"(~{actual_shares:.0f} shares @ ${price:.3f})")
-            return OrderResult(
-                success=True, order_id=order_id, status=FILLED,
-                side="BUY", price=price,
-                amount_usd=spent, shares=actual_shares,
-                token_id=token_id[:16] + "...", dry_run=False,
-            )
+        CRITICAL: never cancels on timeout — Polygon settlement can take 5-15s.
+        If we can't verify, we return the order details so the bot can
+        retroactively detect the fill via balance sync at window boundary.
+        """
+        for attempt in range(3):
+            # Check balance (source of truth once chain settles)
+            balance_after = self.get_balance()
+            spent = balance_before - balance_after if balance_before > 0 else 0
 
-        # Balance didn't drop — check order API as fallback
-        fill = self._check_order(order_id)
-        if fill:
-            matched = self._extract_fill(fill, price)
-            if matched:
+            if spent > 0.50:
+                actual_shares = spent / price if price > 0 else shares
+                suffix = f" (attempt {attempt+1})" if attempt > 0 else ""
+                print(f"  ✓ Balance verified{suffix}: spent ${spent:.2f} "
+                      f"(~{actual_shares:.0f} shares @ ${price:.3f})")
                 return OrderResult(
                     success=True, order_id=order_id, status=FILLED,
-                    side="BUY", price=matched[0],
-                    amount_usd=matched[1], shares=matched[2],
+                    side="BUY", price=price,
+                    amount_usd=spent, shares=actual_shares,
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
 
-        # Wait one more second and try again
-        time.sleep(1)
-        balance_after2 = self.get_balance()
-        spent2 = balance_before - balance_after2 if balance_before > 0 else 0
+            # Check order API (updates faster than chain balance)
+            fill = self._check_order(order_id)
+            if fill:
+                matched = self._extract_fill(fill, price)
+                if matched:
+                    suffix = f" (attempt {attempt+1})" if attempt > 0 else ""
+                    print(f"  ✓ Order API verified{suffix}: "
+                          f"{matched[2]:.0f} shares @ ${matched[0]:.3f}")
+                    return OrderResult(
+                        success=True, order_id=order_id, status=FILLED,
+                        side="BUY", price=matched[0],
+                        amount_usd=matched[1], shares=matched[2],
+                        token_id=token_id[:16] + "...", dry_run=False,
+                    )
 
-        if spent2 > 0.50:
-            actual_shares = spent2 / price if price > 0 else shares
-            print(f"  ✓ Balance verified (delayed): spent ${spent2:.2f}")
-            return OrderResult(
-                success=True, order_id=order_id, status=FILLED,
-                side="BUY", price=price,
-                amount_usd=spent2, shares=actual_shares,
-                token_id=token_id[:16] + "...", dry_run=False,
-            )
+            if attempt < 2:
+                time.sleep(3)  # Wait 3s between attempts
 
-        # Truly unfilled
-        self.cancel_order(order_id)
+        # After 3 rounds (~11s since order): still can't verify.
+        # DO NOT CANCEL — the order likely filled but chain hasn't settled.
+        # Return details so bot can detect it via balance sync.
+        print(f"  ⏳ Buy unverified after {3*3+5}s — NOT cancelling "
+              f"(Polygon may still be settling)")
         return OrderResult(
             success=False, order_id=order_id, status=FAILED,
-            error="Order not filled (no balance change)",
-            side="BUY", price=price, token_id=token_id[:16] + "...",
+            error="UNVERIFIED_BUY",  # Special marker for bot to handle
+            side="BUY", price=price, amount_usd=shares * price,
+            shares=shares, token_id=token_id[:16] + "...",
         )
 
     # ── Sell (balance-verified, partial fill aware) ─────────────────
