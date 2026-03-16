@@ -1,10 +1,15 @@
 """Order executor for Polymarket CLOB.
 
-v9.2b — Per-token conditional approval before sells.
+v9.3 — Split buy/sell paths:
+  - BUY: calculate_market_price → clean OrderArgs → post_order(GTC)
+    (works perfectly, clean decimals)
+  - SELL: create_market_order → post_order(GTC)
+    (complement engine handles token routing/approval internally)
 
-CONDITIONAL tokens are ERC-1155 — each market has a different token ID.
-We can't approve them globally. Instead, approve the specific token
-right before selling it.
+The sell "not enough balance/allowance" error happens because regular
+OrderArgs tries to move ERC-1155 conditional tokens directly, which
+needs on-chain approval. create_market_order routes through the
+complement engine which handles this internally.
 """
 
 import time
@@ -14,6 +19,7 @@ from typing import Optional
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     OrderArgs,
+    MarketOrderArgs,
     OrderType,
     BalanceAllowanceParams,
     AssetType,
@@ -119,7 +125,7 @@ class Executor:
             print(f"[executor] Price check failed: {e}")
             return 0.0
 
-    # ── Buy ─────────────────────────────────────────────────────────
+    # ── Buy (clean OrderArgs + GTC) ─────────────────────────────────
 
     def buy(self, token_id: str, amount_usd: float) -> OrderResult:
         amount_usd = round(float(amount_usd), 2)
@@ -161,11 +167,38 @@ class Executor:
         print(f"  📊 Market price: ${market_price:.3f}/share "
               f"→ {shares:.0f} shares for ${spend:.2f}")
 
-        return self._place_order(token_id, "BUY", market_price, shares, spend)
+        # Regular OrderArgs for buys — clean decimals
+        try:
+            order_args = OrderArgs(
+                price=market_price, size=shares, side="BUY", token_id=token_id,
+            )
+            signed_order = self.client.create_order(order_args)
+            result = self.client.post_order(signed_order, OrderType.GTC)
 
-    # ── Sell (with per-token approval) ──────────────────────────────
+            order_id = result.get("orderID", "")
+            if not order_id:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error="No orderID", side="BUY", price=market_price,
+                    token_id=token_id[:16] + "...",
+                )
+
+            return self._verify_fill(order_id, "BUY", market_price, shares, token_id)
+
+        except Exception as e:
+            return OrderResult(
+                success=False, status=FAILED, error=str(e),
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
+    # ── Sell (create_market_order — complement engine handles routing) ─
 
     def sell(self, token_id: str, shares: float, price: float = 0.0) -> OrderResult:
+        """Sell shares via create_market_order.
+
+        Uses the complement engine path which handles ERC-1155
+        token routing internally — no manual approval needed.
+        """
         sell_shares = int(shares)
         if sell_shares < 1:
             return OrderResult(
@@ -186,7 +219,7 @@ class Executor:
         if not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        # Get sell price from complement engine if not provided
+        # Calculate sell amount in USD (what we expect to receive)
         if price <= 0:
             notional = float(sell_shares) * 0.50
             price = self.get_market_price(token_id, "SELL", notional)
@@ -197,97 +230,89 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
-        # Approve this specific conditional token before selling
-        # ERC-1155 tokens require per-token approval
+        sell_amount = round(sell_shares * price, 2)
+        print(f"  📊 Sell: {sell_shares} shares @ ${price:.3f} = ${sell_amount:.2f}")
+
+        # Use create_market_order for sells — handles token routing
         try:
-            self.client.update_balance_allowance(
-                BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL,
-                    token_id=token_id,
-                )
-            )
-        except Exception as e:
-            print(f"[executor] Token approval failed: {e}")
-
-        spend = round(sell_shares * price, 2)
-        print(f"  📊 Sell: {sell_shares} shares @ ${price:.3f} = ${spend:.2f}")
-
-        return self._place_order(token_id, "SELL", price, float(sell_shares), spend)
-
-    # ── Internal: place order ───────────────────────────────────────
-
-    def _place_order(
-        self, token_id: str, side: str, price: float, shares: float, spend: float,
-    ) -> OrderResult:
-        try:
-            order_args = OrderArgs(
-                price=price, size=shares, side=side, token_id=token_id,
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=sell_amount,
+                side="SELL",
             )
 
-            signed_order = self.client.create_order(order_args)
+            signed_order = self.client.create_market_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
 
             order_id = result.get("orderID", "")
             if not order_id:
                 return OrderResult(
                     success=False, status=REJECTED,
-                    error="No orderID", side=side, price=price,
-                    token_id=token_id[:16] + "...",
+                    error="No orderID from sell", side="SELL",
+                    price=price, token_id=token_id[:16] + "...",
                 )
 
-            # Check fill
-            fill = self._check_order(order_id)
-            if fill:
-                size_matched = float(
-                    fill.get("size_matched", 0) if isinstance(fill, dict)
-                    else getattr(fill, "size_matched", 0)
-                )
-                if size_matched > 0:
-                    fill_price = float(
-                        fill.get("price", price) if isinstance(fill, dict)
-                        else getattr(fill, "price", price)
-                    )
-                    actual_usd = size_matched * fill_price
-                    return OrderResult(
-                        success=True, order_id=order_id, status=FILLED,
-                        side=side, price=fill_price,
-                        amount_usd=actual_usd, shares=size_matched,
-                        token_id=token_id[:16] + "...", dry_run=False,
-                    )
-
-            # GTC on book — wait briefly
-            time.sleep(2)
-            fill = self._check_order(order_id)
-            if fill:
-                size_matched = float(
-                    fill.get("size_matched", 0) if isinstance(fill, dict)
-                    else getattr(fill, "size_matched", 0)
-                )
-                if size_matched > 0:
-                    fill_price = float(
-                        fill.get("price", price) if isinstance(fill, dict)
-                        else getattr(fill, "price", price)
-                    )
-                    return OrderResult(
-                        success=True, order_id=order_id, status=FILLED,
-                        side=side, price=fill_price,
-                        amount_usd=size_matched * fill_price, shares=size_matched,
-                        token_id=token_id[:16] + "...", dry_run=False,
-                    )
-
-            # Still not filled — cancel
-            self.cancel_order(order_id)
-            return OrderResult(
-                success=False, order_id=order_id, status=FAILED,
-                error="Order not filled within 2s",
-                side=side, price=price, token_id=token_id[:16] + "...",
-            )
+            return self._verify_fill(order_id, "SELL", price, float(sell_shares), token_id)
 
         except Exception as e:
             return OrderResult(
                 success=False, status=FAILED, error=str(e),
-                side=side, price=price, token_id=token_id[:16] + "...",
+                side="SELL", price=price, token_id=token_id[:16] + "...",
             )
+
+    # ── Verify fill (shared by buy and sell) ────────────────────────
+
+    def _verify_fill(
+        self, order_id: str, side: str, price: float, shares: float, token_id: str,
+    ) -> OrderResult:
+        """Check if an order filled, with one retry after 2s."""
+        # First check
+        fill = self._check_order(order_id)
+        if fill:
+            matched = self._extract_fill(fill, price)
+            if matched:
+                return OrderResult(
+                    success=True, order_id=order_id, status=FILLED,
+                    side=side, price=matched[0],
+                    amount_usd=matched[1], shares=matched[2],
+                    token_id=token_id[:16] + "...", dry_run=False,
+                )
+
+        # Wait and retry
+        time.sleep(2)
+        fill = self._check_order(order_id)
+        if fill:
+            matched = self._extract_fill(fill, price)
+            if matched:
+                return OrderResult(
+                    success=True, order_id=order_id, status=FILLED,
+                    side=side, price=matched[0],
+                    amount_usd=matched[1], shares=matched[2],
+                    token_id=token_id[:16] + "...", dry_run=False,
+                )
+
+        # Not filled — cancel
+        self.cancel_order(order_id)
+        return OrderResult(
+            success=False, order_id=order_id, status=FAILED,
+            error="Order not filled within 2s",
+            side=side, price=price, token_id=token_id[:16] + "...",
+        )
+
+    def _extract_fill(self, fill: dict, fallback_price: float) -> Optional[tuple]:
+        """Extract (price, usd, shares) from a fill response. Returns None if not filled."""
+        size_matched = float(
+            fill.get("size_matched", 0) if isinstance(fill, dict)
+            else getattr(fill, "size_matched", 0)
+        )
+        if size_matched <= 0:
+            return None
+
+        fill_price = float(
+            fill.get("price", fallback_price) if isinstance(fill, dict)
+            else getattr(fill, "price", fallback_price)
+        )
+        return (fill_price, size_matched * fill_price, size_matched)
 
     def _check_order(self, order_id: str) -> Optional[dict]:
         if not self._initialized:
