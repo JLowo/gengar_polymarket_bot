@@ -1,13 +1,13 @@
 """Order executor for Polymarket CLOB.
 
-v10 — Three critical fixes from live data analysis:
+v11 — Balance-verified everything:
 
-1. Balance-verified sells: check USDC balance before/after sell to detect
-   ghost fills and partial fills. The order status API is unreliable.
-2. Partial fill tracking: returns actual shares sold (may be less than
-   requested). Bot can track residual shares.
-3. Max buy price cap: configurable (default $0.75). Above this, take-profit
-   at 30% is impossible since shares max at $1.00.
+1. Balance-verified buys: snapshot USDC before order, check after.
+   Ghost fills caught even when API throws exceptions.
+2. Balance-verified sells: unchanged from v10, still the source of truth.
+3. Minimum notional guard: rejects sells below $5 with explicit
+   "hold to resolution" message instead of hitting Polymarket's error.
+4. Silenced 'price check failed: no match' spam — only logs real errors.
 
 Still uses create_market_order for sells (complement engine routing).
 """
@@ -35,6 +35,7 @@ FAILED = "FAILED"
 MIN_SHARES = 5.0
 MIN_AMOUNT_USD = 1.0
 MAX_BUY_PRICE = 0.75  # Don't buy above this — TP can't trigger
+POLY_MIN_NOTIONAL = 5.0  # Polymarket rejects orders below $5 notional
 
 
 @dataclass
@@ -126,12 +127,17 @@ class Executor:
             )
             return float(price) if price else 0.0
         except Exception as e:
-            print(f"[executor] Price check failed: {e}")
+            err = str(e).lower()
+            # Only log genuinely unexpected errors, not "no match" book-empty noise
+            if "no match" not in err and "none" not in err:
+                print(f"[executor] Price check failed: {e}")
             return 0.0
 
     # ── Buy (clean OrderArgs + GTC + price cap) ─────────────────────
 
     def buy(self, token_id: str, amount_usd: float) -> OrderResult:
+        """Buy via market order. Balance-verified: snapshots USDC before/after
+        to detect ghost fills and get the real cost paid."""
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
             return OrderResult(
@@ -180,6 +186,9 @@ class Executor:
         print(f"  📊 Market price: ${market_price:.3f}/share "
               f"→ {shares:.0f} shares for ${spend:.2f}")
 
+        # Snapshot balance BEFORE buy
+        balance_before = self.get_balance()
+
         try:
             order_args = OrderArgs(
                 price=market_price, size=shares, side="BUY", token_id=token_id,
@@ -195,13 +204,86 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
-            return self._verify_fill(order_id, "BUY", market_price, shares, token_id)
+            # Wait for settlement then verify via balance
+            time.sleep(2)
+            return self._verify_buy_via_balance(
+                order_id, market_price, shares, token_id, balance_before,
+            )
 
         except Exception as e:
+            # Ghost fill defense: order may have gone through despite exception
+            time.sleep(2)
+            balance_after = self.get_balance()
+            spent = balance_before - balance_after if balance_before > 0 else 0
+
+            if spent > 1.0:
+                est_shares = spent / market_price if market_price > 0 else 0
+                print(f"  👻 GHOST BUY: balance dropped ${spent:.2f} despite error")
+                return OrderResult(
+                    success=True, order_id="ghost-buy",
+                    status=FILLED, side="BUY", price=market_price,
+                    amount_usd=spent, shares=est_shares,
+                    token_id=token_id[:16] + "...", dry_run=False,
+                )
+
             return OrderResult(
                 success=False, status=FAILED, error=str(e),
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
+
+    def _verify_buy_via_balance(
+        self, order_id: str, price: float, shares: float,
+        token_id: str, balance_before: float,
+    ) -> OrderResult:
+        """Verify buy fill via balance change (source of truth), with order API fallback."""
+        balance_after = self.get_balance()
+        spent = balance_before - balance_after if balance_before > 0 else 0
+
+        if spent > 0.50:
+            actual_shares = spent / price if price > 0 else shares
+            print(f"  ✓ Balance verified: spent ${spent:.2f} "
+                  f"(~{actual_shares:.0f} shares @ ${price:.3f})")
+            return OrderResult(
+                success=True, order_id=order_id, status=FILLED,
+                side="BUY", price=price,
+                amount_usd=spent, shares=actual_shares,
+                token_id=token_id[:16] + "...", dry_run=False,
+            )
+
+        # Balance didn't drop — check order API as fallback
+        fill = self._check_order(order_id)
+        if fill:
+            matched = self._extract_fill(fill, price)
+            if matched:
+                return OrderResult(
+                    success=True, order_id=order_id, status=FILLED,
+                    side="BUY", price=matched[0],
+                    amount_usd=matched[1], shares=matched[2],
+                    token_id=token_id[:16] + "...", dry_run=False,
+                )
+
+        # Wait one more second and try again
+        time.sleep(1)
+        balance_after2 = self.get_balance()
+        spent2 = balance_before - balance_after2 if balance_before > 0 else 0
+
+        if spent2 > 0.50:
+            actual_shares = spent2 / price if price > 0 else shares
+            print(f"  ✓ Balance verified (delayed): spent ${spent2:.2f}")
+            return OrderResult(
+                success=True, order_id=order_id, status=FILLED,
+                side="BUY", price=price,
+                amount_usd=spent2, shares=actual_shares,
+                token_id=token_id[:16] + "...", dry_run=False,
+            )
+
+        # Truly unfilled
+        self.cancel_order(order_id)
+        return OrderResult(
+            success=False, order_id=order_id, status=FAILED,
+            error="Order not filled (no balance change)",
+            side="BUY", price=price, token_id=token_id[:16] + "...",
+        )
 
     # ── Sell (balance-verified, partial fill aware) ─────────────────
 
@@ -210,6 +292,7 @@ class Executor:
 
         Verifies the sell via USDC balance change, not order status.
         Returns shares_remaining for partial fill tracking.
+        Rejects if notional < $5 (Polymarket minimum) — caller should hold to resolution.
         """
         sell_shares = int(shares)
         if sell_shares < 1:
@@ -242,7 +325,19 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
+        # Check minimum notional BEFORE attempting — prevents the
+        # "$3.42 lower than minimum: 5" trap that strands shares
         sell_amount = round(sell_shares * price, 2)
+        if sell_amount < POLY_MIN_NOTIONAL:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Notional ${sell_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min "
+                      f"— hold to resolution",
+                side="SELL", price=price, shares=float(sell_shares),
+                shares_remaining=float(sell_shares),
+                token_id=token_id[:16] + "...",
+            )
+
         print(f"  📊 Sell: {sell_shares} shares @ ${price:.3f} = ${sell_amount:.2f}")
 
         # Snapshot balance BEFORE sell
@@ -331,39 +426,6 @@ class Executor:
             )
 
     # ── Helpers ──────────────────────────────────────────────────────
-
-    def _verify_fill(
-        self, order_id: str, side: str, price: float, shares: float, token_id: str,
-    ) -> OrderResult:
-        fill = self._check_order(order_id)
-        if fill:
-            matched = self._extract_fill(fill, price)
-            if matched:
-                return OrderResult(
-                    success=True, order_id=order_id, status=FILLED,
-                    side=side, price=matched[0],
-                    amount_usd=matched[1], shares=matched[2],
-                    token_id=token_id[:16] + "...", dry_run=False,
-                )
-
-        time.sleep(2)
-        fill = self._check_order(order_id)
-        if fill:
-            matched = self._extract_fill(fill, price)
-            if matched:
-                return OrderResult(
-                    success=True, order_id=order_id, status=FILLED,
-                    side=side, price=matched[0],
-                    amount_usd=matched[1], shares=matched[2],
-                    token_id=token_id[:16] + "...", dry_run=False,
-                )
-
-        self.cancel_order(order_id)
-        return OrderResult(
-            success=False, order_id=order_id, status=FAILED,
-            error="Order not filled within 2s",
-            side=side, price=price, token_id=token_id[:16] + "...",
-        )
 
     def _extract_fill(self, fill: dict, fallback_price: float) -> Optional[tuple]:
         size_matched = float(

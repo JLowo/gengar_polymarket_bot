@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-PolyBot v10 — Balance-Verified Trading
+PolyBot v11 — Balance-Verified Everything
 
-Fixes from Polymarket CSV analysis:
-  1. Balance-verified sells: detects ghost fills and partial fills
-     via USDC balance change, not unreliable order status API
-  2. Partial fill tracking: when sell only fills partially, bot tracks
-     residual shares and knows actual P&L
-  3. Max buy price $0.75: above this, 30% TP is impossible (shares max $1)
-  4. Residual shares held to resolution automatically
+Fixes from live run analysis ($79 → $63):
+  1. Balance-verified buys AND sells: snapshots USDC before/after every
+     order. Ghost fills caught automatically. Real cost/revenue used.
+  2. Minimum notional guard: if sell notional < $5, don't attempt —
+     hold to resolution instead of getting "Size lower than minimum" trap.
+  3. Claim guard: if remaining shares × $0.99 < $5, skip sell claim.
+     Shares auto-resolve at $1.00 on Polymarket.
+  4. Window-boundary balance sync: real USDC balance replaces internal
+     tracking at every window transition. Drift detected and logged.
+  5. Real P&L line: session_start_balance → current_balance shown
+     alongside tracked P&L in hourly/shutdown summaries.
+  6. Silenced 'price check failed: no match' spam.
 
 Position management (from v9.2):
   1. Price stop-loss: sell price < buy × (1 - 40%)
@@ -99,6 +104,10 @@ class PolyBot:
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
 
+        # Real balance tracking (source of truth)
+        self._session_start_balance: float = 0.0
+        self._last_real_balance: float = 0.0
+
         # Price cache
         self._cached_up: float = 0.50
         self._cached_down: float = 0.50
@@ -120,7 +129,7 @@ class PolyBot:
         sl_price = self.stop_loss_pct * 100
         sl_prob = self.stop_loss_prob * 100
         print("=" * 55)
-        print(f"  PolyBot v10 — Balance-Verified Trading")
+        print(f"  PolyBot v11 — Balance-Verified Everything")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
@@ -140,8 +149,12 @@ class PolyBot:
             balance = self.executor.get_balance()
             print(f"  USDC balance: ${balance:.2f}")
             self.stats.bankroll = balance
+            self._session_start_balance = balance
+            self._last_real_balance = balance
         else:
             print("  [dry run — no wallet connection]")
+            self._session_start_balance = self.stats.bankroll
+            self._last_real_balance = self.stats.bankroll
 
         self.price_feed.start()
         print("\n⏳ Waiting for BTC price...")
@@ -364,6 +377,11 @@ class PolyBot:
                 print(f"  💰 EXIT ({reason}): {result.shares:.0f} shares @ "
                       f"${result.price:.3f} = ${result.amount_usd:.2f} | "
                       f"Profit: ${profit:+.2f}")
+        elif "hold to resolution" in result.error:
+            # Below $5 minimum — can't sell, hold to resolution
+            notional = self._trade_shares * sell_price
+            print(f"  📌 Can't sell: ${notional:.2f} below $5 minimum — holding to resolution")
+            self._exit_gave_up = True  # Skip further exit attempts
         else:
             self._exit_retries += 1
             if self._exit_retries >= MAX_EXIT_RETRIES:
@@ -382,6 +400,17 @@ class PolyBot:
             self.stats.hourly.record_window(self._traded)
             if self._traded:
                 self._resolve_previous_trade()
+
+            # Sync real balance at window boundary (catches any drift)
+            if not self.dry_run and self.executor._initialized:
+                real_bal = self.executor.get_balance()
+                if real_bal > 0:
+                    drift = abs(real_bal - self.stats.bankroll)
+                    if drift > 0.50:
+                        print(f"  🔄 Balance sync: ${self.stats.bankroll:.2f} → "
+                              f"${real_bal:.2f} (drift ${drift:.2f})")
+                    self.stats.bankroll = real_bal
+                    self._last_real_balance = real_bal
 
         self._current_window = window_ts
         self._opening_price = 0.0
@@ -505,28 +534,6 @@ class PolyBot:
                 edge=sig.edge, kelly_size=sig.kelly_size,
             )
         else:
-            # Ghost fill recovery
-            if "exception" in result.error.lower() or "timeout" in result.error.lower():
-                print(f"  ⚠️  Network error: {result.error}")
-                if not self.dry_run and self.executor._initialized:
-                    new_balance = self.executor.get_balance()
-                    old_balance = self.stats.bankroll
-                    if old_balance - new_balance > 1.0:
-                        spent = old_balance - new_balance
-                        est_shares = spent / sig.market_price
-                        print(f"  👻 GHOST FILL detected! Balance dropped ${spent:.2f}")
-                        print(f"     Treating as filled: ~{est_shares:.0f} shares @ ~${sig.market_price:.3f}")
-
-                        self._traded = True
-                        self._trade_side = sig.side
-                        self._trade_price = sig.market_price
-                        self._trade_cost = spent
-                        self._trade_shares = est_shares
-                        self._trade_token_id = token_id
-                        self.stats.bankroll = new_balance
-                        self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
-                        return
-
             print(f"  ❌ Buy failed: {result.error}")
 
     # ── Resolve (partial fill aware) ────────────────────────────────
@@ -567,6 +574,21 @@ class PolyBot:
             profit = total_received - original_cost
 
             if self._trade_token_id and not self._trade_token_id.startswith("DRY-"):
+                claim_notional = remaining_shares * 0.99
+                if claim_notional < 5.0:
+                    # Below $5 minimum — can't sell, shares auto-resolve
+                    print(f"  💰 Won {remaining_shares:.0f} shares — below $5 min, "
+                          f"auto-resolving (${claim_notional:.2f})")
+                    self.stats.bankroll += resolution_payout
+                    self.stats.record_win(profit)
+                    self._unclaimed_winnings += resolution_payout
+                    partial_note = f" (partial exit saved ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
+                    print(f"  ✅ WIN{partial_note} +${profit:.2f} (unclaimed) | "
+                          f"P&L: ${self.stats.total_pnl:+.2f} | "
+                          f"Bank: ${self.stats.bankroll:.2f}")
+                    self.telegram.win_alert(profit, self.stats.total_pnl)
+                    return
+
                 print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
                 claim = self.executor.sell(
                     token_id=self._trade_token_id,
@@ -613,6 +635,17 @@ class PolyBot:
             self._last_hour_check = current_hour
             h = self.stats.hourly.to_dict()
             o = self.stats.to_dict()
+
+            # Sync real balance for accuracy
+            if not self.dry_run and self.executor._initialized:
+                real_bal = self.executor.get_balance()
+                if real_bal > 0:
+                    self.stats.bankroll = real_bal
+                    self._last_real_balance = real_bal
+                    o["bankroll"] = real_bal
+
+            real_pnl = self.stats.bankroll - self._session_start_balance
+
             print(f"\n{'═' * 55}")
             print(f"  📊 HOURLY SUMMARY")
             print(f"  This hour: {h['trades']} trades | "
@@ -624,6 +657,8 @@ class PolyBot:
                   f"{h['windows_skipped']} skipped")
             print(f"  Overall: {o['total_trades']} trades | "
                   f"P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
+            print(f"  💰 Real P&L (balance): ${real_pnl:+.2f} "
+                  f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})")
             if self._unclaimed_winnings > 0:
                 print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
             print(f"{'═' * 55}\n")
@@ -637,12 +672,22 @@ class PolyBot:
         if self.executor._initialized:
             self.executor.cancel_all()
 
+        # Final real balance sync
+        if not self.dry_run and self.executor._initialized:
+            real_bal = self.executor.get_balance()
+            if real_bal > 0:
+                self.stats.bankroll = real_bal
+                self._last_real_balance = real_bal
+
+        real_pnl = self.stats.bankroll - self._session_start_balance
         o = self.stats.to_dict()
         print(f"\n{'═' * 55}")
         print(f"  FINAL: {o['total_trades']} trades | "
               f"{o['wins']}W/{o['losses']}L | "
               f"WR: {o['win_rate']:.1f}%")
-        print(f"  P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
+        print(f"  Tracked P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
+        print(f"  💰 Real P&L: ${real_pnl:+.2f} "
+              f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})")
         if self._unclaimed_winnings > 0:
             print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
         print(f"{'═' * 55}")
