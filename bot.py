@@ -1,32 +1,41 @@
 #!/usr/bin/env python3
 """
-PolyBot v8.1 — Complement Engine + Clean Decimals
+PolyBot v9 — Active Position Management
 
-Fixes from v8:
-  - Price caching: queries complement engine every 5s, not every tick
-  - Clean decimals: uses regular OrderArgs (not create_market_order)
-  - GTC orders: tolerates tiny slippage instead of FOK killing
-  - Sell takes shares directly (not notional USD)
+Phase 1 improvements:
+  - Continuous probability updates while holding (Bayesian-style)
+  - Take-profit: sell when return exceeds target (default 30%)
+  - Stop-loss: sell when probability flips against us (prob < 0.50)
+  - Dynamic exit: check every tick, not just at T-5s
+  - Forced exit at T-5s as last resort
+
+The key insight from live data:
+  - Wins: bought at $0.75, sold at $0.99 (held through, BTC stayed)
+  - Losses: bought at $0.64, BTC reversed, held to $0.00
+  - Fix: detect the reversal and exit while shares still have value
 """
 
 import os
 import sys
 import time
 import signal
+import math
 from dotenv import load_dotenv
-
-from market import get_current_market, current_window_ts, PERIOD_SECONDS
-from price_feed import BinancePriceFeed
-from strategy import evaluate, StrategyConfig, TradingStats
-from executor import Executor, FILLED, FAILED
-from telegram_notifier import TelegramNotifier
 
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+from market import get_current_market, current_window_ts, PERIOD_SECONDS
+from price_feed import BinancePriceFeed
+from strategy import evaluate, estimate_true_probability, StrategyConfig, TradingStats
+from executor import Executor, FILLED, FAILED
+from telegram_notifier import TelegramNotifier
 
-EXIT_WINDOW_START = 5
-EXIT_WINDOW_END = 1
+
+# ── Position management constants ───────────────────────────────────
+FORCED_EXIT_START = 5       # Last-resort exit window
+FORCED_EXIT_END = 1
+POSITION_CHECK_INTERVAL = 3  # Check sell price every 3s while holding
 
 
 class PolyBot:
@@ -38,12 +47,16 @@ class PolyBot:
 
         self.strategy_config = StrategyConfig(
             min_edge=float(os.getenv("MIN_EDGE", "0.03")),
-            entry_window_start=int(os.getenv("ENTRY_WINDOW_START", "60")),
+            entry_window_start=int(os.getenv("ENTRY_WINDOW_START", "240")),
             entry_window_end=int(os.getenv("ENTRY_WINDOW_END", "10")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             min_bet=float(os.getenv("MIN_BET", "1.0")),
             max_bet=float(os.getenv("MAX_BET", "25.0")),
         )
+
+        # ── Position management params ──────────────────────────────
+        self.take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))  # 30% return
+        self.stop_loss_prob = float(os.getenv("STOP_LOSS_PROB", "0.50"))    # Exit if prob flips
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
 
@@ -73,8 +86,8 @@ class PolyBot:
 
         # Exit state
         self._exited: bool = False
-        self._exit_attempted: bool = False
         self._exit_revenue: float = 0.0
+        self._last_position_check: float = 0.0
 
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
@@ -88,24 +101,26 @@ class PolyBot:
     def start(self):
         if not self.dry_run:
             from proxy import ensure_tor, apply_proxy
-            import logging
-            logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+            import logging as _log
+            _log.basicConfig(level=_log.INFO, format="[%(name)s] %(message)s")
             print("\n🧅 Starting Tor proxy for CLOB API...")
             proxy_url = ensure_tor()
             apply_proxy(proxy_url)
             print(f"✅ Tor active: {proxy_url}\n")
 
         kf = self.strategy_config.kelly_fraction
+        tp = self.take_profit_pct * 100
         print("=" * 55)
-        print(f"  PolyBot v8.1 — Complement Engine")
+        print(f"  PolyBot v9 — Active Position Management")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
         print(f"  Min edge: {self.strategy_config.min_edge*100:.1f}%")
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
-        print(f"  Exit:  T-{EXIT_WINDOW_START}s to T-{EXIT_WINDOW_END}s")
-        print(f"  Price refresh: every {self._PRICE_REFRESH:.0f}s")
+        print(f"  Take profit: {tp:.0f}% | Stop loss: prob < "
+              f"{self.stop_loss_prob:.0%}")
+        print(f"  Position check: every {POSITION_CHECK_INTERVAL}s")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
 
@@ -173,18 +188,16 @@ class PolyBot:
             self._opening_price = btc_price
             print(f"  📌 Open: ${btc_price:,.2f}")
 
-        # Holding: watch for exit
+        # ── HOLDING: active position management ─────────────────────
         if self._traded and not self._exited:
-            if EXIT_WINDOW_START >= seconds_remaining >= EXIT_WINDOW_END:
-                if not self._exit_attempted:
-                    self._attempt_exit(seconds_remaining)
+            self._manage_position(btc_price, seconds_remaining, now)
             return
 
-        # Already done
+        # ── Already done for this window ────────────────────────────
         if self._traded or self._trade_attempted:
             return
 
-        # Look for entry
+        # ── IDLE: look for entry ────────────────────────────────────
         up_price, down_price = self._get_market_prices(btc_price, seconds_remaining)
 
         signal_result = evaluate(
@@ -212,6 +225,133 @@ class PolyBot:
                 f"P&L ${self.stats.total_pnl:+.2f} [{state}]"
             )
 
+    # ── Active position management (the Phase 1 core) ──────────────
+
+    def _manage_position(self, btc_price: float, seconds_remaining: float, now: float):
+        """Every tick while holding: update probability, check exits.
+
+        Exit triggers (checked in order):
+          1. Take-profit: sell price > buy price × (1 + target%)
+          2. Stop-loss: updated probability < 0.50 (BTC reversed)
+          3. Forced exit: T-5s to T-1s, sell if any profit exists
+        """
+        if self._opening_price <= 0:
+            return
+
+        # ── Recalculate true probability (Bayesian update) ──────────
+        btc_delta_pct = ((btc_price - self._opening_price) / self._opening_price) * 100
+        updated_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
+
+        # Probability is for "UP" side. Flip for "DOWN" trades.
+        if self._trade_side == "DOWN":
+            our_prob = 1.0 - updated_prob
+        else:
+            our_prob = updated_prob
+
+        # ── Throttled sell price check ──────────────────────────────
+        if now - self._last_position_check < POSITION_CHECK_INTERVAL:
+            # Still show status on 30s intervals
+            if int(now) % 30 == 0:
+                d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
+                print(
+                    f"  ⏱  T-{seconds_remaining:5.1f}s | "
+                    f"BTC ${btc_price:,.2f} {d}{abs(btc_delta_pct):.3f}% | "
+                    f"Prob: {our_prob:.2f} | "
+                    f"P&L ${self.stats.total_pnl:+.2f} [HOLDING]"
+                )
+            return
+
+        self._last_position_check = now
+
+        # ── Get current sell price ──────────────────────────────────
+        if self.dry_run:
+            # Simulate sell price from probability
+            sim_sell = our_prob if our_prob > 0.10 else 0.01
+            current_sell_price = round(sim_sell, 2)
+        else:
+            sell_probe = round(self._trade_shares * self._trade_price, 2)
+            current_sell_price = self.executor.get_market_price(
+                self._trade_token_id, "SELL", max(sell_probe, 1.0)
+            )
+
+        if current_sell_price <= 0:
+            return
+
+        # ── Calculate position metrics ──────────────────────────────
+        current_value = self._trade_shares * current_sell_price
+        unrealized_pnl = current_value - self._trade_cost
+        return_pct = (current_sell_price - self._trade_price) / self._trade_price
+
+        # ── Check 1: Take-profit ────────────────────────────────────
+        if return_pct >= self.take_profit_pct:
+            print(f"\n  🎯 TAKE PROFIT: return {return_pct:.0%} ≥ {self.take_profit_pct:.0%} | "
+                  f"sell @ ${current_sell_price:.3f} (bought @ ${self._trade_price:.3f})")
+            self._exit_position(current_sell_price, seconds_remaining, "take-profit")
+            return
+
+        # ── Check 2: Stop-loss (probability flipped) ───────────────
+        if our_prob < self.stop_loss_prob:
+            print(f"\n  🛑 STOP LOSS: prob {our_prob:.2f} < {self.stop_loss_prob:.2f} | "
+                  f"BTC reversed (Δ{btc_delta_pct:+.3f}%) | "
+                  f"sell @ ${current_sell_price:.3f}")
+            self._exit_position(current_sell_price, seconds_remaining, "stop-loss")
+            return
+
+        # ── Check 3: Forced exit at T-5s ────────────────────────────
+        if FORCED_EXIT_START >= seconds_remaining >= FORCED_EXIT_END:
+            if current_sell_price > self._trade_price:
+                print(f"\n  ⏰ FORCED EXIT: T-{seconds_remaining:.0f}s | "
+                      f"sell @ ${current_sell_price:.3f} (profitable)")
+                self._exit_position(current_sell_price, seconds_remaining, "forced-exit")
+            else:
+                print(f"  ⏰ T-{seconds_remaining:.0f}s | "
+                      f"sell @ ${current_sell_price:.3f} not profitable — holding to resolution")
+            return
+
+        # ── Status line (every check interval) ──────────────────────
+        d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
+        pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
+        print(
+            f"  {pnl_emoji} T-{seconds_remaining:5.1f}s | "
+            f"BTC {d}{abs(btc_delta_pct):.3f}% | "
+            f"Prob: {our_prob:.2f} | "
+            f"Sell: ${current_sell_price:.3f} | "
+            f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
+        )
+
+    # ── Execute exit ────────────────────────────────────────────────
+
+    def _exit_position(self, sell_price: float, seconds_remaining: float, reason: str):
+        """Sell shares and record the exit."""
+        if self.dry_run:
+            revenue = self._trade_shares * sell_price
+            self._exited = True
+            self._exit_revenue = revenue
+            self.stats.bankroll += revenue
+            profit = revenue - self._trade_cost
+            print(f"  💰 EXIT ({reason}, paper): {self._trade_shares:.0f} shares @ "
+                  f"${sell_price:.3f} = ${revenue:.2f} | Profit: ${profit:+.2f}")
+            return
+
+        result = self.executor.sell(
+            token_id=self._trade_token_id,
+            shares=self._trade_shares,
+            price=sell_price,
+        )
+
+        if result.success:
+            self._exited = True
+            self._exit_revenue = result.amount_usd
+            self.stats.bankroll += result.amount_usd
+            profit = result.amount_usd - self._trade_cost
+            print(f"  💰 EXIT ({reason}): {result.shares:.0f} shares @ "
+                  f"${result.price:.3f} = ${result.amount_usd:.2f} | "
+                  f"Profit: ${profit:+.2f}")
+        else:
+            print(f"  ⚠️  Exit failed ({reason}): {result.error}")
+
+    # ── Window management ───────────────────────────────────────────
+
     def _on_new_window(self, window_ts: int):
         if self._current_window > 0:
             self.stats.hourly.record_window(self._traded)
@@ -223,8 +363,8 @@ class PolyBot:
         self._traded = False
         self._trade_attempted = False
         self._exited = False
-        self._exit_attempted = False
         self._exit_revenue = 0.0
+        self._last_position_check = 0.0
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
@@ -244,13 +384,11 @@ class PolyBot:
                 return 0.50, 0.50
             delta_pct = (btc_price - self._opening_price) / self._opening_price
             time_factor = 1 - (seconds_remaining / PERIOD_SECONDS[self.period])
-            import math
             lag_factor = min(time_factor * 0.7, 0.85)
             implied = 0.5 + lag_factor * math.tanh(delta_pct * 500) * 0.45
             up = round(min(max(implied, 0.02), 0.98), 3)
             return up, round(1.0 - up, 3)
 
-        # Return cached if fresh enough
         now = time.time()
         if now - self._price_last_fetched < self._PRICE_REFRESH:
             return self._cached_up, self._cached_down
@@ -324,9 +462,12 @@ class PolyBot:
             self.stats.bankroll -= result.amount_usd
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
 
+            tp_price = result.price * (1 + self.take_profit_pct)
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
+            print(f"     Take profit @ ${tp_price:.3f} ({self.take_profit_pct:.0%}) | "
+                  f"Stop loss @ prob < {self.stop_loss_prob:.0%}")
 
             self.telegram.trade_alert(
                 side=sig.side, price=result.price, amount=result.amount_usd,
@@ -336,73 +477,23 @@ class PolyBot:
         else:
             print(f"  ❌ Buy failed: {result.error}")
 
-    # ── Exit ────────────────────────────────────────────────────────
-
-    def _attempt_exit(self, seconds_remaining: float):
-        self._exit_attempted = True
-
-        if self.dry_run:
-            btc_price, _ = self.price_feed.get_price()
-            if self._opening_price <= 0:
-                return
-            delta_pct = (btc_price - self._opening_price) / self._opening_price
-            on_our_side = (delta_pct > 0 and self._trade_side == "UP") or \
-                          (delta_pct < 0 and self._trade_side == "DOWN")
-            if on_our_side and abs(delta_pct) > 0.0001:
-                import math
-                sim_price = min(0.50 + abs(delta_pct) * 5000 * 0.45, 0.97)
-                sim_price = round(sim_price, 2)
-                if sim_price > self._trade_price:
-                    revenue = self._trade_shares * sim_price
-                    self._exited = True
-                    self._exit_revenue = revenue
-                    self.stats.bankroll += revenue
-                    profit = revenue - self._trade_cost
-                    print(f"  💰 EXIT (paper): {self._trade_shares:.0f} shares @ "
-                          f"${sim_price:.3f} | Profit: ${profit:.2f}")
-            return
-
-        # Live: get sell price
-        sell_price = self.executor.get_market_price(
-            self._trade_token_id, "SELL",
-            round(self._trade_shares * self._trade_price, 2),
-        )
-
-        if sell_price <= 0 or sell_price <= self._trade_price:
-            print(f"  ⏳ Sell @ ${sell_price:.3f} not profitable — holding")
-            return
-
-        print(f"  💰 Exiting: sell @ ${sell_price:.3f} > buy ${self._trade_price:.3f} | "
-              f"T-{seconds_remaining:.0f}s")
-
-        result = self.executor.sell(
-            token_id=self._trade_token_id,
-            shares=self._trade_shares,
-            price=sell_price,
-        )
-
-        if result.success:
-            self._exited = True
-            self._exit_revenue = result.amount_usd
-            self.stats.bankroll += result.amount_usd
-            profit = result.amount_usd - self._trade_cost
-            print(f"  💰 SOLD: {result.shares:.0f} shares @ ${result.price:.3f} "
-                  f"= ${result.amount_usd:.2f} | Profit: ${profit:+.2f}")
-        else:
-            print(f"  ⚠️  Exit failed: {result.error} — holding through resolution")
-
     # ── Resolve ─────────────────────────────────────────────────────
 
     def _resolve_previous_trade(self):
         if self._exited:
             profit = self._exit_revenue - self._trade_cost
-            self.stats.record_win(profit)
-            print(f"  ✅ WIN (pre-close) +${profit:.2f} | "
+            self.stats.record_win(profit) if profit > 0 else self.stats.record_loss(abs(profit))
+            result_emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
+            print(f"  {result_emoji} (exited) ${profit:+.2f} | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.win_alert(profit, self.stats.total_pnl)
+            if profit > 0:
+                self.telegram.win_alert(profit, self.stats.total_pnl)
+            else:
+                self.telegram.loss_alert(abs(profit), self.stats.total_pnl)
             return
 
+        # Held through resolution (no exit triggered)
         btc_price, _ = self.price_feed.get_price()
         if self._opening_price <= 0 or btc_price <= 0:
             return
