@@ -1,10 +1,10 @@
 """Order executor for Polymarket CLOB.
 
-v9.2 — Fixes:
-  - Approves CONDITIONAL token transfers on init (fixes sell failures)
-  - Complement engine pricing via calculate_market_price
-  - Clean decimal sizing via regular OrderArgs
-  - GTC for slippage tolerance
+v9.2b — Per-token conditional approval before sells.
+
+CONDITIONAL tokens are ERC-1155 — each market has a different token ID.
+We can't approve them globally. Instead, approve the specific token
+right before selling it.
 """
 
 import time
@@ -83,20 +83,8 @@ class Executor:
                 signature_type=2 if self.safe_address else 0,
             )
             self.client.set_api_creds(self.client.create_or_derive_api_creds())
-
             self._initialized = True
-
-            # Approve BOTH collateral (USDC) and conditional (shares) transfers
-            # Without conditional approval, sells fail with "not enough balance/allowance"
-            self.client.update_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            self.client.update_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL)
-            )
-
             print(f"[executor] Initialized ({'DRY RUN' if self.dry_run else 'LIVE'})")
-            print(f"[executor] Approved: COLLATERAL + CONDITIONAL")
             print(f"[executor] Address: {self.client.get_address()}")
             return True
         except Exception as e:
@@ -117,7 +105,6 @@ class Executor:
     # ── Price from complement engine ────────────────────────────────
 
     def get_market_price(self, token_id: str, side: str, amount_usd: float) -> float:
-        """What would we actually pay/receive? Queries the merged book."""
         if not self._initialized:
             return 0.0
         try:
@@ -135,7 +122,6 @@ class Executor:
     # ── Buy ─────────────────────────────────────────────────────────
 
     def buy(self, token_id: str, amount_usd: float) -> OrderResult:
-        """Buy shares using complement engine price + clean decimals."""
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
             return OrderResult(
@@ -155,7 +141,6 @@ class Executor:
         if not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        # Get real price from complement engine
         market_price = self.get_market_price(token_id, "BUY", amount_usd)
         if market_price <= 0:
             return OrderResult(
@@ -164,7 +149,6 @@ class Executor:
                 token_id=token_id[:16] + "...",
             )
 
-        # Clean decimal sizing
         shares, spend = calculate_order_size(market_price, amount_usd)
         if shares < MIN_SHARES or spend <= 0:
             return OrderResult(
@@ -179,10 +163,9 @@ class Executor:
 
         return self._place_order(token_id, "BUY", market_price, shares, spend)
 
-    # ── Sell ────────────────────────────────────────────────────────
+    # ── Sell (with per-token approval) ──────────────────────────────
 
     def sell(self, token_id: str, shares: float, price: float = 0.0) -> OrderResult:
-        """Sell shares. If price=0, gets market price automatically."""
         sell_shares = int(shares)
         if sell_shares < 1:
             return OrderResult(
@@ -213,6 +196,18 @@ class Executor:
                     error="Could not get sell price", side="SELL",
                     token_id=token_id[:16] + "...",
                 )
+
+        # Approve this specific conditional token before selling
+        # ERC-1155 tokens require per-token approval
+        try:
+            self.client.update_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                )
+            )
+        except Exception as e:
+            print(f"[executor] Token approval failed: {e}")
 
         spend = round(sell_shares * price, 2)
         print(f"  📊 Sell: {sell_shares} shares @ ${price:.3f} = ${spend:.2f}")
