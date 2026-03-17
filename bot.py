@@ -35,7 +35,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 from market import get_current_market, current_window_ts, PERIOD_SECONDS
 from price_feed import BinancePriceFeed
 from strategy import evaluate, estimate_true_probability, StrategyConfig, TradingStats
-from executor import Executor, FILLED, PARTIAL, FAILED
+from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE
 from telegram_notifier import TelegramNotifier
 
 
@@ -146,7 +146,7 @@ class PolyBot:
         print(f"  Min edge: {self.strategy_config.min_edge*100:.1f}%")
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
-        print(f"  Take profit: {tp:.0f}% | Max buy price: $0.75")
+        print(f"  Take profit: {tp:.0f}% | Max buy price: ${MAX_BUY_PRICE:.2f}")
         print(f"  Stop loss: price -{sl_price:.0f}% OR prob < {sl_prob:.0f}%")
         print(f"  Sells: balance-verified (partial fill aware)")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")

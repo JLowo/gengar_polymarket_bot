@@ -34,7 +34,7 @@ FAILED = "FAILED"
 
 MIN_SHARES = 5.0
 MIN_AMOUNT_USD = 1.0
-MAX_BUY_PRICE = 0.75  # Don't buy above this — TP can't trigger
+MAX_BUY_PRICE = 0.90  # Allow high-conviction buys — profit comes from resolution at $1.00
 POLY_MIN_NOTIONAL = 5.0  # Polymarket rejects orders below $5 notional
 
 
@@ -179,17 +179,29 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        # Check minimum notional
-        if amount_usd < POLY_MIN_NOTIONAL:
+        # Compute clean amounts: integer shares × price = clean 2-decimal USD.
+        # MarketOrderArgs needs: taker amount (USDC) ≤ 2 decimals,
+        # maker amount (shares) ≤ 4 decimals. Integer shares guarantees both.
+        shares = int(amount_usd / market_price)
+        if shares < 1:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Amount ${amount_usd:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
+                error=f"Can't afford 1 share at ${market_price:.3f} "
+                      f"within ${amount_usd:.2f}",
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+        clean_amount = round(shares * market_price, 2)
+
+        # Re-check minimum notional with clean amount
+        if clean_amount < POLY_MIN_NOTIONAL:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Amount ${clean_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        est_shares = amount_usd / market_price if market_price > 0 else 0
         print(f"  📊 Market price: ${market_price:.3f}/share "
-              f"→ ~{est_shares:.0f} shares for ${amount_usd:.2f}")
+              f"→ {shares} shares for ${clean_amount:.2f}")
 
         # Snapshot balance BEFORE buy
         balance_before = self.get_balance()
@@ -197,7 +209,7 @@ class Executor:
         try:
             order_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=amount_usd,
+                amount=clean_amount,
                 side="BUY",
             )
             signed_order = self.client.create_market_order(order_args)
@@ -215,7 +227,7 @@ class Executor:
             # Wait for balance to settle, then verify.
             time.sleep(3)
             return self._verify_buy_via_balance(
-                order_id, market_price, est_shares, token_id, balance_before,
+                order_id, market_price, float(shares), token_id, balance_before,
             )
 
         except Exception as e:
