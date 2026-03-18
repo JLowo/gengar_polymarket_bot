@@ -15,11 +15,10 @@ Fixes from live run analysis ($79 → $63):
      alongside tracked P&L in hourly/shutdown summaries.
   6. Silenced 'price check failed: no match' spam.
 
-Position management (from v9.2):
-  1. Price stop-loss: sell price < buy × (1 - 40%)
-  2. Prob stop-loss: probability < 35%
-  3. Take-profit: return ≥ 30%
-  4. Forced exit: T-5s, sell if profitable
+Position management:
+  ALL STOPS DISABLED — hold to resolution.
+  Data showed prob-stop cost $35.45 across 5 fires (4 won at resolution).
+  Collecting pure hold-to-resolution data for future stop optimization.
 """
 
 import os
@@ -137,20 +136,16 @@ class PolyBot:
             print(f"✅ Tor active: {proxy_url}\n")
 
         kf = self.strategy_config.kelly_fraction
-        tp = self.take_profit_pct * 100
-        sl_price = self.stop_loss_pct * 100
-        sl_prob = self.stop_loss_prob * 100
         print("=" * 55)
-        print(f"  PolyBot v11 — Balance-Verified Everything")
+        print(f"  PolyBot v12 — Hold to Resolution")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
         print(f"  Min edge: {self.strategy_config.min_edge*100:.1f}%")
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
-        print(f"  Take profit: {tp:.0f}% | Max buy price: ${MAX_BUY_PRICE:.2f}")
-        print(f"  Stop loss: price -{sl_price:.0f}% OR prob < {sl_prob:.0f}%")
-        print(f"  Sells: balance-verified (partial fill aware)")
+        print(f"  Max buy price: ${MAX_BUY_PRICE:.2f}")
+        print(f"  Exits: NONE — all trades hold to resolution")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
 
@@ -260,9 +255,16 @@ class PolyBot:
                 f"P&L ${self.stats.total_pnl:+.2f} [{state}]"
             )
 
-    # ── Active position management ──────────────────────────────────
+    # ── Position monitoring (hold to resolution — no early exits) ───
 
     def _manage_position(self, btc_price: float, seconds_remaining: float, now: float):
+        """Monitor position only — all trades hold to resolution.
+
+        All stops disabled based on data (35 signals, 8 trades):
+        prob-stop fired 5x, 4 won at resolution. Cost: $35.45.
+        Strategy: enter on edge, hold 5 min, let resolution pay.
+        Tracker logs hold-period stats for future stop design.
+        """
         if self._opening_price <= 0:
             return
 
@@ -282,13 +284,13 @@ class PolyBot:
                     f"  ⏱  T-{seconds_remaining:5.1f}s | "
                     f"BTC {d}{abs(btc_delta_pct):.3f}% | "
                     f"Prob: {our_prob:.2f} | "
-                    f"P&L ${self.stats.total_pnl:+.2f} [HOLDING]"
+                    f"P&L ${self.stats.total_pnl:+.2f} [HOLDING→RES]"
                 )
             return
 
         self._last_position_check = now
 
-        # Get current sell price
+        # Get current sell price (for tracking only)
         if self.dry_run:
             current_sell_price = round(max(our_prob, 0.01), 2)
         else:
@@ -300,49 +302,14 @@ class PolyBot:
         if current_sell_price <= 0:
             return
 
-        # Track hold-period extremes for post-trade analysis
+        # Track hold-period extremes for post-session analysis
         self.tracker.update_hold_stats(our_prob, current_sell_price)
 
         current_value = self._trade_shares * current_sell_price
         unrealized_pnl = current_value - self._trade_cost
         return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
 
-        # Check 1: Price stop-loss
-        price_floor = self._trade_price * (1.0 - self.stop_loss_pct)
-        if current_sell_price <= price_floor:
-            print(f"\n  🛑 PRICE STOP: sell ${current_sell_price:.3f} ≤ "
-                  f"floor ${price_floor:.3f} (-{self.stop_loss_pct:.0%}) | "
-                  f"Saving ${current_value:.2f} of ${self._trade_cost:.2f}")
-            self._exit_position(current_sell_price, seconds_remaining, "price-stop")
-            return
-
-        # Check 2: Prob stop-loss
-        if our_prob < self.stop_loss_prob:
-            print(f"\n  🛑 PROB STOP: prob {our_prob:.2f} < {self.stop_loss_prob:.2f} | "
-                  f"BTC Δ{btc_delta_pct:+.3f}% | "
-                  f"sell @ ${current_sell_price:.3f}")
-            self._exit_position(current_sell_price, seconds_remaining, "prob-stop")
-            return
-
-        # Check 3: Take-profit
-        if return_pct >= self.take_profit_pct:
-            print(f"\n  🎯 TAKE PROFIT: return {return_pct:.0%} ≥ {self.take_profit_pct:.0%} | "
-                  f"sell @ ${current_sell_price:.3f} (bought @ ${self._trade_price:.3f})")
-            self._exit_position(current_sell_price, seconds_remaining, "take-profit")
-            return
-
-        # Check 4: Forced exit at T-5s
-        if FORCED_EXIT_START >= seconds_remaining >= FORCED_EXIT_END:
-            if current_sell_price > self._trade_price:
-                print(f"\n  ⏰ FORCED EXIT: T-{seconds_remaining:.0f}s | "
-                      f"sell @ ${current_sell_price:.3f} (profitable)")
-                self._exit_position(current_sell_price, seconds_remaining, "forced-exit")
-            else:
-                print(f"  ⏰ T-{seconds_remaining:.0f}s | "
-                      f"sell @ ${current_sell_price:.3f} not profitable — holding to resolution")
-            return
-
-        # Status line
+        # Status line (monitoring only — no exits)
         d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
         pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
         print(
@@ -364,11 +331,6 @@ class PolyBot:
             profit = revenue - self._trade_cost
             print(f"  💰 EXIT ({reason}, paper): {self._trade_shares:.0f} shares @ "
                   f"${sell_price:.3f} = ${revenue:.2f} | Profit: ${profit:+.2f}")
-            self.tracker.log_trade_exit(
-                exit_type=reason, exit_price=sell_price,
-                exit_shares_sold=self._trade_shares, exit_revenue=revenue,
-                residual_shares=0,
-            )
             return
 
         result = self.executor.sell(
@@ -392,11 +354,6 @@ class PolyBot:
                 self._trade_shares = result.shares_remaining
                 # Mark exited — residual resolves at window close
                 self._exited = True
-                self.tracker.log_trade_exit(
-                    exit_type=f"{reason}-partial", exit_price=result.price,
-                    exit_shares_sold=result.shares, exit_revenue=result.amount_usd,
-                    residual_shares=result.shares_remaining,
-                )
             else:
                 # Full fill (or residual < 1 share)
                 self._exited = True
@@ -404,21 +361,11 @@ class PolyBot:
                 print(f"  💰 EXIT ({reason}): {result.shares:.0f} shares @ "
                       f"${result.price:.3f} = ${result.amount_usd:.2f} | "
                       f"Profit: ${profit:+.2f}")
-                self.tracker.log_trade_exit(
-                    exit_type=reason, exit_price=result.price,
-                    exit_shares_sold=result.shares, exit_revenue=result.amount_usd,
-                    residual_shares=result.shares_remaining,
-                )
         elif "hold to resolution" in result.error:
             # Below $5 minimum — can't sell, hold to resolution
             notional = self._trade_shares * sell_price
             print(f"  📌 Can't sell: ${notional:.2f} below $5 minimum — holding to resolution")
             self._exit_gave_up = True  # Skip further exit attempts
-            self.tracker.log_trade_exit(
-                exit_type="hold-to-resolution", exit_price=sell_price,
-                exit_shares_sold=0, exit_revenue=0,
-                residual_shares=self._trade_shares,
-            )
         else:
             self._exit_retries += 1
             if self._exit_retries >= MAX_EXIT_RETRIES:
@@ -596,13 +543,10 @@ class PolyBot:
             self.stats.bankroll -= result.amount_usd
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
 
-            tp_price = result.price * (1 + self.take_profit_pct)
-            sl_price = result.price * (1 - self.stop_loss_pct)
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
-            print(f"     TP @ ${tp_price:.3f} ({self.take_profit_pct:.0%}) | "
-                  f"SL @ ${sl_price:.3f} (-{self.stop_loss_pct:.0%}) or prob < {self.stop_loss_prob:.0%}")
+            print(f"     Holding to resolution (no stops)")
 
             self.telegram.trade_alert(
                 side=sig.side, price=result.price, amount=result.amount_usd,
@@ -610,7 +554,6 @@ class PolyBot:
                 edge=sig.edge, kelly_size=sig.kelly_size,
             )
 
-            # Track signal and entry
             self.tracker.log_signal(
                 window_ts=self._current_window, btc_price=0, opening_price=self._opening_price,
                 up_price=0, down_price=0, seconds_remaining=seconds_remaining,
@@ -670,8 +613,6 @@ class PolyBot:
                 self.telegram.win_alert(profit, self.stats.total_pnl)
             else:
                 self.telegram.loss_alert(abs(profit), self.stats.total_pnl)
-
-            # Track resolution (exited before window close)
             btc_now, _ = self.price_feed.get_price()
             won_res = (btc_now >= self._opening_price) == (self._trade_side == "UP") if btc_now > 0 else False
             self.tracker.log_trade_resolve(
@@ -733,7 +674,8 @@ class PolyBot:
                     self.telegram.win_alert(actual_profit, self.stats.total_pnl)
                     self.tracker.log_trade_resolve(
                         btc_final_price=btc_price, opening_price=self._opening_price,
-                        won=True, profit=actual_profit, exit_revenue=self._exit_revenue + claim.amount_usd,
+                        won=True, profit=actual_profit,
+                        exit_revenue=self._exit_revenue + claim.amount_usd,
                     )
                     return
                 else:
@@ -757,7 +699,7 @@ class PolyBot:
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(net_loss, self.stats.total_pnl)
 
-        # Track resolution for held-to-resolution trades
+        # Track resolution for all held-to-resolution paths
         self.tracker.log_trade_resolve(
             btc_final_price=btc_price, opening_price=self._opening_price,
             won=won, profit=profit if won else -net_loss,
