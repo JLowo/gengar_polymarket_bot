@@ -208,11 +208,11 @@ class Executor:
         balance_before = self.get_balance()
 
         try:
-                order_args = MarketOrderArgs(
+            order_args = MarketOrderArgs(
                 token_id=token_id,
-                    # clean_amount is guaranteed to be a 2-decimal value
-                    # derived from integer cents, satisfying taker accuracy.
-                    amount=clean_amount,
+                # clean_amount is guaranteed to be a 2-decimal value
+                # derived from integer cents, satisfying taker accuracy.
+                amount=clean_amount,
                 side="BUY",
             )
             signed_order = self.client.create_market_order(order_args)
