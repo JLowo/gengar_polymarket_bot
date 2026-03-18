@@ -37,6 +37,7 @@ from price_feed import BinancePriceFeed
 from strategy import evaluate, estimate_true_probability, StrategyConfig, TradingStats
 from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE
 from telegram_notifier import TelegramNotifier
+from tracker import Tracker
 
 
 FORCED_EXIT_START = 5
@@ -75,6 +76,7 @@ class PolyBot:
             dry_run=self.dry_run,
         )
         self.telegram = TelegramNotifier()
+        self.tracker = Tracker(log_dir=os.getenv("LOG_DIR", "logs"))
         self.stats = TradingStats(bankroll=initial_bankroll)
         self.stats.hourly.hour_start = time.time()
 
@@ -161,10 +163,12 @@ class PolyBot:
             self.stats.bankroll = balance
             self._session_start_balance = balance
             self._last_real_balance = balance
+            self.tracker.set_session_balance(balance)
         else:
             print("  [dry run — no wallet connection]")
             self._session_start_balance = self.stats.bankroll
             self._last_real_balance = self.stats.bankroll
+            self.tracker.set_session_balance(self.stats.bankroll)
 
         self.price_feed.start()
         print("\n⏳ Waiting for BTC price...")
@@ -296,6 +300,9 @@ class PolyBot:
         if current_sell_price <= 0:
             return
 
+        # Track hold-period extremes for post-trade analysis
+        self.tracker.update_hold_stats(our_prob, current_sell_price)
+
         current_value = self._trade_shares * current_sell_price
         unrealized_pnl = current_value - self._trade_cost
         return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
@@ -357,6 +364,11 @@ class PolyBot:
             profit = revenue - self._trade_cost
             print(f"  💰 EXIT ({reason}, paper): {self._trade_shares:.0f} shares @ "
                   f"${sell_price:.3f} = ${revenue:.2f} | Profit: ${profit:+.2f}")
+            self.tracker.log_trade_exit(
+                exit_type=reason, exit_price=sell_price,
+                exit_shares_sold=self._trade_shares, exit_revenue=revenue,
+                residual_shares=0,
+            )
             return
 
         result = self.executor.sell(
@@ -380,6 +392,11 @@ class PolyBot:
                 self._trade_shares = result.shares_remaining
                 # Mark exited — residual resolves at window close
                 self._exited = True
+                self.tracker.log_trade_exit(
+                    exit_type=f"{reason}-partial", exit_price=result.price,
+                    exit_shares_sold=result.shares, exit_revenue=result.amount_usd,
+                    residual_shares=result.shares_remaining,
+                )
             else:
                 # Full fill (or residual < 1 share)
                 self._exited = True
@@ -387,11 +404,21 @@ class PolyBot:
                 print(f"  💰 EXIT ({reason}): {result.shares:.0f} shares @ "
                       f"${result.price:.3f} = ${result.amount_usd:.2f} | "
                       f"Profit: ${profit:+.2f}")
+                self.tracker.log_trade_exit(
+                    exit_type=reason, exit_price=result.price,
+                    exit_shares_sold=result.shares, exit_revenue=result.amount_usd,
+                    residual_shares=result.shares_remaining,
+                )
         elif "hold to resolution" in result.error:
             # Below $5 minimum — can't sell, hold to resolution
             notional = self._trade_shares * sell_price
             print(f"  📌 Can't sell: ${notional:.2f} below $5 minimum — holding to resolution")
             self._exit_gave_up = True  # Skip further exit attempts
+            self.tracker.log_trade_exit(
+                exit_type="hold-to-resolution", exit_price=sell_price,
+                exit_shares_sold=0, exit_revenue=0,
+                residual_shares=self._trade_shares,
+            )
         else:
             self._exit_retries += 1
             if self._exit_retries >= MAX_EXIT_RETRIES:
@@ -547,6 +574,13 @@ class PolyBot:
 
                 if actual_edge < self.strategy_config.min_edge:
                     print(f"  ⚠️  Edge gone at market price — skipping")
+                    self.tracker.log_signal(
+                        window_ts=self._current_window, btc_price=0, opening_price=self._opening_price,
+                        up_price=0, down_price=0, seconds_remaining=seconds_remaining,
+                        side=sig.side, true_prob=sig.true_prob, market_price=sig.market_price,
+                        edge=sig.edge, kelly_size=trade_amount,
+                        action="skipped_edge_gone", actual_price=actual_price, actual_edge=actual_edge,
+                    )
                     return
 
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount)
@@ -575,6 +609,22 @@ class PolyBot:
                 market_slug=slug, dry_run=self.dry_run,
                 edge=sig.edge, kelly_size=sig.kelly_size,
             )
+
+            # Track signal and entry
+            self.tracker.log_signal(
+                window_ts=self._current_window, btc_price=0, opening_price=self._opening_price,
+                up_price=0, down_price=0, seconds_remaining=seconds_remaining,
+                side=sig.side, true_prob=sig.true_prob, market_price=sig.market_price,
+                edge=sig.edge, kelly_size=trade_amount,
+                action="traded", fill_price=result.price,
+            )
+            self.tracker.log_trade_entry(
+                window_ts=self._current_window, side=sig.side,
+                entry_price=result.price, entry_shares=result.shares,
+                entry_cost=result.amount_usd, edge=sig.edge,
+                prob=sig.true_prob, btc_delta=sig.btc_delta_pct,
+                seconds_remaining=seconds_remaining,
+            )
         else:
             if result.error == "UNVERIFIED_BUY":
                 # Order likely filled but Polygon hasn't settled.
@@ -590,6 +640,15 @@ class PolyBot:
                 print(f"  ⏳ Buy sent but unverified — will detect via balance sync")
             else:
                 print(f"  ❌ Buy failed: {result.error}")
+                action = "skipped_below_min" if "min" in result.error.lower() else \
+                         "skipped_price_cap" if "cap" in result.error.lower() else \
+                         "skipped_buy_failed"
+                self.tracker.log_signal(
+                    window_ts=self._current_window, btc_price=0, opening_price=self._opening_price,
+                    up_price=0, down_price=0, seconds_remaining=seconds_remaining,
+                    side=sig.side, true_prob=sig.true_prob, market_price=sig.market_price,
+                    edge=sig.edge, kelly_size=trade_amount, action=action,
+                )
 
     # ── Resolve (partial fill aware) ────────────────────────────────
 
@@ -611,6 +670,14 @@ class PolyBot:
                 self.telegram.win_alert(profit, self.stats.total_pnl)
             else:
                 self.telegram.loss_alert(abs(profit), self.stats.total_pnl)
+
+            # Track resolution (exited before window close)
+            btc_now, _ = self.price_feed.get_price()
+            won_res = (btc_now >= self._opening_price) == (self._trade_side == "UP") if btc_now > 0 else False
+            self.tracker.log_trade_resolve(
+                btc_final_price=btc_now, opening_price=self._opening_price,
+                won=won_res, profit=profit, exit_revenue=self._exit_revenue,
+            )
             return
 
         # Held through resolution (may have partial exit revenue)
@@ -642,6 +709,10 @@ class PolyBot:
                           f"P&L: ${self.stats.total_pnl:+.2f} | "
                           f"Bank: ${self.stats.bankroll:.2f}")
                     self.telegram.win_alert(profit, self.stats.total_pnl)
+                    self.tracker.log_trade_resolve(
+                        btc_final_price=btc_price, opening_price=self._opening_price,
+                        won=True, profit=profit, exit_revenue=self._exit_revenue,
+                    )
                     return
 
                 print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
@@ -660,6 +731,10 @@ class PolyBot:
                           f"P&L: ${self.stats.total_pnl:+.2f} | "
                           f"Bank: ${self.stats.bankroll:.2f}")
                     self.telegram.win_alert(actual_profit, self.stats.total_pnl)
+                    self.tracker.log_trade_resolve(
+                        btc_final_price=btc_price, opening_price=self._opening_price,
+                        won=True, profit=actual_profit, exit_revenue=self._exit_revenue + claim.amount_usd,
+                    )
                     return
                 else:
                     print(f"  ⚠️  Claim failed: {claim.error}")
@@ -681,6 +756,13 @@ class PolyBot:
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+
+        # Track resolution for held-to-resolution trades
+        self.tracker.log_trade_resolve(
+            btc_final_price=btc_price, opening_price=self._opening_price,
+            won=won, profit=profit if won else -net_loss,
+            exit_revenue=self._exit_revenue,
+        )
 
     # ── Hourly + shutdown ───────────────────────────────────────────
 
@@ -747,6 +829,7 @@ class PolyBot:
             print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
         print(f"{'═' * 55}")
 
+        self.tracker.session_summary(self.stats.bankroll)
         self.telegram.status_update(o)
         time.sleep(1)
         sys.exit(0)
