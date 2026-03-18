@@ -32,7 +32,7 @@ PARTIAL = "PARTIAL"
 REJECTED = "REJECTED"
 FAILED = "FAILED"
 
-MIN_SHARES = 5.0
+MIN_SHARES = 1.0
 MIN_AMOUNT_USD = 1.0
 MAX_BUY_PRICE = 0.90  # Allow high-conviction buys — profit comes from resolution at $1.00
 POLY_MIN_NOTIONAL = 5.0  # Polymarket rejects orders below $5 notional
@@ -179,18 +179,19 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        # Compute clean amounts: integer shares × price = clean 2-decimal USD.
-        # MarketOrderArgs needs: taker amount (USDC) ≤ 2 decimals,
-        # maker amount (shares) ≤ 4 decimals. Integer shares guarantees both.
-        shares = int(amount_usd / market_price)
-        if shares < 1:
+        # Compute clean amounts with integer-cents math to avoid any
+        # floating-point precision that can trip Polymarket's
+        # "maker/taker accuracy" validation.
+        # - maker (shares): ≤ 4 decimals (we use integers)
+        # - taker (USDC):  ≤ 2 decimals (we use integer cents)
+        shares, clean_amount = calculate_order_size(market_price, amount_usd)
+        if shares < 1 or clean_amount <= 0:
             return OrderResult(
                 success=False, status=REJECTED,
                 error=f"Can't afford 1 share at ${market_price:.3f} "
                       f"within ${amount_usd:.2f}",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
-        clean_amount = round(shares * market_price, 2)
 
         # Re-check minimum notional with clean amount
         if clean_amount < POLY_MIN_NOTIONAL:
@@ -201,15 +202,17 @@ class Executor:
             )
 
         print(f"  📊 Market price: ${market_price:.3f}/share "
-              f"→ {shares} shares for ${clean_amount:.2f}")
+              f"→ {int(shares)} shares for ${clean_amount:.2f}")
 
         # Snapshot balance BEFORE buy
         balance_before = self.get_balance()
 
         try:
-            order_args = MarketOrderArgs(
+                order_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=clean_amount,
+                    # clean_amount is guaranteed to be a 2-decimal value
+                    # derived from integer cents, satisfying taker accuracy.
+                    amount=clean_amount,
                 side="BUY",
             )
             signed_order = self.client.create_market_order(order_args)
