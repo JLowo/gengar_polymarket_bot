@@ -55,9 +55,8 @@ class PolyBot:
         self.period = int(os.getenv("MARKET_PERIOD", "5"))
 
         self.strategy_config = StrategyConfig(
-            min_edge=float(os.getenv("MIN_EDGE", "0.03")),
+            min_edge=float(os.getenv("MIN_EDGE", "0.05")),
             min_prob=float(os.getenv("MIN_PROB", "0.80")),
-            safety_factor=float(os.getenv("SAFETY_FACTOR", "0.70")),
             entry_window_start=int(os.getenv("ENTRY_WINDOW_START", "240")),
             entry_window_end=int(os.getenv("ENTRY_WINDOW_END", "10")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
@@ -135,17 +134,17 @@ class PolyBot:
             print(f"✅ Tor active: {proxy_url}\n")
 
         kf = self.strategy_config.kelly_fraction
-        sf = self.strategy_config.safety_factor
         mp = self.strategy_config.min_prob
+        me = self.strategy_config.min_edge
         print("=" * 55)
-        print(f"  PolyBot v13 — Recalibrated + Margin of Safety")
+        print(f"  PolyBot v13 — Recalibrated (vol=0.12)")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
-        print(f"  Min prob: {mp:.0%} | Safety: buy ≤ prob × {sf:.0%}")
+        print(f"  Min prob: {mp:.0%} | Min edge: {me:.0%}")
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
-        print(f"  Vol: 0.15 (recalibrated) | Exits: hold to resolution")
+        print(f"  Vol: 0.12 | Exits: hold to resolution")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
 
