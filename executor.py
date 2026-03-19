@@ -170,6 +170,10 @@ class Executor:
                 token_id=token_id[:16] + "...",
             )
 
+        # Kill float artifacts: 0.7200000001 → 0.72
+        # CLOB requires price ≤ 2 decimals, size ≤ 4 decimals
+        market_price = round(market_price, 2)
+
         # Price cap: don't buy above MAX_BUY_PRICE
         if market_price > MAX_BUY_PRICE:
             return OrderResult(
