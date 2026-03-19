@@ -133,18 +133,15 @@ class Executor:
                 print(f"[executor] Price check failed: {e}")
             return 0.0
 
-    # ── Buy (limit order with integer shares — decimal-safe) ──────────
+    # ── Buy (market order via complement engine) ─────────────────────
 
     def buy(self, token_id: str, amount_usd: float) -> OrderResult:
-        """Buy via create_order with integer shares at market price.
+        """Buy via create_market_order (complement engine).
 
-        We use create_order (not create_market_order) because the market
-        order path internally recomputes shares = amount / price, producing
-        fractional shares that violate Polymarket's 4-decimal limit.
-
-        With create_order + OrderArgs, WE specify the exact integer shares
-        and exact price — zero decimal surprises. Posted as GTC, the
-        complement engine fills it just as fast when priced at market.
+        Same mechanism as sell() — routes through the merged book where
+        all the volume actually flows. Limit orders via create_order()
+        sit on the raw token book and take 5-15s to match via Polygon.
+        Market orders fill instantly.
         """
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
@@ -173,48 +170,52 @@ class Executor:
                 token_id=token_id[:16] + "...",
             )
 
-        # Price cap
+        # Price cap: don't buy above MAX_BUY_PRICE
         if market_price > MAX_BUY_PRICE:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Price ${market_price:.3f} > cap ${MAX_BUY_PRICE:.2f}",
+                error=f"Price ${market_price:.3f} > cap ${MAX_BUY_PRICE:.2f} "
+                      f"(TP impossible above this)",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        # Integer shares × clean price = guaranteed clean decimals.
-        # calculate_order_size uses integer-cent math internally.
-        shares, clean_spend = calculate_order_size(market_price, amount_usd)
-        if shares < 1 or clean_spend <= 0:
+        # Compute clean amounts with integer-cents math to avoid any
+        # floating-point precision that can trip Polymarket's
+        # "maker/taker accuracy" validation.
+        # - maker (shares): ≤ 4 decimals (we use integers)
+        # - taker (USDC):  ≤ 2 decimals (we use integer cents)
+        shares, clean_amount = calculate_order_size(market_price, amount_usd)
+        if shares < 1 or clean_amount <= 0:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Can't afford shares at ${market_price:.3f} "
+                error=f"Can't afford 1 share at ${market_price:.3f} "
                       f"within ${amount_usd:.2f}",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        if clean_spend < POLY_MIN_NOTIONAL:
+        # Re-check minimum notional with clean amount
+        if clean_amount < POLY_MIN_NOTIONAL:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Amount ${clean_spend:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
+                error=f"Amount ${clean_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
         print(f"  📊 Market price: ${market_price:.3f}/share "
-              f"→ {int(shares)} shares for ${clean_spend:.2f}")
+              f"→ {int(shares)} shares for ${clean_amount:.2f}")
 
         # Snapshot balance BEFORE buy
         balance_before = self.get_balance()
 
         try:
-            # OrderArgs: WE control price (2 decimal) and size (integer).
-            # No internal recomputation, no decimal surprises.
-            order_args = OrderArgs(
-                price=market_price,
-                size=shares,
-                side="BUY",
+            order_args = MarketOrderArgs(
                 token_id=token_id,
+                # clean_amount is guaranteed to be a 2-decimal value
+                # derived from integer cents, satisfying taker accuracy.
+                amount=clean_amount,
+                side="BUY",
             )
-            signed_order = self.client.create_order(order_args)
+            signed_order = self.client.create_market_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
 
             order_id = result.get("orderID", "")
@@ -225,15 +226,15 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
-            # GTC at market price fills via complement engine.
-            # Wait for settlement, then verify.
+            # Market orders fill instantly via complement engine.
+            # Wait for balance to settle, then verify.
             time.sleep(3)
             return self._verify_buy_via_balance(
-                order_id, market_price, shares, token_id, balance_before,
+                order_id, market_price, float(shares), token_id, balance_before,
             )
 
         except Exception as e:
-            # Ghost fill defense
+            # Ghost fill defense: order may have gone through despite exception
             time.sleep(3)
             balance_after = self.get_balance()
             spent = balance_before - balance_after if balance_before > 0 else 0

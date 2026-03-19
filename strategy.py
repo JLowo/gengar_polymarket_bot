@@ -26,14 +26,16 @@ class TradeSignal:
 
 @dataclass
 class StrategyConfig:
-    min_edge: float = 0.03
+    min_edge: float = 0.03          # Minimum edge (prob - price) — secondary filter
+    min_prob: float = 0.80          # Minimum model probability to consider entry
+    safety_factor: float = 0.70     # Noisy-inspired: only buy at prob × 0.70
     entry_window_start: int = 60
     entry_window_end: int = 10
     max_price: float = 0.95
-    min_price: float = 0.50
+    min_price: float = 0.30         # Lowered — safety factor already caps us
     min_btc_delta_pct: float = 0.01
     kelly_fraction: float = 0.25    # Quarter-Kelly (conservative)
-    min_bet: float = 1.0            # Polymarket minimum
+    min_bet: float = 5.0            # Polymarket minimum notional
     max_bet: float = 25.0           # Hard cap per trade
 
 
@@ -187,8 +189,14 @@ def kelly_bet_size(
 
 
 def estimate_true_probability(btc_delta_pct: float, seconds_remaining: float) -> float:
-    """Estimate true probability using Brownian motion model."""
-    btc_5min_vol = 0.08
+    """Estimate true probability using Brownian motion model.
+
+    Calibrated vol = 0.15 (was 0.08).
+    15-trade data showed the old model was ~2x overconfident in the
+    60-85% range. At 0.15, a 0.05% move at T-240s gives ~65% instead
+    of ~91%, matching observed win rates.
+    """
+    btc_5min_vol = 0.15
 
     time_factor = max(seconds_remaining, 1) / 300
     effective_vol = btc_5min_vol * math.sqrt(time_factor)
@@ -211,7 +219,15 @@ def evaluate(
     bankroll: float = 100.0,
     config: StrategyConfig = None,
 ) -> Optional[TradeSignal]:
-    """Evaluate whether to enter a trade. Returns signal with Kelly size or None."""
+    """Evaluate whether to enter a trade.
+
+    Three-layer filter:
+      1. Model probability must exceed min_prob (default 80%)
+      2. Market price must be ≤ prob × safety_factor (default 70%)
+         — the Noisy margin of safety. Even if model is 15% wrong,
+         we still break even.
+      3. Raw edge (prob - price) must exceed min_edge (default 3%)
+    """
     if config is None:
         config = StrategyConfig()
 
@@ -234,8 +250,20 @@ def evaluate(
         return None
 
     true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
-    edge = true_prob - market_price
 
+    # Filter 1: Model must be confident enough
+    if true_prob < config.min_prob:
+        return None
+
+    # Filter 2: Margin of safety — only buy when market is cheap
+    # relative to our model. Even if model is wrong by (1 - safety_factor),
+    # we still break even.
+    max_buy_price = true_prob * config.safety_factor
+    if market_price > max_buy_price:
+        return None
+
+    # Filter 3: Raw edge check (redundant with above, but belt + suspenders)
+    edge = true_prob - market_price
     if edge < config.min_edge:
         return None
 
