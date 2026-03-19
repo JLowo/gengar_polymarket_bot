@@ -136,12 +136,11 @@ class Executor:
     # ── Buy (market order via complement engine) ─────────────────────
 
     def buy(self, token_id: str, amount_usd: float) -> OrderResult:
-        """Buy via create_market_order (complement engine).
+        """Buy via create_order + OrderArgs (limit order, complement engine).
 
-        Same mechanism as sell() — routes through the merged book where
-        all the volume actually flows. Limit orders via create_order()
-        sit on the raw token book and take 5-15s to match via Polygon.
-        Market orders fill instantly.
+        Uses explicit integer shares and 2-decimal price to avoid
+        float precision errors that create_market_order produces
+        internally (amount/price division → 21.000000000004 shares).
         """
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
@@ -212,14 +211,17 @@ class Executor:
         balance_before = self.get_balance()
 
         try:
-            order_args = MarketOrderArgs(
+            # Use create_order + OrderArgs with explicit price/size.
+            # NOT create_market_order — that internally divides
+            # amount/price producing 21.000000000004 shares, which
+            # the CLOB rejects as "invalid amounts, max accuracy 4 decimals".
+            order_args = OrderArgs(
                 token_id=token_id,
-                # clean_amount is guaranteed to be a 2-decimal value
-                # derived from integer cents, satisfying taker accuracy.
-                amount=clean_amount,
+                price=market_price,       # Already rounded to 2 decimals
+                size=float(int(shares)),  # Integer shares as float
                 side="BUY",
             )
-            signed_order = self.client.create_market_order(order_args)
+            signed_order = self.client.create_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
 
             order_id = result.get("orderID", "")
@@ -230,9 +232,9 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
-            # Market orders fill instantly via complement engine.
+            # Limit orders route through complement engine in 5-15s.
             # Wait for balance to settle, then verify.
-            time.sleep(3)
+            time.sleep(5)
             return self._verify_buy_via_balance(
                 order_id, market_price, float(shares), token_id, balance_before,
             )
