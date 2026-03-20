@@ -123,6 +123,12 @@ class PolyBot:
         self._price_last_fetched: float = 0.0
         self._PRICE_REFRESH: float = 5.0
 
+        # Circuit breaker — detects CLOB API degradation
+        self._consecutive_buy_failures: int = 0
+        self._clob_halted: bool = False
+        self._HALT_AFTER_FAILURES: int = 3    # Halt after 3 consecutive failures
+        self._MAX_SANE_EDGE: float = 0.25     # Edge > 25% = stale prices
+
     def start(self):
         if not self.dry_run:
             from proxy import ensure_tor, apply_proxy
@@ -447,6 +453,21 @@ class PolyBot:
               f"P&L: ${self.stats.total_pnl:+.2f}")
         print(f"{'─' * 55}")
 
+        # Circuit breaker auto-recovery: probe CLOB each new window
+        if self._clob_halted and not self.dry_run and self.executor._initialized:
+            try:
+                market = get_current_market(self.period)
+                if market:
+                    probe = self.executor.get_market_price(market.token_id_up, "BUY", 5.0)
+                    if probe > 0 and abs(probe - 0.50) > 0.03:
+                        self._clob_halted = False
+                        self._consecutive_buy_failures = 0
+                        print(f"  ✅ CLOB recovered (probe: ${probe:.3f}) — resuming trades")
+                    else:
+                        print(f"  🔌 CLOB still degraded (probe: ${probe:.3f}) — staying halted")
+            except Exception:
+                print(f"  🔌 CLOB probe failed — staying halted")
+
     # ── Market prices (cached, complement engine) ───────────────────
 
     def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
@@ -495,6 +516,16 @@ class PolyBot:
     def _execute_trade(self, sig, seconds_remaining: float):
         self._trade_attempted = True
 
+        # ── Circuit breaker: CLOB API degradation ────────────────
+        if self._clob_halted:
+            print(f"  🔌 CLOB HALTED — skipping trade ({self._consecutive_buy_failures} consecutive failures)")
+            return
+
+        # Frozen price detection: both sides near $0.50 = API default/stale
+        if abs(sig.market_price - 0.50) < 0.03 or abs(sig.market_price - 0.51) < 0.02:
+            print(f"  🔌 Market price ${sig.market_price:.3f} looks frozen — skipping")
+            return
+
         market = get_current_market(self.period) if not self.dry_run else None
         token_id = ""
         if market:
@@ -523,6 +554,7 @@ class PolyBot:
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount)
 
         if result.success:
+            self._consecutive_buy_failures = 0  # Reset circuit breaker
             self._traded = True
             self._trade_side = sig.side
             self._trade_price = result.price
@@ -533,13 +565,10 @@ class PolyBot:
             self.stats.bankroll -= result.amount_usd
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
 
-            tp_price = result.price * (1 + self.take_profit_pct)
-            sl_price = result.price * (1 - self.stop_loss_pct)
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
-            print(f"     TP @ ${tp_price:.3f} ({self.take_profit_pct:.0%}) | "
-                  f"SL @ ${sl_price:.3f} (-{self.stop_loss_pct:.0%}) or prob < {self.stop_loss_prob:.0%}")
+            print(f"     Holding to resolution (no stops)")
 
             self.telegram.trade_alert(
                 side=sig.side, price=result.price, amount=result.amount_usd,
@@ -561,6 +590,16 @@ class PolyBot:
                 print(f"  ⏳ Buy sent but unverified — will detect via balance sync")
             else:
                 print(f"  ❌ Buy failed: {result.error}")
+                # Circuit breaker: track consecutive API failures
+                err = str(result.error).lower()
+                if "request exception" in err or "service not ready" in err or "status_code=none" in err:
+                    self._consecutive_buy_failures += 1
+                    if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
+                        self._clob_halted = True
+                        msg = (f"🔌 CLOB HALTED after {self._consecutive_buy_failures} "
+                               f"consecutive API failures — stopping trades until restart")
+                        print(f"\n  {msg}")
+                        self.telegram.status_update({"alert": msg})
 
     # ── Resolve (partial fill aware) ────────────────────────────────
 
