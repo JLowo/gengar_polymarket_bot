@@ -453,20 +453,15 @@ class PolyBot:
               f"P&L: ${self.stats.total_pnl:+.2f}")
         print(f"{'─' * 55}")
 
-        # Circuit breaker auto-recovery: probe CLOB each new window
+        # Circuit breaker auto-recovery: ping CLOB each new window
         if self._clob_halted and not self.dry_run and self.executor._initialized:
             try:
-                market = get_current_market(self.period)
-                if market:
-                    probe = self.executor.get_market_price(market.token_id_up, "BUY", 5.0)
-                    if probe > 0 and abs(probe - 0.50) > 0.03:
-                        self._clob_halted = False
-                        self._consecutive_buy_failures = 0
-                        print(f"  ✅ CLOB recovered (probe: ${probe:.3f}) — resuming trades")
-                    else:
-                        print(f"  🔌 CLOB still degraded (probe: ${probe:.3f}) — staying halted")
+                self.executor.client.get_ok()
+                self._clob_halted = False
+                self._consecutive_buy_failures = 0
+                print(f"  ✅ CLOB recovered (health check OK) — resuming trades")
             except Exception:
-                print(f"  🔌 CLOB probe failed — staying halted")
+                print(f"  🔌 CLOB health check still failing — staying halted")
 
     # ── Market prices (cached, complement engine) ───────────────────
 
@@ -516,15 +511,24 @@ class PolyBot:
     def _execute_trade(self, sig, seconds_remaining: float):
         self._trade_attempted = True
 
-        # ── Circuit breaker: CLOB API degradation ────────────────
+        # ── Circuit breaker: CLOB health check ───────────────────
         if self._clob_halted:
             print(f"  🔌 CLOB HALTED — skipping trade ({self._consecutive_buy_failures} consecutive failures)")
             return
 
-        # Frozen price detection: both sides near $0.50 = API default/stale
-        if abs(sig.market_price - 0.50) < 0.03 or abs(sig.market_price - 0.51) < 0.02:
-            print(f"  🔌 Market price ${sig.market_price:.3f} looks frozen — skipping")
-            return
+        if not self.dry_run and self.executor._initialized:
+            try:
+                self.executor.client.get_ok()
+            except Exception as e:
+                self._consecutive_buy_failures += 1
+                print(f"  🔌 CLOB health check failed: {e}")
+                if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
+                    self._clob_halted = True
+                    msg = (f"🔌 CLOB HALTED after {self._consecutive_buy_failures} "
+                           f"consecutive health check failures — stopping trades until recovery")
+                    print(f"\n  {msg}")
+                    self.telegram.status_update({"alert": msg})
+                return
 
         market = get_current_market(self.period) if not self.dry_run else None
         token_id = ""
