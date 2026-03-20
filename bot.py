@@ -65,6 +65,7 @@ class PolyBot:
         )
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
+        self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
 
         self.price_feed = BinancePriceFeed()
         self.executor = Executor(
@@ -126,8 +127,8 @@ class PolyBot:
         # Circuit breaker — detects CLOB API degradation
         self._consecutive_buy_failures: int = 0
         self._clob_halted: bool = False
-        self._HALT_AFTER_FAILURES: int = 3    # Halt after 3 consecutive failures
-        self._MAX_SANE_EDGE: float = 0.25     # Edge > 25% = stale prices
+        self._HALT_AFTER_FAILURES: int = 3
+        self._daily_loss_halted: bool = False
 
     def start(self):
         if not self.dry_run:
@@ -151,6 +152,7 @@ class PolyBot:
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
         print(f"  Vol: 0.12 | Exits: hold to resolution")
+        print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
 
@@ -529,6 +531,21 @@ class PolyBot:
                     print(f"\n  {msg}")
                     self.telegram.status_update({"alert": msg})
                 return
+
+        # ── Daily loss limit ─────────────────────────────────────
+        if self._daily_loss_halted:
+            print(f"  🛑 DAILY LOSS LIMIT — session P&L ${self.stats.total_pnl:+.2f} "
+                  f"exceeds -${self._daily_loss_limit:.0f}")
+            return
+
+        session_pnl = self.stats.bankroll - self._session_start_balance
+        if session_pnl <= -self._daily_loss_limit:
+            self._daily_loss_halted = True
+            msg = (f"🛑 DAILY LOSS LIMIT HIT: ${session_pnl:+.2f} "
+                   f"(limit -${self._daily_loss_limit:.0f}) — stopping trades")
+            print(f"\n  {msg}")
+            self.telegram.status_update({"alert": msg})
+            return
 
         market = get_current_market(self.period) if not self.dry_run else None
         token_id = ""
