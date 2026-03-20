@@ -1,15 +1,15 @@
 """Order executor for Polymarket CLOB.
 
-v11 — Balance-verified everything:
+All orders route through the complement engine (tight spreads, real volume).
+Buys use create_order(OrderArgs) with integer shares and 2-decimal prices to
+avoid the float precision bug that create_market_order triggers internally
+(amount/price division produces 21.000000000004 shares, rejected by CLOB).
+Sells use create_market_order — the sell path doesn't have the same issue.
 
-1. Balance-verified buys: snapshot USDC before order, check after.
-   Ghost fills caught even when API throws exceptions.
-2. Balance-verified sells: unchanged from v10, still the source of truth.
-3. Minimum notional guard: rejects sells below $5 with explicit
-   "hold to resolution" message instead of hitting Polymarket's error.
-4. Silenced 'price check failed: no match' spam — only logs real errors.
-
-Still uses create_market_order for sells (complement engine routing).
+Fill verification uses USDC balance change as the source of truth.
+Ghost fills (order went through despite API exception) are caught via
+balance snapshot before/after. Unverified buys are never cancelled —
+the bot detects them via balance sync at the next window boundary.
 """
 
 import time

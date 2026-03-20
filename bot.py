@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-PolyBot v11 — Balance-Verified Everything
+PolyBot v13 — Recalibrated + Safety Systems
 
-Fixes from live run analysis ($79 → $63):
-  1. Balance-verified buys AND sells: snapshots USDC before/after every
-     order. Ghost fills caught automatically. Real cost/revenue used.
-  2. Minimum notional guard: if sell notional < $5, don't attempt —
-     hold to resolution instead of getting "Size lower than minimum" trap.
-  3. Claim guard: if remaining shares × $0.99 < $5, skip sell claim.
-     Shares auto-resolve at $1.00 on Polymarket.
-  4. Window-boundary balance sync: real USDC balance replaces internal
-     tracking at every window transition. Drift detected and logged.
-  5. Real P&L line: session_start_balance → current_balance shown
-     alongside tracked P&L in hourly/shutdown summaries.
-  6. Silenced 'price check failed: no match' spam.
+Strategy:
+  - Brownian motion model with vol=0.12 (recalibrated from 0.08)
+  - Entry gate: model confidence >= 80%, market price <= true_prob * 0.85
+  - Position sizing: quarter-Kelly, $5–$25 per trade
+  - Exit: hold all positions to resolution — no stops, no take-profit
 
-Position management (from v9.2):
-  1. Price stop-loss: sell price < buy × (1 - 40%)
-  2. Prob stop-loss: probability < 35%
-  3. Take-profit: return ≥ 30%
-  4. Forced exit: T-5s, sell if profitable
+Safety systems:
+  1. CLOB health check: get_ok() before every trade; 3 consecutive
+     failures halt trading and send Telegram alert. Auto-recovers
+     when API comes back at next window boundary.
+  2. Daily loss limit: if session P&L <= -DAILY_LOSS_LIMIT, halt trading.
+  3. Balance-verified buys: snapshot USDC before/after; ghost fills
+     caught even when API throws. Never cancels on timeout — returns
+     UNVERIFIED_BUY for pending detection at next window boundary.
+  4. Pending buy safety net: if buy unverified, check balance at next
+     window boundary; retroactively track as filled if balance dropped.
+  5. Window-boundary balance sync: real USDC balance overwrites internal
+     tracking every 5 minutes. Corrects any accumulated drift.
+  6. Minimum notional guard: skip sells below $5 notional; hold to
+     resolution instead of hitting Polymarket's minimum-size rejection.
 """
 
 import os
