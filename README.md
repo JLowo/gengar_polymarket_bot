@@ -1,154 +1,169 @@
-# PolyBot v4 — Oracle Lag Scalper
+# PolyBot — Oracle Lag Scalper for Polymarket BTC 5-min Markets
 
-A Python trading bot for Polymarket's 5-minute BTC Up/Down markets.
+An algorithmic trading bot that exploits the oracle lag between Binance real-time BTC prices and Polymarket's 5-minute BTC Up/Down binary markets.
 
 ## How it works
 
-Every 5 minutes, Polymarket opens a market asking: "Will BTC be higher or lower at the end of this window?"
+Every 5 minutes, Polymarket opens a binary market: "Will BTC be higher or lower at the end of this window?" The market resolves automatically — winning shares pay $1.00, losing shares pay $0.00.
 
-This bot exploits the **oracle lag** — the delay between when BTC moves on Binance (real-time) and when Polymarket's prices catch up. It watches BTC via Binance WebSocket, compares to the window's opening price, and places Fill-or-Kill orders when the market hasn't priced in a significant move.
+This bot watches BTC in real-time via Binance WebSocket while Polymarket's prices lag behind. When BTC has moved significantly but the market hasn't fully priced it in, the bot buys the correct side at a discount and holds to resolution.
+
+### The edge
+
+BTC moves on Binance. Polymarket's order book takes seconds to reprice. In that window, you can buy "BTC Up" shares at $0.60 when the true probability is 85%. If BTC stays up, those shares pay $1.00 — a 67% return in under 5 minutes.
 
 ## Architecture
 
 ```
-bot.py                → Main loop (1 tick/second)
-├── price_feed.py     → Binance WebSocket for real-time BTC price
-├── market.py         → Discovers active 5-min market + token IDs
-├── strategy.py       → Decision engine (Brownian model + Kelly criterion)
-├── executor.py       → FOK orders via py-clob-client + auto-claim
-├── telegram_notifier.py → Mobile alerts
-└── proxy.py          → Tor proxy for CLOB API (live mode)
+bot.py                → Main loop, position lifecycle, circuit breakers
+├── strategy.py       → Brownian motion probability model + Kelly criterion sizing
+├── executor.py       → Polymarket CLOB order execution (balance-verified)
+├── market.py         → Active market discovery via Gamma API
+├── price_feed.py     → Binance WebSocket for real-time BTC
+├── tracker.py        → Quantitative analytics logger (signals, trades, executions)
+├── telegram_notifier.py → Mobile alerts + hourly summaries
+└── proxy.py          → Tor proxy for CLOB API geo-restrictions
 ```
 
-### Module map
+## Strategy (v13 — Recalibrated)
 
-```mermaid
-graph TD
-    BOT[🤖 bot.py<br/>Main loop · 1 tick/sec] --> PF[📡 price_feed.py<br/>Binance WebSocket]
-    BOT --> MK[🔍 market.py<br/>Market discovery]
-    BOT --> ST[🧠 strategy.py<br/>Kelly + Brownian model]
-    BOT --> EX[⚡ executor.py<br/>FOK orders + auto-claim]
-    BOT --> TG[📱 telegram_notifier.py<br/>Mobile alerts]
-    EX --> PX[🧅 proxy.py<br/>Tor proxy]
+### Entry filters (three layers)
 
-    PF -.->|real-time price| BN[(Binance)]
-    MK -.->|token IDs & prices| PM[(Polymarket API)]
-    EX -.->|orders & claims| CLOB[(Polymarket CLOB)]
-    TG -.->|alerts| TGA[(Telegram API)]
-    PX -.->|routes traffic| CLOB
+1. **Brownian motion model** — estimates true probability that BTC will be higher/lower at window close, based on current delta from opening price and time remaining. Volatility parameter calibrated to `0.12` from 15-trade backtest showing the original `0.08` was ~2x overconfident in the 60-85% probability range.
 
-    style BOT fill:#7F77DD,color:#fff
-    style PF fill:#1D9E75,color:#fff
-    style MK fill:#1D9E75,color:#fff
-    style ST fill:#D85A30,color:#fff
-    style EX fill:#D85A30,color:#fff
-    style TG fill:#888780,color:#fff
-    style PX fill:#888780,color:#fff
-```
+2. **Minimum probability** — model must output ≥80% confidence before considering entry. Below this, the signal is noise.
 
-### Main loop
+3. **Margin of safety** — inspired by value investing: only buy when `market_price ≤ model_probability × 0.85`. Even if the model is 15% wrong, we break even. This filters out situations where the market has already priced in the move.
 
-Every second, `bot.py` runs a tick:
+### Position sizing
 
-```mermaid
-flowchart TD
-    A[⏱ Tick] --> B{New 5-min window?}
-    B -->|Yes| C[Resolve last trade<br/>Win/loss + auto-claim]
-    C --> D[Get BTC price<br/>from Binance WebSocket]
-    B -->|No| D
-    D --> E[Record opening price<br/>if first tick of window]
-    E --> F{Already traded<br/>this window?}
-    F -->|Yes| G[Skip — wait for<br/>next window]
-    F -->|No| H[strategy.evaluate<br/>Brownian prob + Kelly sizing]
-    H --> I{Edge > minimum?}
-    I -->|No| J[No trade — wait]
-    I -->|Yes| K[Place FOK order<br/>Fill instantly or cancel]
-    K --> L{Filled?}
-    L -->|Yes| M[✅ Record trade<br/>Deduct cost from bankroll]
-    L -->|No| N[⚠️ No liquidity<br/>No cost, try next window]
-```
+Quarter-Kelly criterion. At 80%+ win rate with avg entry $0.68, Kelly sizes $8-20 per trade depending on edge and bankroll. Hard floor at $5 (Polymarket minimum notional), hard cap at $25.
 
-### Trade lifecycle
+### Exit strategy
 
-```mermaid
-flowchart TD
-    S[📊 Signal detected<br/>BTC moved, edge > 3%] --> SIZE[Calculate order size<br/>Kelly criterion, min 5 shares]
-    SIZE --> LIQ[Check book liquidity<br/>Cap to available asks]
-    LIQ --> FOK[⚡ Send FOK order<br/>Fill instantly or cancel]
-    FOK -->|Matched| FILL[✅ Filled<br/>Shares are ours]
-    FOK -->|No match| NOFILL[⏭ Not filled<br/>No cost, no harm]
-    FILL --> WAIT[⏳ Wait for window close<br/>5 minutes total]
-    WAIT --> RESOLVE{BTC up or down?}
-    RESOLVE -->|Correct side| WIN[🎉 Win<br/>Shares worth $1 each]
-    RESOLVE -->|Wrong side| LOSS[❌ Loss<br/>Shares worth $0]
-    WIN --> CLAIM[💰 Auto-claim<br/>Sell @ $0.99 via FOK]
-    CLAIM --> USDC[💵 USDC back in wallet<br/>Profit = payout − cost − 1¢/share]
-    LOSS --> GONE[Cost is lost]
+No stops. All trades hold to resolution. Data from 15 trades showed that probability-based and price-based stops cost $35+ by panic-selling during normal BTC micro-bounces. The 5-minute window is too short for mean-reversion stops — the edge comes from being right at resolution, not from timing exits.
 
-    style WIN fill:#1D9E75,color:#fff
-    style LOSS fill:#D85A30,color:#fff
-    style CLAIM fill:#7F77DD,color:#fff
-```
+## Safety systems
 
-### Strategy logic
+### Circuit breaker — CLOB health check
 
-The strategy uses a **Brownian motion model** to estimate the true probability that BTC will close above/below its opening price:
+Before every trade, the bot pings `client.get_ok()` — Polymarket's unauthenticated health endpoint. If the CLOB operator isn't responding:
+- Skip the trade immediately
+- Increment failure counter
+- After 3 consecutive failures, halt all trading and send a Telegram alert
+- Every new 5-minute window, probe `get_ok()` again — auto-resume when healthy
 
-1. **Calculate BTC delta** from the window's opening price
-2. **Estimate true probability** using cumulative normal distribution (accounts for time remaining and historical 5-min BTC volatility)
-3. **Compare to Polymarket's price** — the gap is our edge
-4. **Size the bet with Kelly criterion** (quarter-Kelly for safety) — balances edge size against bankroll risk
-5. **Entry window**: only trade between T-60s and T-10s — enough data to see a move, enough time for the order to fill
+This prevents trading on stale/frozen market prices during API outages.
 
-### Order execution (v4)
+### Daily loss limit
 
-The executor enforces several Polymarket constraints:
+Configurable via `DAILY_LOSS_LIMIT` in `.env` (default: $30). Compares session P&L (current balance vs session start) before every trade. If breached, all trading stops for the session with a Telegram alert. Protects against correlated loss streaks.
 
-- **FOK (Fill or Kill)**: orders fill instantly or cancel — no sitting on the book, no polling
-- **Minimum 5 shares**: Polymarket CLOB requirement, auto-bumped if Kelly size is smaller
-- **Clean decimals**: maker amount (USD) rounded to 2 decimals, shares to whole numbers
-- **Liquidity cap**: checks the order book before sending — caps order to available asks
-- **Auto-claim**: after a win, sells shares at $0.99 to convert back to USDC (~1¢/share fee)
+### Balance-verified everything
 
-## Quick Start
+- **Buys**: Snapshot USDC before order, verify balance drop after. Ghost fills (order succeeds on-chain despite API exception) are caught via balance change.
+- **Sells**: Balance-verified with partial fill tracking.
+- **Window sync**: Real USDC balance queried at every window boundary, overwrites internal tracking. Drift > $0.50 is logged.
+- **Pending buy safety net**: If a buy can't be verified within 14s, details are saved. Next window boundary detects the fill via balance drop and retroactively tracks the position.
+
+### Minimum notional guard
+
+Polymarket rejects sells below $5 notional. The bot checks before attempting — if remaining shares × price < $5, it holds to resolution instead of hitting the error. Winning shares auto-resolve at $1.00.
+
+## Quick start
 
 ```bash
-# 1. Clone
+# Clone
 git clone https://github.com/JLowo/gengar_polymarket_bot.git
 cd gengar_polymarket_bot
 
-# 2. Install dependencies
+# Install dependencies
 pip install -r requirements.txt
 
-# 3. Configure
+# Configure
 cp .env.example .env
-# Edit .env with your credentials (see below)
+# Edit .env with your credentials
 
-# 4. Run in dry-run mode (paper trading)
+# Paper trading (safe)
 python bot.py
 
-# 5. When ready for real trades, set DRY_RUN=false in .env
+# Live trading (set DRY_RUN=false in .env)
 ```
 
 ## Configuration (.env)
 
+### Required
+
 | Variable | Description |
-| --- | --- |
-| `PRIVATE_KEY` | Your wallet private key (0x prefixed) |
-| `SAFE_ADDRESS` | Your Polymarket Safe address (from polymarket.com/settings) |
-| `TELEGRAM_BOT_TOKEN` | From @BotFather on Telegram |
+|----------|-------------|
+| `PRIVATE_KEY` | Wallet private key (0x prefixed) |
+| `SAFE_ADDRESS` | Polymarket Safe/proxy address |
+| `DRY_RUN` | `true` = paper trade, `false` = real money |
+
+### Strategy
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MIN_EDGE` | `0.05` | Minimum edge (prob - price) to enter |
+| `MIN_PROB` | `0.80` | Minimum model probability |
+| `SAFETY_FACTOR` | `0.85` | Only buy at price ≤ prob × this |
+| `ENTRY_WINDOW_START` | `240` | Start evaluating at T-240s |
+| `ENTRY_WINDOW_END` | `10` | Stop evaluating at T-10s |
+| `KELLY_FRACTION` | `0.25` | Quarter-Kelly (conservative) |
+| `MIN_BET` | `5.0` | Polymarket minimum notional |
+| `MAX_BET` | `25.0` | Hard cap per trade |
+| `BANKROLL` | `100.0` | Starting bankroll for Kelly sizing |
+
+### Safety
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DAILY_LOSS_LIMIT` | `30.0` | Stop trading if session P&L drops below -$30 |
+
+### Notifications
+
+| Variable | Description |
+|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | From @BotFather |
 | `TELEGRAM_CHAT_ID` | Your numeric Telegram user ID |
-| `TRADE_AMOUNT` | USD per trade (default: 5.0) |
-| `MIN_EDGE` | Minimum edge to enter (default: 0.03 = 3%) |
-| `DRY_RUN` | true = paper trade, false = real money |
-| `KELLY_FRACTION` | Kelly fraction (default: 0.25 = quarter-Kelly) |
-| `MIN_BET` | Minimum bet in USD (default: 1.0) |
-| `MAX_BET` | Maximum bet in USD (default: 25.0) |
-| `ENTRY_WINDOW_START` | Seconds before close to start looking (default: 60) |
-| `ENTRY_WINDOW_END` | Seconds before close to stop looking (default: 10) |
 
-## Risk Warning
+### Other
 
-This bot trades real money on volatile markets. Start with `DRY_RUN=true`.
-When going live, use small amounts you can afford to lose entirely.
-Past performance of any strategy does not guarantee future results.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MARKET_PERIOD` | `5` | Market window in minutes |
+| `LOG_DIR` | `logs` | Directory for tracker CSVs |
+
+## Tracker output
+
+The bot logs three CSV files in `LOG_DIR/` for post-session analysis:
+
+- **signals.csv** — every signal evaluated (traded or skipped), with model probability, market price, edge, Kelly size, and reason for action
+- **trades.csv** — full trade lifecycle: entry, hold-period extremes (min/max prob and sell price), exit, resolution outcome, and `profit_if_held` counterfactual
+- **executions.csv** — every CLOB API call with latency
+
+## Lessons learned
+
+These are architectural decisions made from live trading data, not theory:
+
+- **Two-book architecture**: Polymarket has a raw token book (illiquid, wide spreads) and a complement engine book (tight spreads, real volume). All orders must route through the complement engine — the raw book is effectively unusable.
+- **Ghost orders are real fills**: Network exceptions on buys don't mean the order failed. On-chain fills can occur silently. Always verify via balance change, never trust the API response alone.
+- **Float precision kills orders**: `py-clob-client` internally computes `shares × (1 - price)` using float math. `1.0 - 0.71 = 0.29000000000000004` in IEEE 754. The bot uses `create_order` with explicit integer shares to avoid this.
+- **Stops destroy value on 5-min windows**: Prob-stop fired 5 times in testing. 4 of 5 stopped trades won at resolution. Cost: $35.45. BTC micro-bounces trigger panic sells that the 5-minute trend ultimately reverses.
+- **Model calibration matters more than strategy complexity**: Doubling the vol parameter from 0.08 to 0.12 (based on 15 trades of calibration data) turned a -35% ROC strategy into a +55% ROC strategy. Same code, different constant.
+
+## Known limitations
+
+- **Ghost fills during outages**: When the CLOB confirmation pipeline is down, orders can still execute on-chain. The `get_ok()` circuit breaker prevents *new* orders, but can't recall orders already submitted.
+- **Tor latency**: Routing through Tor adds 200-500ms per API call. The total buy flow is 8-15 seconds. This is acceptable for 5-minute windows but would be a problem for faster markets.
+- **Stranded shares**: Winning positions below $5 notional can't be sold via the API. They auto-resolve on Polymarket but the USDC may take time to appear.
+
+## Risk warning
+
+This bot trades real money on volatile 5-minute binary markets. Each trade is an all-or-nothing bet — shares pay $1 or $0. Even with an 80% win rate, a run of losses is inevitable over hundreds of trades.
+
+Start with `DRY_RUN=true`. When going live, use money you can afford to lose entirely.
+
+## Status monitoring
+
+Polymarket publishes API status at [status.polymarket.com](https://status.polymarket.com). Subscribe to webhook notifications for outage alerts.
