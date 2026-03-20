@@ -56,6 +56,7 @@ TRADE_FIELDS = [
     "edge_at_entry", "prob_at_entry", "btc_delta_at_entry",
     "seconds_remaining_at_entry",
     "entry_latency_ms",         # signal → fill confirmed
+    "planned_price", "slippage",  # strategy cache price vs execution price
     # Hold
     "max_prob_during_hold",     # Peak probability while holding
     "min_prob_during_hold",     # Trough probability
@@ -198,8 +199,10 @@ class Tracker:
         btc_delta: float,
         seconds_remaining: float,
         latency_ms: float = 0.0,
+        planned_price: float = 0.0,
     ):
         self._trade_counter += 1
+        slippage = round(entry_price - planned_price, 4) if planned_price > 0 else 0.0
         self._current_trade = {
             "timestamp": time.time(),
             "window_ts": window_ts,
@@ -207,6 +210,8 @@ class Tracker:
             "trade_id": self._trade_counter,
             "side": side,
             "entry_price": round(entry_price, 4),
+            "planned_price": round(planned_price, 4),
+            "slippage": slippage,
             "entry_shares": round(entry_shares, 1),
             "entry_cost": round(entry_cost, 2),
             "edge_at_entry": round(edge, 4),

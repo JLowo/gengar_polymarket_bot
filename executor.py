@@ -246,12 +246,15 @@ class Executor:
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 1.0:
-                actual_shares = spent / market_price if market_price > 0 else 0
+                # Cap at intended cost — balance delta may include other settlements
+                actual_cost = min(spent, clean_amount)
                 print(f"  👻 GHOST BUY: balance dropped ${spent:.2f} despite error")
+                if spent > clean_amount * 1.02:
+                    print(f"  ⚠️  Capped from ${spent:.2f} to ${actual_cost:.2f}")
                 return OrderResult(
                     success=True, order_id="ghost-buy",
                     status=FILLED, side="BUY", price=market_price,
-                    amount_usd=spent, shares=actual_shares,
+                    amount_usd=actual_cost, shares=shares,
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
 
@@ -276,14 +279,20 @@ class Executor:
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 0.50:
-                actual_shares = spent / price if price > 0 else shares
+                # Cap at intended cost — balance delta can be contaminated
+                # by concurrent settlements (previous sells, token redemptions)
+                intended_cost = round(shares * price, 2)
+                actual_cost = min(spent, intended_cost)
+                if spent > intended_cost * 1.02:
+                    print(f"  ⚠️  Balance delta ${spent:.2f} > intended "
+                          f"${intended_cost:.2f} — capping (concurrent settlement)")
                 suffix = f" (attempt {attempt+1})" if attempt > 0 else ""
-                print(f"  ✓ Balance verified{suffix}: spent ${spent:.2f} "
-                      f"(~{actual_shares:.0f} shares @ ${price:.3f})")
+                print(f"  ✓ Balance verified{suffix}: spent ${actual_cost:.2f} "
+                      f"({shares:.0f} shares @ ${price:.3f})")
                 return OrderResult(
                     success=True, order_id=order_id, status=FILLED,
                     side="BUY", price=price,
-                    amount_usd=spent, shares=actual_shares,
+                    amount_usd=actual_cost, shares=shares,
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
 
@@ -370,19 +379,27 @@ class Executor:
                 token_id=token_id[:16] + "...",
             )
 
+        # Cap sell price at 0.99 — CLOB rejects effective prices > 0.99
+        price = min(price, 0.99)
+        sell_amount = round(sell_shares * price, 2)
+
         print(f"  📊 Sell: {sell_shares} shares @ ${price:.3f} = ${sell_amount:.2f}")
 
         # Snapshot balance BEFORE sell
         balance_before = self.get_balance()
 
         try:
-            order_args = MarketOrderArgs(
+            # Use create_order (limit order) instead of create_market_order
+            # to avoid the CLOB computing an effective price > 0.99 when
+            # the market is near $1.00 (e.g. winning side at resolution).
+            order_args = OrderArgs(
                 token_id=token_id,
-                amount=sell_amount,
+                price=round(price, 2),
+                size=float(sell_shares),
                 side="SELL",
             )
 
-            signed_order = self.client.create_market_order(order_args)
+            signed_order = self.client.create_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
             order_id = result.get("orderID", "")
 

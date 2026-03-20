@@ -113,19 +113,32 @@ def _port_in_use(port: int) -> bool:
 
 
 def _kill_port(port: int) -> None:
-    """Kill whatever process is holding a TCP port (macOS/Linux)."""
+    """Kill whatever process is holding a TCP port (macOS/Linux).
+    Tries SIGTERM first, then SIGKILL after 2s if still alive."""
     try:
         result = subprocess.run(
             ["lsof", "-ti", f"tcp:{port}"],
             capture_output=True, text=True,
         )
-        pids = result.stdout.strip().split()
+        pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
         for pid in pids:
             try:
-                os.kill(int(pid), signal.SIGTERM)
-                logger.info(f"Killed stale process on port {port} (pid {pid})")
-            except (ValueError, ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+                logger.info(f"Sent SIGTERM to pid {pid} on port {port}")
+            except (ProcessLookupError, PermissionError):
                 pass
+
+        # Wait briefly, then SIGKILL any survivors
+        if pids:
+            import time
+            time.sleep(2)
+            for pid in pids:
+                try:
+                    os.kill(pid, 0)  # check if still alive
+                    os.kill(pid, signal.SIGKILL)
+                    logger.info(f"Sent SIGKILL to pid {pid} (SIGTERM wasn't enough)")
+                except (ProcessLookupError, PermissionError):
+                    pass  # already dead
     except FileNotFoundError:
         pass  # lsof not available
 
@@ -188,6 +201,17 @@ def _parse_bootstrap_pct(line: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _test_socks_proxy(proxy_url: str) -> bool:
+    """Quick check if a SOCKS5 proxy is alive and routing traffic."""
+    try:
+        import httpx
+        with httpx.Client(proxy=proxy_url, timeout=10) as client:
+            resp = client.get("https://check.torproject.org/api/ip")
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def ensure_tor(exit_countries: Optional[list[str]] = None) -> str:
     """Ensure Tor is running and fully bootstrapped with exit nodes pinned to friendly countries.
 
@@ -206,15 +230,26 @@ def ensure_tor(exit_countries: Optional[list[str]] = None) -> str:
         pid = int(TOR_PID_FILE.read_text().strip())
         os.kill(pid, signal.SIGHUP)
         logger.info(f"Reloaded Tor config (pid {pid})")
-    else:
-        # Kill anything already holding port 9050 (e.g. a stale brew-managed Tor)
-        if _port_in_use(TOR_SOCKS_PORT):
-            logger.info(f"Port {TOR_SOCKS_PORT} already in use — stopping existing Tor process...")
-            _kill_port(TOR_SOCKS_PORT)
-            # Brief pause for the OS to release the port
-            import time
-            time.sleep(2)
+    elif _port_in_use(TOR_SOCKS_PORT):
+        # Port 9050 is held by a Tor process we didn't start (previous bot run,
+        # brew service, etc.). Try to use it as-is instead of fighting to kill it.
+        logger.info(f"Port {TOR_SOCKS_PORT} already in use — checking if it's a usable Tor proxy...")
+        proxy_url = f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}"
+        if _test_socks_proxy(proxy_url):
+            logger.info("Existing Tor on port 9050 is working — reusing it")
+            return proxy_url
 
+        # Not a working proxy — kill it and start fresh
+        logger.info("Existing process on 9050 is not a working proxy — killing it...")
+        _kill_port(TOR_SOCKS_PORT)
+        import time
+        for _ in range(20):
+            time.sleep(0.5)
+            if not _port_in_use(TOR_SOCKS_PORT):
+                break
+        # If port is STILL held, proceed anyway — Tor will error clearly
+        logger.info("Starting Tor — waiting for full bootstrap (this may take ~60s)...")
+    else:
         logger.info("Starting Tor — waiting for full bootstrap (this may take ~60s)...")
         proc = subprocess.Popen(
             [tor_bin, "-f", str(torrc)],
@@ -275,6 +310,16 @@ def apply_proxy(proxy_url: str) -> None:
             _original_async_client_init(self, *args, **kwargs)
 
         httpx.AsyncClient.__init__ = _patched_async_client_init
+
+        # Also patch the module-level singleton in py_clob_client's http_helpers.
+        # This client is created at import time (before our patch), so it never
+        # gets the proxy. Replace it with a new proxied client.
+        try:
+            from py_clob_client.http_helpers import helpers as _clob_helpers
+            _clob_helpers._http_client = httpx.Client(http2=True, proxy=proxy_url)
+            logger.info("Patched py_clob_client singleton httpx client with proxy")
+        except Exception as e:
+            logger.warning(f"Could not patch py_clob_client singleton: {e}")
 
         logger.info("httpx (CLOB) proxy patch applied — trading calls routed through proxy")
     except ImportError:

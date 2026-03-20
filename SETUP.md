@@ -96,11 +96,20 @@ Use your wallet's private key directly. Leave `SAFE_ADDRESS` blank in `.env`.
 
 ### Option B: Polymarket Safe wallet (used by the original bot)
 
-Polymarket creates a Safe (multi-sig proxy) for each account. If you use the Polymarket UI normally, you likely have one. To find it:
+Polymarket creates a Safe (multi-sig proxy) for each account. If you use the Polymarket UI normally, you likely have one. You must make at least one trade on Polymarket first (even a small one) for the Safe to be created.
 
-1. Go to your Polymarket profile
-2. Open browser dev tools → Network tab
-3. Look for API calls containing your wallet address — the Safe address appears as `proxyWallet`
+**To find your proxy wallet address:**
+
+1. Go to [polymarket.com](https://polymarket.com) and log in
+2. Open browser dev tools (Cmd+Option+I on Mac, F12 on Windows)
+3. Go to **Application** tab → **Local Storage** → click `https://polymarket.com`
+4. Look for a key containing `proxyWallet` — the value will look like:
+   ```
+   "proxyWallet": "0x94a42c9be304a39703ec24fae8bd448f07601301"
+   ```
+5. Copy that address — this is your `SAFE_ADDRESS`
+
+**Alternative method:** In dev tools, go to the **Network** tab, filter requests, and look for API calls containing your wallet address — the Safe address appears as `proxyWallet` in responses.
 
 If using a Safe, set `SAFE_ADDRESS` in `.env` to that address and `signature_type` in the code will automatically be set to `2`.
 

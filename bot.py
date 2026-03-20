@@ -134,13 +134,17 @@ class PolyBot:
 
     def start(self):
         if not self.dry_run:
-            from proxy import ensure_tor, apply_proxy
-            import logging as _log
-            _log.basicConfig(level=_log.INFO, format="[%(name)s] %(message)s")
-            print("\n🧅 Starting Tor proxy for CLOB API...")
-            proxy_url = ensure_tor()
-            apply_proxy(proxy_url)
-            print(f"✅ Tor active: {proxy_url}\n")
+            use_tor = os.getenv("USE_TOR", "true").lower() == "true"
+            if use_tor:
+                from proxy import ensure_tor, apply_proxy
+                import logging as _log
+                _log.basicConfig(level=_log.INFO, format="[%(name)s] %(message)s")
+                print("\n🧅 Starting Tor proxy for CLOB API...")
+                proxy_url = ensure_tor()
+                apply_proxy(proxy_url)
+                print(f"✅ Tor active: {proxy_url}\n")
+            else:
+                print("\n⚡ Tor disabled — connecting directly\n")
 
         kf = self.strategy_config.kelly_fraction
         mp = self.strategy_config.min_prob
@@ -395,22 +399,39 @@ class PolyBot:
                     if real_bal > 0 and self._balance_before_buy > 0:
                         spent = self._balance_before_buy - real_bal
                         if spent > 1.0:
-                            # The buy DID go through — retroactively track it
-                            est_shares = spent / self._pending_buy_price if self._pending_buy_price > 0 else 0
+                            # Buy confirmed via balance drop. Use intended order amounts
+                            # (balance delta can be contaminated by concurrent settlements)
+                            trade_cost = min(spent, self._pending_buy_amount) if self._pending_buy_amount > 0 else spent
+                            trade_shares = self._pending_buy_shares if self._pending_buy_shares > 0 else (trade_cost / self._pending_buy_price if self._pending_buy_price > 0 else 0)
                             print(f"\n  👻 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
-                            print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
+                            if spent > self._pending_buy_amount * 1.02:
+                                print(f"     ⚠️  Capped cost: ${spent:.2f} → ${trade_cost:.2f}")
+                            print(f"     Retroactively tracking: {trade_shares:.0f} shares "
                                   f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
 
                             self._traded = True
                             self._trade_side = self._pending_buy_side
                             self._trade_price = self._pending_buy_price
-                            self._trade_cost = spent
-                            self._trade_shares = est_shares
+                            self._trade_cost = trade_cost
+                            self._trade_shares = trade_shares
                             self._trade_token_id = self._pending_buy_token_id
                             self.stats.bankroll = real_bal
                             self._last_real_balance = real_bal
                             self.stats.hourly.record_trade(
                                 self._pending_buy_edge, self._pending_buy_delta)
+
+                            # Log late-fill to trades CSV
+                            self.tracker.log_trade_entry(
+                                window_ts=self._current_window,
+                                side=self._pending_buy_side,
+                                entry_price=self._pending_buy_price,
+                                entry_shares=trade_shares,
+                                entry_cost=trade_cost,
+                                edge=self._pending_buy_edge,
+                                prob=0.0,
+                                btc_delta=self._pending_buy_delta,
+                                seconds_remaining=0.0,
+                            )
 
             self.stats.hourly.record_window(self._traded)
             if self._traded:
@@ -540,7 +561,10 @@ class PolyBot:
                   f"exceeds -${self._daily_loss_limit:.0f}")
             return
 
-        session_pnl = self.stats.bankroll - self._session_start_balance
+        # Use tracked P&L from trade outcomes, not raw balance comparison.
+        # Balance-based P&L is wrong when winning shares are unredeemed
+        # (tokens sitting in wallet, not yet converted back to USDC).
+        session_pnl = self.stats.total_pnl
         if session_pnl <= -self._daily_loss_limit:
             self._daily_loss_halted = True
             msg = (f"🛑 DAILY LOSS LIMIT HIT: ${session_pnl:+.2f} "
@@ -568,10 +592,17 @@ class PolyBot:
             actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
             if actual_price > 0:
                 actual_edge = sig.true_prob - actual_price
-                print(f"  📊 Actual price: ${actual_price:.3f} (edge: {actual_edge:.3f})")
+                slippage = actual_price - sig.market_price
+                print(f"  📊 Actual price: ${actual_price:.3f} (edge: {actual_edge:.3f}, slippage: {slippage:+.3f})")
 
                 if actual_edge < self.strategy_config.min_edge:
                     print(f"  ⚠️  Edge gone at market price — skipping")
+                    return
+
+                # Slippage filter: if market has already repriced >$0.09 from
+                # what the strategy saw, the oracle lag is gone — skip
+                if slippage > 0.09:
+                    print(f"  ⚠️  Slippage ${slippage:.3f} > $0.09 — market already repriced, skipping")
                     return
 
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount)
@@ -592,6 +623,21 @@ class PolyBot:
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
             print(f"     Holding to resolution (no stops)")
+
+            # Log trade entry to CSV (both dry-run and live)
+            btc_delta = ((self.price_feed.get_price()[0] - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0
+            self.tracker.log_trade_entry(
+                window_ts=self._current_window,
+                side=sig.side,
+                entry_price=result.price,
+                entry_shares=result.shares,
+                entry_cost=result.amount_usd,
+                edge=sig.edge,
+                prob=sig.true_prob,
+                btc_delta=btc_delta,
+                seconds_remaining=seconds_remaining,
+                planned_price=sig.market_price,
+            )
 
             self.telegram.trade_alert(
                 side=sig.side, price=result.price, amount=result.amount_usd,
@@ -635,6 +681,17 @@ class PolyBot:
                 self.stats.record_win(profit)
             else:
                 self.stats.record_loss(abs(profit))
+
+            # Log to CSV
+            btc_price, _ = self.price_feed.get_price()
+            self.tracker.log_trade_resolve(
+                btc_final_price=btc_price,
+                opening_price=self._opening_price,
+                won=profit > 0,
+                profit=profit,
+                exit_revenue=self._exit_revenue,
+            )
+
             result_emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
             residual_note = f" (~{self._residual_shares:.0f} residual)" if self._residual_shares >= 1 else ""
             print(f"  {result_emoji} (exited{residual_note}) ${profit:+.2f} | "
@@ -705,6 +762,15 @@ class PolyBot:
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.win_alert(profit, self.stats.total_pnl)
+
+            # Log win to CSV
+            self.tracker.log_trade_resolve(
+                btc_final_price=btc_price,
+                opening_price=self._opening_price,
+                won=True,
+                profit=profit,
+                exit_revenue=self._exit_revenue,
+            )
         else:
             # Lost — remaining shares worth $0. Any partial exit revenue was already banked.
             net_loss = original_cost - self._exit_revenue
@@ -714,6 +780,15 @@ class PolyBot:
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+
+            # Log loss to CSV
+            self.tracker.log_trade_resolve(
+                btc_final_price=btc_price,
+                opening_price=self._opening_price,
+                won=False,
+                profit=-net_loss,
+                exit_revenue=self._exit_revenue,
+            )
 
     # ── Hourly + shutdown ───────────────────────────────────────────
 

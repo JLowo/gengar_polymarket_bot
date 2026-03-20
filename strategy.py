@@ -136,14 +136,16 @@ class TradingStats:
         self.total_trades += 1
         self.wins += 1
         self.total_pnl += profit
-        self.bankroll += profit
+        # bankroll is managed directly in bot.py via buy/sell operations
+        # and corrected by window-boundary balance sync
         self.hourly.record_result(profit, won=True)
 
     def record_loss(self, loss: float):
         self.total_trades += 1
         self.losses += 1
         self.total_pnl -= abs(loss)
-        self.bankroll -= abs(loss)
+        # bankroll is managed directly in bot.py via buy/sell operations
+        # and corrected by window-boundary balance sync
         self.hourly.record_result(-abs(loss), won=False)
 
     def to_dict(self) -> dict:
