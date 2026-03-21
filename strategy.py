@@ -32,7 +32,7 @@ class StrategyConfig:
     entry_window_end: int = 10
     max_price: float = 0.90
     min_price: float = 0.50
-    min_btc_delta_pct: float = 0.01
+    min_btc_delta: float = 0.06     # minimum |btc_delta_pct| — below this the oracle and Binance can disagree
     kelly_fraction: float = 0.25    # Quarter-Kelly (conservative)
     min_bet: float = 5.0            # Polymarket minimum notional
     max_bet: float = 25.0           # Hard cap per trade
@@ -237,7 +237,7 @@ def evaluate(
 
     btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
 
-    if abs(btc_delta_pct) < config.min_btc_delta_pct:
+    if abs(btc_delta_pct) < config.min_btc_delta:
         return None
 
     side = "UP" if btc_delta_pct > 0 else "DOWN"

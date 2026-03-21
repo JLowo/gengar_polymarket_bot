@@ -59,6 +59,7 @@ class PolyBot:
         self.strategy_config = StrategyConfig(
             min_edge=float(os.getenv("MIN_EDGE", "0.05")),
             min_prob=float(os.getenv("MIN_PROB", "0.80")),
+            min_btc_delta=float(os.getenv("MIN_BTC_DELTA", "0.06")),
             entry_window_start=int(os.getenv("ENTRY_WINDOW_START", "240")),
             entry_window_end=int(os.getenv("ENTRY_WINDOW_END", "10")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
@@ -151,7 +152,7 @@ class PolyBot:
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
-        print(f"  Min prob: {mp:.0%} | Min edge: {me:.0%}")
+        print(f"  Min prob: {mp:.0%} | Min edge: {me:.0%} | Min BTC delta: {self.strategy_config.min_btc_delta:.2f}%")
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
         print(f"  Vol: 0.12 | Exits: hold to resolution")
@@ -258,7 +259,12 @@ class PolyBot:
             self._last_status_print = now
             delta = ((btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0
             d = "↑" if delta > 0 else "↓" if delta < 0 else "→"
-            state = "HOLDING" if self._traded else "IDLE"
+            if self._traded:
+                state = "HOLDING"
+            elif self._opening_price > 0 and abs(delta) < self.strategy_config.min_btc_delta:
+                state = f"ΔSMALL ({abs(delta):.3f}%<{self.strategy_config.min_btc_delta:.3f}%)"
+            else:
+                state = "IDLE"
             print(
                 f"  ⏱  T-{seconds_remaining:5.1f}s | "
                 f"BTC ${btc_price:,.2f} {d}{abs(delta):.3f}% | "
