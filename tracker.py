@@ -71,6 +71,7 @@ TRADE_FIELDS = [
     "btc_final_price", "btc_final_delta_pct",
     "won_resolution",           # Did BTC go our way?
     "resolution_payout",        # What resolution would have paid
+    "resolution_method",        # "claim_sell", "balance_check", "binance_fallback", "exited"
     # P&L
     "profit", "return_pct",
     "profit_if_held",           # What we'd have made holding to resolution
@@ -261,6 +262,7 @@ class Tracker:
         won: bool,
         profit: float,
         exit_revenue: float = 0.0,
+        resolution_method: str = "binance_fallback",
     ):
         if not self._current_trade:
             return
@@ -278,6 +280,7 @@ class Tracker:
         self._current_trade["btc_final_delta_pct"] = round(btc_delta, 4)
         self._current_trade["won_resolution"] = won
         self._current_trade["resolution_payout"] = round(resolution_payout, 2)
+        self._current_trade["resolution_method"] = resolution_method
         self._current_trade["profit"] = round(profit, 2)
         self._current_trade["return_pct"] = round(
             (profit / entry_cost * 100) if entry_cost > 0 else 0, 2

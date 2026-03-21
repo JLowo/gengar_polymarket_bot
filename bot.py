@@ -100,6 +100,7 @@ class PolyBot:
         self._exit_shares_sold: float = 0.0
         self._residual_shares: float = 0.0  # Shares left after partial fill
         self._last_position_check: float = 0.0
+        self._last_status_print: float = 0.0
         self._exit_retries: int = 0
         self._exit_gave_up: bool = False
 
@@ -208,7 +209,7 @@ class PolyBot:
             except Exception as e:
                 print(f"[error] {e}")
                 self.telegram.error_alert(str(e))
-            time.sleep(1)
+            time.sleep(0.1)
 
     def _tick(self):
         now = time.time()
@@ -253,7 +254,8 @@ class PolyBot:
         if signal_result:
             self._execute_trade(signal_result, seconds_remaining)
 
-        if int(now) % 30 == 0:
+        if now - self._last_status_print >= 30:
+            self._last_status_print = now
             delta = ((btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0
             d = "↑" if delta > 0 else "↓" if delta < 0 else "→"
             state = "HOLDING" if self._traded else "IDLE"
@@ -285,7 +287,8 @@ class PolyBot:
 
         # Throttled check
         if now - self._last_position_check < POSITION_CHECK_INTERVAL:
-            if int(now) % 30 == 0:
+            if now - self._last_status_print >= 30:
+                self._last_status_print = now
                 d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
                 print(
                     f"  ⏱  T-{seconds_remaining:5.1f}s | "
@@ -563,7 +566,9 @@ class PolyBot:
               f"prob={sig.true_prob:.2f} | BTC Δ={sig.btc_delta_pct:+.3f}%")
         print(f"     Kelly: ${trade_amount:.2f} | mkt ${sig.market_price:.3f} | T-{seconds_remaining:.0f}s")
 
-        # Preview actual market price and re-check edge
+        # Preview actual market price, re-check edge, then pass price into buy()
+        # so executor skips a second fetch (saves one Tor roundtrip ~500ms)
+        hint_price = 0.0
         if not self.dry_run and self.executor._initialized:
             actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
             if actual_price > 0:
@@ -574,7 +579,9 @@ class PolyBot:
                     print(f"  ⚠️  Edge gone at market price — skipping")
                     return
 
-        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount)
+                hint_price = actual_price
+
+        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
 
         if result.success:
             self._consecutive_buy_failures = 0  # Reset circuit breaker
@@ -628,8 +635,6 @@ class PolyBot:
 
     def _resolve_previous_trade(self):
         if self._exited:
-            # _trade_cost = original cost (never modified)
-            # _exit_revenue = cumulative USDC received from all sells
             profit = self._exit_revenue - self._trade_cost
             if profit > 0:
                 self.stats.record_win(profit)
@@ -644,76 +649,151 @@ class PolyBot:
                 self.telegram.win_alert(profit, self.stats.total_pnl)
             else:
                 self.telegram.loss_alert(abs(profit), self.stats.total_pnl)
+            btc_price, _ = self.price_feed.get_price()
+            self.tracker.log_trade_resolve(
+                btc_final_price=btc_price,
+                opening_price=self._opening_price,
+                won=profit > 0,
+                profit=profit,
+                exit_revenue=self._exit_revenue,
+                resolution_method="exited",
+            )
             return
 
-        # Held through resolution (may have partial exit revenue)
-        btc_price, _ = self.price_feed.get_price()
-        if self._opening_price <= 0 or btc_price <= 0:
+        original_cost = self._trade_cost
+        remaining_shares = self._trade_shares
+
+        # ── Dry run: Binance price fallback ──────────────────────────
+        if self.dry_run:
+            btc_price, _ = self.price_feed.get_price()
+            if self._opening_price <= 0 or btc_price <= 0:
+                return
+            won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
+            self._record_resolution(
+                won=won,
+                original_cost=original_cost,
+                remaining_shares=remaining_shares,
+                resolution_method="binance_fallback",
+                claim_revenue=0.0,
+            )
             return
 
-        won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
-        original_cost = self._trade_cost  # Never modified
-        remaining_shares = self._trade_shares  # Reduced on partial fills
+        # ── Live: attempt claim sell first — result is the truth ─────
+        # Binance price and oracle can disagree when BTC is near the opening
+        # price at resolution. The claim sell result is ground truth:
+        #   - Sell succeeds at ~$0.99 → shares had value → won
+        #   - "no match" or near-zero fill → shares worthless → lost
+        won = None
+        claim_revenue = 0.0
+        resolution_method = "claim_sell"
 
-        if won:
-            # Remaining shares pay $1 each at resolution
-            resolution_payout = remaining_shares * 1.0
-            total_received = self._exit_revenue + resolution_payout
-            profit = total_received - original_cost
+        claim_notional = remaining_shares * 0.99
+        live_token = (self._trade_token_id
+                      and not self._trade_token_id.startswith("DRY-")
+                      and self.executor._initialized)
 
-            if self._trade_token_id and not self._trade_token_id.startswith("DRY-"):
-                claim_notional = remaining_shares * 0.99
-                if claim_notional < 5.0:
-                    # Below $5 minimum — can't sell, shares auto-resolve
-                    print(f"  💰 Won {remaining_shares:.0f} shares — below $5 min, "
-                          f"auto-resolving (${claim_notional:.2f})")
-                    self.stats.bankroll += resolution_payout
-                    self.stats.record_win(profit)
-                    self._unclaimed_winnings += resolution_payout
-                    partial_note = f" (partial exit saved ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-                    print(f"  ✅ WIN{partial_note} +${profit:.2f} (unclaimed) | "
-                          f"P&L: ${self.stats.total_pnl:+.2f} | "
-                          f"Bank: ${self.stats.bankroll:.2f}")
-                    self.telegram.win_alert(profit, self.stats.total_pnl)
-                    return
+        if live_token and claim_notional >= 5.0:
+            print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
+            claim = self.executor.sell(
+                token_id=self._trade_token_id,
+                shares=remaining_shares,
+                price=0.99,
+            )
+            if claim.success and claim.amount_usd > remaining_shares * 0.50:
+                # Got meaningful USDC back → shares had value → won
+                won = True
+                claim_revenue = claim.amount_usd
+                self.stats.bankroll += claim_revenue
+            elif "no match" in claim.error.lower() or (
+                claim.success and claim.amount_usd < remaining_shares * 0.10
+            ):
+                # No buyers for these shares → resolved against us → lost
+                won = False
+            else:
+                # Network error or ambiguous result — fall back to balance check
+                print(f"  ⚠️  Claim inconclusive ({claim.error}) — falling back to balance check")
+                resolution_method = "balance_check"
+        else:
+            # Below $5 notional or no valid token — use balance check
+            resolution_method = "balance_check"
+            if live_token and claim_notional < 5.0:
+                print(f"  💰 {remaining_shares:.0f} shares below $5 min — using balance check")
 
-                print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
-                claim = self.executor.sell(
-                    token_id=self._trade_token_id,
-                    shares=remaining_shares,
-                    price=0.99,
-                )
-                if claim.success:
-                    self.stats.bankroll += claim.amount_usd
-                    total_received = self._exit_revenue + claim.amount_usd
-                    actual_profit = total_received - original_cost
-                    self.stats.record_win(actual_profit)
-                    partial_note = f" (partial exit saved ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-                    print(f"  ✅ WIN (claimed{partial_note}) +${actual_profit:.2f} | "
-                          f"P&L: ${self.stats.total_pnl:+.2f} | "
-                          f"Bank: ${self.stats.bankroll:.2f}")
-                    self.telegram.win_alert(actual_profit, self.stats.total_pnl)
-                    return
+        # ── Balance-based fallback ────────────────────────────────────
+        if won is None and self.executor._initialized:
+            time.sleep(4)  # Wait for auto-resolution to settle on-chain
+            current_balance = self.executor.get_balance()
+            if current_balance > 0 and self._last_real_balance > 0:
+                # self._last_real_balance = balance at last window boundary (pre-trade)
+                # expected_if_lost = that balance minus what we spent
+                expected_if_lost = self._last_real_balance - original_cost
+                balance_delta = current_balance - expected_if_lost
+                won = balance_delta > (remaining_shares * 0.50)
+                print(f"  🔍 Balance check: expected_if_lost=${expected_if_lost:.2f} "
+                      f"actual=${current_balance:.2f} delta=${balance_delta:+.2f} "
+                      f"→ {'WON' if won else 'LOST'}")
+            else:
+                # Last resort: Binance price
+                resolution_method = "binance_fallback"
+                btc_price, _ = self.price_feed.get_price()
+                if self._opening_price > 0 and btc_price > 0:
+                    won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
+                    print(f"  ⚠️  Balance unavailable — using Binance fallback")
                 else:
-                    print(f"  ⚠️  Claim failed: {claim.error}")
+                    print(f"  ⚠️  Cannot determine resolution outcome — skipping")
+                    return
 
-            self.stats.bankroll += resolution_payout
+        if won is None:
+            return
+
+        self._record_resolution(
+            won=won,
+            original_cost=original_cost,
+            remaining_shares=remaining_shares,
+            resolution_method=resolution_method,
+            claim_revenue=claim_revenue,
+        )
+
+    def _record_resolution(
+        self, won: bool, original_cost: float, remaining_shares: float,
+        resolution_method: str, claim_revenue: float,
+    ):
+        """Apply win/loss to stats, print result, alert Telegram, log to tracker."""
+        if won:
+            if claim_revenue > 0:
+                total_received = self._exit_revenue + claim_revenue
+            else:
+                resolution_payout = remaining_shares * 1.0
+                total_received = self._exit_revenue + resolution_payout
+                self.stats.bankroll += resolution_payout
+                self._unclaimed_winnings += resolution_payout
+            profit = total_received - original_cost
             self.stats.record_win(profit)
-            self._unclaimed_winnings += resolution_payout
-            partial_note = f" (partial exit saved ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            print(f"  ✅ WIN{partial_note} +${profit:.2f} (unclaimed) | "
+            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
+            claimed_note = " (claimed)" if claim_revenue > 0 else " (unclaimed)"
+            print(f"  ✅ WIN{partial_note}{claimed_note} +${profit:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.win_alert(profit, self.stats.total_pnl)
         else:
-            # Lost — remaining shares worth $0. Any partial exit revenue was already banked.
             net_loss = original_cost - self._exit_revenue
+            profit = -net_loss
             self.stats.record_loss(net_loss)
-            partial_note = f" (partial exit saved ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} | "
+            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
+            print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+
+        btc_price, _ = self.price_feed.get_price()
+        self.tracker.log_trade_resolve(
+            btc_final_price=btc_price,
+            opening_price=self._opening_price,
+            won=won,
+            profit=profit,
+            exit_revenue=self._exit_revenue,
+            resolution_method=resolution_method,
+        )
 
     # ── Hourly + shutdown ───────────────────────────────────────────
 

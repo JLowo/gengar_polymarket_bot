@@ -135,12 +135,15 @@ class Executor:
 
     # ── Buy (market order via complement engine) ─────────────────────
 
-    def buy(self, token_id: str, amount_usd: float) -> OrderResult:
+    def buy(self, token_id: str, amount_usd: float, price: float = 0.0) -> OrderResult:
         """Buy via create_order + OrderArgs (limit order, complement engine).
 
         Uses explicit integer shares and 2-decimal price to avoid
         float precision errors that create_market_order produces
         internally (amount/price division → 21.000000000004 shares).
+
+        If price > 0, skips the internal get_market_price fetch (caller already
+        has a fresh price, saves one Tor roundtrip at execution time).
         """
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
@@ -161,17 +164,18 @@ class Executor:
         if not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        market_price = self.get_market_price(token_id, "BUY", amount_usd)
-        if market_price <= 0:
-            return OrderResult(
-                success=False, status=FAILED,
-                error="Could not get market price", side="BUY",
-                token_id=token_id[:16] + "...",
-            )
-
-        # Kill float artifacts: 0.7200000001 → 0.72
-        # CLOB requires price ≤ 2 decimals, size ≤ 4 decimals
-        market_price = round(market_price, 2)
+        if price > 0:
+            market_price = round(price, 2)
+        else:
+            market_price = self.get_market_price(token_id, "BUY", amount_usd)
+            if market_price <= 0:
+                return OrderResult(
+                    success=False, status=FAILED,
+                    error="Could not get market price", side="BUY",
+                    token_id=token_id[:16] + "...",
+                )
+            # Kill float artifacts: 0.7200000001 → 0.72
+            market_price = round(market_price, 2)
 
         # Price cap: don't buy above MAX_BUY_PRICE
         if market_price > MAX_BUY_PRICE:
