@@ -41,6 +41,8 @@ SIGNAL_FIELDS = [
     # What happened
     "action",           # "traded", "skipped_edge_gone", "skipped_below_min",
                         # "skipped_price_cap", "skipped_no_signal", etc.
+    "skip_reason",      # "delta_too_small", "prob_below_min", "edge_below_min",
+                        # "price_out_of_range", "edge_gone_at_market", or ""
     "actual_price",     # Real market price after preview (0 if not checked)
     "actual_edge",      # Edge at actual price
     "fill_price",       # What we actually paid (0 if not traded)
@@ -55,6 +57,8 @@ TRADE_FIELDS = [
     "side", "entry_price", "entry_shares", "entry_cost",
     "edge_at_entry", "prob_at_entry", "btc_delta_at_entry",
     "seconds_remaining_at_entry",
+    "entry_delta_pct",          # BTC delta at moment of entry
+    "entry_seconds_remaining",  # T-minus at entry
     "entry_latency_ms",         # signal → fill confirmed
     # Hold
     "max_prob_during_hold",     # Peak probability while holding
@@ -72,6 +76,7 @@ TRADE_FIELDS = [
     "won_resolution",           # Did BTC go our way?
     "resolution_payout",        # What resolution would have paid
     "resolution_method",        # "claim_sell", "balance_check", "binance_fallback", "exited"
+    "claim_result",             # "filled", "no_match", "inconclusive", "not_attempted"
     # P&L
     "profit", "return_pct",
     "profit_if_held",           # What we'd have made holding to resolution
@@ -89,19 +94,33 @@ EXECUTION_FIELDS = [
     "details",                  # JSON-safe string with relevant params
 ]
 
+SESSION_FIELDS = [
+    "start_time", "end_time",
+    "start_balance", "end_balance",
+    "real_pnl",                 # end_balance - start_balance
+    "tracked_pnl",              # from stats
+    "pnl_drift",                # real_pnl - tracked_pnl
+    "trades", "wins", "losses", "win_rate",
+    "avg_entry_price", "avg_edge", "avg_delta",
+]
+
 
 class Tracker:
-    def __init__(self, log_dir: str = "logs"):
+    def __init__(self, log_dir: str = "logs", log_executions: bool = False):
         self.log_dir = log_dir
+        self.log_executions = log_executions
         os.makedirs(log_dir, exist_ok=True)
 
         self._signal_path = os.path.join(log_dir, "signals.csv")
         self._trade_path = os.path.join(log_dir, "trades.csv")
         self._exec_path = os.path.join(log_dir, "executions.csv")
+        self._session_path = os.path.join(log_dir, "sessions.csv")
 
         self._ensure_headers(self._signal_path, SIGNAL_FIELDS)
         self._ensure_headers(self._trade_path, TRADE_FIELDS)
-        self._ensure_headers(self._exec_path, EXECUTION_FIELDS)
+        self._ensure_headers(self._session_path, SESSION_FIELDS)
+        if self.log_executions:
+            self._ensure_headers(self._exec_path, EXECUTION_FIELDS)
 
         # In-memory state for current trade
         self._current_trade: dict = {}
@@ -141,6 +160,7 @@ class Tracker:
         kelly_size: float = 0.0,
         # Outcome
         action: str = "no_signal",
+        skip_reason: str = "",
         actual_price: float = 0.0,
         actual_edge: float = 0.0,
         fill_price: float = 0.0,
@@ -178,6 +198,7 @@ class Tracker:
             "edge": round(edge, 4),
             "kelly_size": round(kelly_size, 2),
             "action": action,
+            "skip_reason": skip_reason,
             "actual_price": round(actual_price, 4),
             "actual_edge": round(actual_edge, 4),
             "fill_price": round(fill_price, 4),
@@ -199,6 +220,8 @@ class Tracker:
         btc_delta: float,
         seconds_remaining: float,
         latency_ms: float = 0.0,
+        entry_delta_pct: float = 0.0,
+        entry_seconds_remaining: float = 0.0,
     ):
         self._trade_counter += 1
         self._current_trade = {
@@ -215,6 +238,8 @@ class Tracker:
             "btc_delta_at_entry": round(btc_delta, 4),
             "seconds_remaining_at_entry": round(seconds_remaining, 1),
             "entry_latency_ms": round(latency_ms, 0),
+            "entry_delta_pct": round(entry_delta_pct, 4),
+            "entry_seconds_remaining": round(entry_seconds_remaining, 1),
             # Hold tracking — updated live
             "max_prob_during_hold": round(prob, 4),
             "min_prob_during_hold": round(prob, 4),
@@ -263,6 +288,7 @@ class Tracker:
         profit: float,
         exit_revenue: float = 0.0,
         resolution_method: str = "binance_fallback",
+        claim_result: str = "not_attempted",
     ):
         if not self._current_trade:
             return
@@ -281,6 +307,7 @@ class Tracker:
         self._current_trade["won_resolution"] = won
         self._current_trade["resolution_payout"] = round(resolution_payout, 2)
         self._current_trade["resolution_method"] = resolution_method
+        self._current_trade["claim_result"] = claim_result
         self._current_trade["profit"] = round(profit, 2)
         self._current_trade["return_pct"] = round(
             (profit / entry_cost * 100) if entry_cost > 0 else 0, 2
@@ -318,6 +345,9 @@ class Tracker:
     ):
         self._total_latency_ms += latency_ms
         self._latency_count += 1
+
+        if not self.log_executions:
+            return
 
         row = {
             "timestamp": time.time(),
@@ -374,6 +404,42 @@ class Tracker:
         print(f"{'═' * 55}")
 
         return summary
+
+    # ── Session logging ─────────────────────────────────────────────
+
+    def log_session(
+        self,
+        start_time: float,
+        end_time: float,
+        start_balance: float,
+        end_balance: float,
+        tracked_pnl: float,
+        trades: int,
+        wins: int,
+        losses: int,
+        avg_entry_price: float = 0.0,
+        avg_edge: float = 0.0,
+        avg_delta: float = 0.0,
+    ):
+        real_pnl = end_balance - start_balance
+        win_rate = (wins / trades * 100) if trades > 0 else 0.0
+        row = {
+            "start_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)),
+            "end_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)),
+            "start_balance": round(start_balance, 2),
+            "end_balance": round(end_balance, 2),
+            "real_pnl": round(real_pnl, 2),
+            "tracked_pnl": round(tracked_pnl, 2),
+            "pnl_drift": round(real_pnl - tracked_pnl, 2),
+            "trades": trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 1),
+            "avg_entry_price": round(avg_entry_price, 4),
+            "avg_edge": round(avg_edge, 4),
+            "avg_delta": round(avg_delta, 4),
+        }
+        self._append_row(self._session_path, row, SESSION_FIELDS)
 
     # ── Internal ────────────────────────────────────────────────────
 

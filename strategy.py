@@ -210,6 +210,41 @@ def estimate_true_probability(btc_delta_pct: float, seconds_remaining: float) ->
     return min(max(prob, 0.01), 0.99)
 
 
+def get_skip_reason(
+    btc_price: float,
+    opening_price: float,
+    up_market_price: float,
+    down_market_price: float,
+    seconds_remaining: float,
+    config: "StrategyConfig" = None,
+) -> str:
+    """Return why evaluate() returned None, for signal logging.
+
+    Returns one of: "delta_too_small", "prob_below_min", "edge_below_min",
+    "price_out_of_range", or "" (no skip reason — should have traded).
+    "edge_gone_at_market" is set by the caller in bot.py after the live
+    price re-check.
+    """
+    if config is None:
+        config = StrategyConfig()
+    if opening_price <= 0:
+        return ""
+    btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
+    if abs(btc_delta_pct) < config.min_btc_delta:
+        return "delta_too_small"
+    side = "UP" if btc_delta_pct > 0 else "DOWN"
+    market_price = up_market_price if btc_delta_pct > 0 else down_market_price
+    if market_price > config.max_price or market_price < config.min_price:
+        return "price_out_of_range"
+    true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
+    if true_prob < config.min_prob:
+        return "prob_below_min"
+    edge = true_prob - market_price
+    if edge < config.min_edge:
+        return "edge_below_min"
+    return ""
+
+
 def evaluate(
     btc_price: float,
     opening_price: float,
