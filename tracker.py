@@ -75,6 +75,8 @@ TRADE_FIELDS = [
     # P&L
     "profit", "return_pct",
     "profit_if_held",           # What we'd have made holding to resolution
+    # Meta
+    "version",
 ]
 
 # ── Execution record ────────────────────────────────────────────────
@@ -89,6 +91,17 @@ EXECUTION_FIELDS = [
     "details",                  # JSON-safe string with relevant params
 ]
 
+# ── Skipped signal record ──────────────────────────────────────────
+
+SKIPPED_FIELDS = [
+    "timestamp", "window_ts", "window_time",
+    "side", "prob", "btc_delta_pct", "market_price",
+    "reason",                   # "edge_gone", "slippage", "btc_reversed"
+    "would_have_won",
+    "btc_final_price", "opening_price", "btc_final_delta_pct",
+    "version",
+]
+
 
 class Tracker:
     def __init__(self, log_dir: str = "logs"):
@@ -98,10 +111,12 @@ class Tracker:
         self._signal_path = os.path.join(log_dir, "signals.csv")
         self._trade_path = os.path.join(log_dir, "trades.csv")
         self._exec_path = os.path.join(log_dir, "executions.csv")
+        self._skipped_path = os.path.join(log_dir, "skipped.csv")
 
         self._ensure_headers(self._signal_path, SIGNAL_FIELDS)
         self._ensure_headers(self._trade_path, TRADE_FIELDS)
         self._ensure_headers(self._exec_path, EXECUTION_FIELDS)
+        self._ensure_headers(self._skipped_path, SKIPPED_FIELDS)
 
         # In-memory state for current trade
         self._current_trade: dict = {}
@@ -200,6 +215,7 @@ class Tracker:
         seconds_remaining: float,
         latency_ms: float = 0.0,
         planned_price: float = 0.0,
+        version: int = 0,
     ):
         self._trade_counter += 1
         slippage = round(entry_price - planned_price, 4) if planned_price > 0 else 0.0
@@ -217,6 +233,7 @@ class Tracker:
             "edge_at_entry": round(edge, 4),
             "prob_at_entry": round(prob, 4),
             "btc_delta_at_entry": round(btc_delta, 4),
+            "version": version,
             "seconds_remaining_at_entry": round(seconds_remaining, 1),
             "entry_latency_ms": round(latency_ms, 0),
             # Hold tracking — updated live
@@ -306,6 +323,39 @@ class Tracker:
         # Write the complete trade record
         self._append_row(self._trade_path, self._current_trade, TRADE_FIELDS)
         self._current_trade = {}
+
+    # ── Skipped signal logging ───────────────────────────────────────
+
+    def log_skipped_signal(
+        self,
+        window_ts: int,
+        side: str,
+        prob: float,
+        btc_delta: float,
+        market_price: float,
+        reason: str,
+        would_have_won: bool,
+        btc_final_price: float,
+        opening_price: float,
+        version: int = 0,
+    ):
+        btc_final_delta = ((btc_final_price - opening_price) / opening_price * 100) if opening_price > 0 else 0
+        row = {
+            "timestamp": time.time(),
+            "window_ts": window_ts,
+            "window_time": time.strftime("%H:%M", time.localtime(window_ts)),
+            "side": side,
+            "prob": round(prob, 4),
+            "btc_delta_pct": round(btc_delta, 4),
+            "market_price": round(market_price, 4),
+            "reason": reason,
+            "would_have_won": would_have_won,
+            "btc_final_price": round(btc_final_price, 2),
+            "opening_price": round(opening_price, 2),
+            "btc_final_delta_pct": round(btc_final_delta, 4),
+            "version": version,
+        }
+        self._append_row(self._skipped_path, row, SKIPPED_FIELDS)
 
     # ── Execution logging ───────────────────────────────────────────
 

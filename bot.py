@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PolyBot v13 — Recalibrated + Safety Systems
+PolyBot v15 — Skipped Signal Tracking + Filter Validation
 
 Strategy:
   - Brownian motion model with vol=0.12 (recalibrated from 0.08)
@@ -40,6 +40,8 @@ from strategy import evaluate, estimate_true_probability, StrategyConfig, Tradin
 from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE
 from telegram_notifier import TelegramNotifier
 from tracker import Tracker
+
+BOT_VERSION = 15
 
 
 FORCED_EXIT_START = 5
@@ -125,6 +127,9 @@ class PolyBot:
         self._cached_down: float = 0.50
         self._price_last_fetched: float = 0.0
         self._PRICE_REFRESH: float = 5.0
+
+        # Skipped signal tracking (for win-rate analysis)
+        self._skipped_signal: dict = {}
 
         # Circuit breaker — detects CLOB API degradation
         self._consecutive_buy_failures: int = 0
@@ -431,7 +436,29 @@ class PolyBot:
                                 prob=0.0,
                                 btc_delta=self._pending_buy_delta,
                                 seconds_remaining=0.0,
+                                version=BOT_VERSION,
                             )
+
+            # Resolve skipped signal — check if it would have won
+            if self._skipped_signal and self._opening_price > 0:
+                btc_now, _ = self.price_feed.get_price()
+                if btc_now > 0:
+                    s = self._skipped_signal
+                    would_won = (btc_now >= self._opening_price) == (s["side"] == "UP")
+                    self.tracker.log_skipped_signal(
+                        window_ts=self._current_window,
+                        side=s["side"],
+                        prob=s["prob"],
+                        btc_delta=s["btc_delta"],
+                        market_price=s["market_price"],
+                        reason=s["reason"],
+                        would_have_won=would_won,
+                        btc_final_price=btc_now,
+                        opening_price=self._opening_price,
+                        version=BOT_VERSION,
+                    )
+                    tag = "✅" if would_won else "❌"
+                    print(f"  📋 Skipped {s['side']} ({s['reason']}) → would have {tag} {'WON' if would_won else 'LOST'}")
 
             self.stats.hourly.record_window(self._traded)
             if self._traded:
@@ -452,6 +479,7 @@ class PolyBot:
         self._opening_price = 0.0
         self._traded = False
         self._trade_attempted = False
+        self._skipped_signal = {}
         self._exited = False
         self._exit_revenue = 0.0
         self._exit_shares_sold = 0.0
@@ -597,13 +625,29 @@ class PolyBot:
 
                 if actual_edge < self.strategy_config.min_edge:
                     print(f"  ⚠️  Edge gone at market price — skipping")
+                    self._skipped_signal = {"side": sig.side, "prob": sig.true_prob, "btc_delta": sig.btc_delta_pct, "market_price": actual_price, "reason": "edge_gone"}
                     return
 
                 # Slippage filter: if market has already repriced >$0.09 from
                 # what the strategy saw, the oracle lag is gone — skip
                 if slippage > 0.09:
                     print(f"  ⚠️  Slippage ${slippage:.3f} > $0.09 — market already repriced, skipping")
+                    self._skipped_signal = {"side": sig.side, "prob": sig.true_prob, "btc_delta": sig.btc_delta_pct, "market_price": actual_price, "reason": "slippage"}
                     return
+
+        # Direction re-check: verify BTC is still moving in the signal's direction.
+        # Stale cached prices can produce UP signals when BTC has already reversed.
+        btc_now, _ = self.price_feed.get_price()
+        if btc_now > 0 and self._opening_price > 0:
+            current_delta = ((btc_now - self._opening_price) / self._opening_price) * 100
+            if sig.side == "UP" and current_delta < 0:
+                print(f"  ⚠️  BTC reversed to {current_delta:+.3f}% — signal was UP, skipping")
+                self._skipped_signal = {"side": sig.side, "prob": sig.true_prob, "btc_delta": sig.btc_delta_pct, "market_price": sig.market_price, "reason": "btc_reversed"}
+                return
+            if sig.side == "DOWN" and current_delta > 0:
+                print(f"  ⚠️  BTC reversed to {current_delta:+.3f}% — signal was DOWN, skipping")
+                self._skipped_signal = {"side": sig.side, "prob": sig.true_prob, "btc_delta": sig.btc_delta_pct, "market_price": sig.market_price, "reason": "btc_reversed"}
+                return
 
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount)
 
@@ -637,6 +681,7 @@ class PolyBot:
                 btc_delta=btc_delta,
                 seconds_remaining=seconds_remaining,
                 planned_price=sig.market_price,
+                version=BOT_VERSION,
             )
 
             self.telegram.trade_alert(
@@ -732,6 +777,13 @@ class PolyBot:
                           f"P&L: ${self.stats.total_pnl:+.2f} | "
                           f"Bank: ${self.stats.bankroll:.2f}")
                     self.telegram.win_alert(profit, self.stats.total_pnl)
+                    self.tracker.log_trade_resolve(
+                        btc_final_price=btc_price,
+                        opening_price=self._opening_price,
+                        won=True,
+                        profit=profit,
+                        exit_revenue=self._exit_revenue,
+                    )
                     return
 
                 print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
@@ -750,6 +802,13 @@ class PolyBot:
                           f"P&L: ${self.stats.total_pnl:+.2f} | "
                           f"Bank: ${self.stats.bankroll:.2f}")
                     self.telegram.win_alert(actual_profit, self.stats.total_pnl)
+                    self.tracker.log_trade_resolve(
+                        btc_final_price=btc_price,
+                        opening_price=self._opening_price,
+                        won=True,
+                        profit=actual_profit,
+                        exit_revenue=self._exit_revenue + claim.amount_usd,
+                    )
                     return
                 else:
                     print(f"  ⚠️  Claim failed: {claim.error}")

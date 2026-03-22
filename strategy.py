@@ -32,7 +32,7 @@ class StrategyConfig:
     entry_window_end: int = 10
     max_price: float = 0.90
     min_price: float = 0.50
-    min_btc_delta_pct: float = 0.01
+    min_btc_delta_pct: float = 0.04
     kelly_fraction: float = 0.25    # Quarter-Kelly (conservative)
     min_bet: float = 5.0            # Polymarket minimum notional
     max_bet: float = 25.0           # Hard cap per trade

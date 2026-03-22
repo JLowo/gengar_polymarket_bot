@@ -134,12 +134,34 @@ python bot.py
 | `MARKET_PERIOD` | `5` | Market window in minutes |
 | `LOG_DIR` | `logs` | Directory for tracker CSVs |
 
+## Dashboard
+
+Live trading dashboard with interactive charts. Reads CSV data fresh on every page load — refresh during a session to see new trades.
+
+```bash
+# Install chart dependencies (first time only)
+venv/bin/pip install matplotlib
+
+# Launch dashboard
+python dashboard.py          # opens http://localhost:8050
+python dashboard.py 9000     # custom port
+```
+
+Features:
+- **Equity curve** — cumulative P&L across all versions, color-coded by version
+- **Win rate & P&L** — bar charts by version with breakeven line
+- **Per-trade waterfall** — every trade as a green/red bar chronologically
+- **Skipped signal analysis** — would-have-won rate by skip reason (edge_gone, slippage, btc_reversed)
+- **Recent trades table** — last 20 trades with entry price, result, and return %
+- **Version filter** — click v13/v14/v15 to isolate any version's data
+
 ## Tracker output
 
-The bot logs three CSV files in `LOG_DIR/` for post-session analysis:
+The bot logs four CSV files in `LOG_DIR/` for post-session analysis:
 
 - **signals.csv** — every signal evaluated (traded or skipped), with model probability, market price, edge, Kelly size, and reason for action
 - **trades.csv** — full trade lifecycle: entry, hold-period extremes (min/max prob and sell price), exit, resolution outcome, and `profit_if_held` counterfactual
+- **skipped.csv** — signals that passed strategy filters but were blocked by pre-trade checks, with `would_have_won` outcome for filter validation
 - **executions.csv** — every CLOB API call with latency
 
 ## Lessons learned
