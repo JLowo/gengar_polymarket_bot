@@ -229,14 +229,14 @@ class PolyBot:
         period_secs = PERIOD_SECONDS[self.period]
         window_ts = int(now) - (int(now) % period_secs)
 
+        btc_price, is_fresh = self.price_feed.get_price()
+        if not is_fresh or btc_price <= 0:
+            return
+
         if window_ts != self._current_window:
             self._on_new_window(window_ts, closing_btc_price=btc_price)
 
         seconds_remaining = (window_ts + period_secs) - now
-
-        btc_price, is_fresh = self.price_feed.get_price()
-        if not is_fresh or btc_price <= 0:
-            return
 
         if self._opening_price <= 0:
             self._opening_price = btc_price
