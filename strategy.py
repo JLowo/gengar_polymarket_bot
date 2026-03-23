@@ -187,19 +187,18 @@ def kelly_bet_size(
     return max(min(bet, max_bet), min_bet)
 
 
-def estimate_true_probability(btc_delta_pct: float, seconds_remaining: float) -> float:
+def estimate_true_probability(
+    btc_delta_pct: float, seconds_remaining: float, vol: float = 0.12
+) -> float:
     """Estimate true probability using Brownian motion model.
 
-    Calibrated vol = 0.12 (was 0.08, briefly 0.15).
-    0.08 was 2x overconfident (model 83% → actual 40-60%).
-    0.15 agreed with market → no edge visible.
-    0.12 sits in between: model shows 5-15% edge on real moves,
-    which aligns with the lag we see in the complement engine.
+    vol defaults to 0.12 (calibrated static fallback). When the bot has
+    enough recent window data, it passes a realized rolling vol instead,
+    which adapts to the current regime (higher in volatile sessions,
+    lower in trending sessions).
     """
-    btc_5min_vol = 0.12
-
     time_factor = max(seconds_remaining, 1) / 300
-    effective_vol = btc_5min_vol * math.sqrt(time_factor)
+    effective_vol = vol * math.sqrt(time_factor)
 
     if effective_vol == 0:
         return 1.0 if btc_delta_pct > 0 else 0.0
@@ -217,6 +216,7 @@ def get_skip_reason(
     down_market_price: float,
     seconds_remaining: float,
     config: "StrategyConfig" = None,
+    realized_vol: float = None,
 ) -> str:
     """Return why evaluate() returned None, for signal logging.
 
@@ -236,7 +236,8 @@ def get_skip_reason(
     market_price = up_market_price if btc_delta_pct > 0 else down_market_price
     if market_price > config.max_price or market_price < config.min_price:
         return "price_out_of_range"
-    true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
+    vol = realized_vol if realized_vol is not None else 0.12
+    true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining, vol=vol)
     if true_prob < config.min_prob:
         return "prob_below_min"
     edge = true_prob - market_price
@@ -253,12 +254,16 @@ def evaluate(
     seconds_remaining: float,
     bankroll: float = 100.0,
     config: StrategyConfig = None,
+    realized_vol: float = None,
 ) -> Optional[TradeSignal]:
     """Evaluate whether to enter a trade.
 
     Two-layer filter:
       1. Model probability must exceed min_prob (default 80%)
       2. Edge (prob - market_price) must exceed min_edge (default 5%)
+
+    realized_vol: rolling std dev of recent window closing deltas.
+    When None, falls back to the hardcoded 0.12 default.
     """
     if config is None:
         config = StrategyConfig()
@@ -281,7 +286,8 @@ def evaluate(
     if market_price > config.max_price or market_price < config.min_price:
         return None
 
-    true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
+    vol = realized_vol if realized_vol is not None else 0.12
+    true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining, vol=vol)
 
     # Filter 1: Model must be confident enough
     if true_prob < config.min_prob:

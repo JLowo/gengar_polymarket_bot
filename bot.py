@@ -29,6 +29,7 @@ import sys
 import time
 import signal
 import math
+import statistics
 from dotenv import load_dotenv
 
 import logging
@@ -69,6 +70,10 @@ class PolyBot:
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
         self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
+        self._rolling_vol_windows = int(os.getenv("ROLLING_VOL_WINDOWS", "12"))
+        self._vol_floor = float(os.getenv("VOL_FLOOR", "0.06"))
+        self._vol_cap = float(os.getenv("VOL_CAP", "0.30"))
+        self._vol_fallback = 0.12  # used until enough windows accumulate
 
         self.price_feed = BinancePriceFeed()
         self.executor = Executor(
@@ -107,6 +112,7 @@ class PolyBot:
         self._last_status_print: float = 0.0
         self._last_tick_context: dict = {}   # last entry-window state, for window-end signal logging
         self._session_start_time: float = time.time()
+        self._recent_window_deltas: list = []  # rolling abs(close_delta_pct) per window
         self._exit_retries: int = 0
         self._exit_gave_up: bool = False
 
@@ -160,7 +166,8 @@ class PolyBot:
         print(f"  Min prob: {mp:.0%} | Min edge: {me:.0%} | Min BTC delta: {self.strategy_config.min_btc_delta:.2f}%")
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
-        print(f"  Vol: 0.12 | Exits: hold to resolution")
+        print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
+        print(f"  Exits: hold to resolution")
         print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
@@ -223,7 +230,7 @@ class PolyBot:
         window_ts = int(now) - (int(now) % period_secs)
 
         if window_ts != self._current_window:
-            self._on_new_window(window_ts)
+            self._on_new_window(window_ts, closing_btc_price=btc_price)
 
         seconds_remaining = (window_ts + period_secs) - now
 
@@ -247,6 +254,7 @@ class PolyBot:
         # IDLE: look for entry
         up_price, down_price = self._get_market_prices(btc_price, seconds_remaining)
 
+        realized_vol = self._compute_realized_vol()
         signal_result = evaluate(
             btc_price=btc_price,
             opening_price=self._opening_price,
@@ -255,6 +263,7 @@ class PolyBot:
             seconds_remaining=seconds_remaining,
             bankroll=self.stats.bankroll,
             config=self.strategy_config,
+            realized_vol=realized_vol,
         )
 
         # Store context for window-end no-trade signal logging
@@ -280,11 +289,13 @@ class PolyBot:
                 state = f"ΔSMALL ({abs(delta):.3f}%<{self.strategy_config.min_btc_delta:.3f}%)"
             else:
                 state = "IDLE"
+            n = len(self._recent_window_deltas)
+            vol_label = f"{self._compute_realized_vol():.3f}({'r' if n >= 6 else f'fb,n={n}'})"
             print(
                 f"  ⏱  T-{seconds_remaining:5.1f}s | "
                 f"BTC ${btc_price:,.2f} {d}{abs(delta):.3f}% | "
                 f"UP ${up_price:.3f} DN ${down_price:.3f} | "
-                f"P&L ${self.stats.total_pnl:+.2f} [{state}]"
+                f"vol={vol_label} | P&L ${self.stats.total_pnl:+.2f} [{state}]"
             )
 
     # ── Active position management ──────────────────────────────────
@@ -410,8 +421,14 @@ class PolyBot:
 
     # ── Window management ───────────────────────────────────────────
 
-    def _on_new_window(self, window_ts: int):
+    def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
         if self._current_window > 0:
+            # Record closing delta for rolling vol calculation
+            if self._opening_price > 0 and closing_btc_price > 0:
+                closing_delta = abs((closing_btc_price - self._opening_price) / self._opening_price * 100)
+                self._recent_window_deltas.append(closing_delta)
+                if len(self._recent_window_deltas) > self._rolling_vol_windows:
+                    self._recent_window_deltas.pop(0)
             # Detect pending buy that settled after our verification timeout
             if self._pending_buy_side and not self._traded:
                 if not self.dry_run and self.executor._initialized:
@@ -449,6 +466,7 @@ class PolyBot:
                     down_market_price=ctx["down_price"],
                     seconds_remaining=ctx["seconds_remaining"],
                     config=self.strategy_config,
+                    realized_vol=self._compute_realized_vol(),
                 )
                 sig = ctx.get("signal")
                 self.tracker.log_signal(
@@ -519,6 +537,19 @@ class PolyBot:
                 print(f"  🔌 CLOB health check still failing — staying halted")
 
     # ── Market prices (cached, complement engine) ───────────────────
+
+    def _compute_realized_vol(self) -> float:
+        """Rolling std dev of recent window closing deltas.
+
+        Returns the realized vol to pass into the Brownian motion model.
+        Falls back to 0.12 until at least 6 windows have accumulated.
+        Floored/capped to prevent extreme values breaking the model.
+        """
+        min_samples = max(6, self._rolling_vol_windows // 2)
+        if len(self._recent_window_deltas) >= min_samples:
+            vol = statistics.stdev(self._recent_window_deltas)
+            return max(self._vol_floor, min(self._vol_cap, vol))
+        return self._vol_fallback
 
     def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
         if self.dry_run or not self.executor._initialized:
