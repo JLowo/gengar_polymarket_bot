@@ -115,6 +115,7 @@ class PolyBot:
         self._recent_window_deltas: list = []  # rolling abs(close_delta_pct) per window
         self._exit_retries: int = 0
         self._exit_gave_up: bool = False
+        self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
 
         # Pending buy (unverified — Polygon settlement too slow)
         self._pending_buy_side: str = ""
@@ -344,6 +345,8 @@ class PolyBot:
         if current_sell_price <= 0:
             return
 
+        self._last_sell_price_seen = current_sell_price
+
         # Track hold-period extremes
         self.tracker.update_hold_stats(our_prob, current_sell_price)
 
@@ -507,6 +510,7 @@ class PolyBot:
         self._last_position_check = 0.0
         self._exit_retries = 0
         self._exit_gave_up = False
+        self._last_sell_price_seen = 0.0
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
@@ -821,6 +825,29 @@ class PolyBot:
         live_token = (self._trade_token_id
                       and not self._trade_token_id.startswith("DRY-")
                       and self.executor._initialized)
+
+        # Short-circuit: if last observed sell price is below $0.50, market has
+        # already priced these shares as worthless — skip the claim API call.
+        if self._last_sell_price_seen > 0 and self._last_sell_price_seen < 0.50:
+            net_loss = original_cost - self._exit_revenue
+            profit = -net_loss
+            self.stats.record_loss(net_loss)
+            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
+            print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [market_price] | "
+                  f"P&L: ${self.stats.total_pnl:+.2f} | "
+                  f"Bank: ${self.stats.bankroll:.2f}")
+            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+            btc_price, _ = self.price_feed.get_price()
+            self.tracker.log_trade_resolve(
+                btc_final_price=btc_price,
+                opening_price=self._opening_price,
+                won=False,
+                profit=profit,
+                exit_revenue=self._exit_revenue,
+                resolution_method="market_price",
+                claim_result="skipped_losing",
+            )
+            return
 
         if live_token and claim_notional >= 5.0:
             print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
