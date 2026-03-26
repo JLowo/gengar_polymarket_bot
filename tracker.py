@@ -1,24 +1,24 @@
 """Quant-grade performance tracker for PolyBot.
 
-Three log files, all append-only CSV:
+Log files (append-only CSV):
 
 1. signals.csv — Every signal the strategy evaluates (traded or not).
    Answers: Are our edges real? What are we missing?
 
-2. trades.csv — Full lifecycle of every trade (entry → hold → exit → resolve).
+2. trades.csv — Full lifecycle of every trade (entry → hold → resolve).
    Answers: How well do we execute? Where does P&L leak?
 
-3. executions.csv — Every API call with timing.
+3. executions.csv — Every API call with timing (optional).
    Answers: How fast are we? Where's the latency?
 
 Usage:
     tracker = Tracker(log_dir="logs")
-    tracker.log_signal(...)       # Every evaluate() result
-    tracker.log_trade_entry(...)  # On buy fill
-    tracker.log_trade_exit(...)   # On sell/stop/TP
-    tracker.log_trade_resolve(...)# At window close
-    tracker.log_execution(...)    # Every API call
-    tracker.session_summary()     # On shutdown
+    tracker.log_signal(...)         # Every evaluate() result
+    tracker.open_trade(...)         # On buy fill
+    tracker.update_hold_stats(...)  # Each position check tick
+    tracker.close_trade(...)        # At window close — computes profit, writes CSV
+    tracker.log_execution(...)      # Every API call (optional)
+    tracker.session_summary()       # On shutdown
 """
 
 import os
@@ -66,8 +66,7 @@ TRADE_FIELDS = [
     "max_sell_price_seen",      # Best exit we saw
     "min_sell_price_seen",      # Worst exit we saw
     # Exit
-    "exit_type",                # "take-profit", "prob-stop", "price-stop",
-                                # "forced-exit", "resolution", "hold-to-resolution"
+    "exit_type",                # "hold-to-resolution", "forced-exit"
     "exit_price", "exit_shares_sold", "exit_revenue",
     "residual_shares", "residual_value",
     "exit_latency_ms",
@@ -82,6 +81,36 @@ TRADE_FIELDS = [
     "profit_if_held",           # What we'd have made holding to resolution
 ]
 
+
+@dataclass
+class TradeRecord:
+    """In-memory state for a single trade's lifecycle (entry + hold).
+
+    Created by open_trade(), updated by update_hold_stats(),
+    consumed by close_trade() which adds resolution fields and writes CSV.
+    """
+    timestamp: float = 0.0
+    window_ts: int = 0
+    window_time: str = ""
+    trade_id: int = 0
+    side: str = ""
+    entry_price: float = 0.0
+    entry_shares: float = 0.0
+    entry_cost: float = 0.0
+    edge_at_entry: float = 0.0
+    prob_at_entry: float = 0.0
+    btc_delta_at_entry: float = 0.0
+    seconds_remaining_at_entry: float = 0.0
+    entry_delta_pct: float = 0.0
+    entry_seconds_remaining: float = 0.0
+    entry_latency_ms: float = 0.0
+    # Hold (updated live via update_hold_stats)
+    max_prob_during_hold: float = 0.0
+    min_prob_during_hold: float = 1.0
+    max_sell_price_seen: float = 0.0
+    min_sell_price_seen: float = 999.0
+
+
 # ── Execution record ────────────────────────────────────────────────
 
 EXECUTION_FIELDS = [
@@ -92,6 +121,16 @@ EXECUTION_FIELDS = [
     "success",
     "error",
     "details",                  # JSON-safe string with relevant params
+]
+
+# ── Hold tick record (one row per position check, ~every 3s) ───────
+
+HOLD_TICK_FIELDS = [
+    "timestamp", "trade_id", "window_ts",
+    "seconds_remaining",
+    "btc_price", "btc_delta_pct",
+    "prob", "sell_price",
+    "unrealized_pnl", "return_pct",
 ]
 
 SESSION_FIELDS = [
@@ -113,17 +152,19 @@ class Tracker:
 
         self._signal_path = os.path.join(log_dir, "signals.csv")
         self._trade_path = os.path.join(log_dir, "trades.csv")
+        self._tick_path = os.path.join(log_dir, "hold_ticks.csv")
         self._exec_path = os.path.join(log_dir, "executions.csv")
         self._session_path = os.path.join(log_dir, "sessions.csv")
 
         self._ensure_headers(self._signal_path, SIGNAL_FIELDS)
         self._ensure_headers(self._trade_path, TRADE_FIELDS)
+        self._ensure_headers(self._tick_path, HOLD_TICK_FIELDS)
         self._ensure_headers(self._session_path, SESSION_FIELDS)
         if self.log_executions:
             self._ensure_headers(self._exec_path, EXECUTION_FIELDS)
 
-        # In-memory state for current trade
-        self._current_trade: dict = {}
+        # Active trade (TradeRecord dataclass, replaces old dict)
+        self._active_trade: Optional[TradeRecord] = None
         self._trade_counter: int = 0
 
         # Session stats
@@ -208,7 +249,7 @@ class Tracker:
 
     # ── Trade lifecycle ─────────────────────────────────────────────
 
-    def log_trade_entry(
+    def open_trade(
         self,
         window_ts: int,
         side: str,
@@ -223,114 +264,152 @@ class Tracker:
         entry_delta_pct: float = 0.0,
         entry_seconds_remaining: float = 0.0,
     ):
+        """Record trade entry. Creates a TradeRecord that tracks hold-period stats."""
         self._trade_counter += 1
-        self._current_trade = {
-            "timestamp": time.time(),
-            "window_ts": window_ts,
-            "window_time": time.strftime("%H:%M", time.localtime(window_ts)),
-            "trade_id": self._trade_counter,
-            "side": side,
-            "entry_price": round(entry_price, 4),
-            "entry_shares": round(entry_shares, 1),
-            "entry_cost": round(entry_cost, 2),
-            "edge_at_entry": round(edge, 4),
-            "prob_at_entry": round(prob, 4),
-            "btc_delta_at_entry": round(btc_delta, 4),
-            "seconds_remaining_at_entry": round(seconds_remaining, 1),
-            "entry_latency_ms": round(latency_ms, 0),
-            "entry_delta_pct": round(entry_delta_pct, 4),
-            "entry_seconds_remaining": round(entry_seconds_remaining, 1),
-            # Hold tracking — updated live
-            "max_prob_during_hold": round(prob, 4),
-            "min_prob_during_hold": round(prob, 4),
-            "max_sell_price_seen": 0.0,
-            "min_sell_price_seen": 999.0,
-        }
+        self._active_trade = TradeRecord(
+            timestamp=time.time(),
+            window_ts=window_ts,
+            window_time=time.strftime("%H:%M", time.localtime(window_ts)),
+            trade_id=self._trade_counter,
+            side=side,
+            entry_price=round(entry_price, 4),
+            entry_shares=round(entry_shares, 1),
+            entry_cost=round(entry_cost, 2),
+            edge_at_entry=round(edge, 4),
+            prob_at_entry=round(prob, 4),
+            btc_delta_at_entry=round(btc_delta, 4),
+            seconds_remaining_at_entry=round(seconds_remaining, 1),
+            entry_latency_ms=round(latency_ms, 0),
+            entry_delta_pct=round(entry_delta_pct, 4),
+            entry_seconds_remaining=round(entry_seconds_remaining, 1),
+            max_prob_during_hold=round(prob, 4),
+            min_prob_during_hold=round(prob, 4),
+        )
 
     def update_hold_stats(self, prob: float, sell_price: float):
         """Call on each position check tick to track hold-period extremes."""
-        if not self._current_trade:
+        if not self._active_trade:
             return
-        if prob > self._current_trade["max_prob_during_hold"]:
-            self._current_trade["max_prob_during_hold"] = round(prob, 4)
-        if prob < self._current_trade["min_prob_during_hold"]:
-            self._current_trade["min_prob_during_hold"] = round(prob, 4)
+        t = self._active_trade
+        if prob > t.max_prob_during_hold:
+            t.max_prob_during_hold = round(prob, 4)
+        if prob < t.min_prob_during_hold:
+            t.min_prob_during_hold = round(prob, 4)
         if sell_price > 0:
-            if sell_price > self._current_trade["max_sell_price_seen"]:
-                self._current_trade["max_sell_price_seen"] = round(sell_price, 4)
-            if sell_price < self._current_trade["min_sell_price_seen"]:
-                self._current_trade["min_sell_price_seen"] = round(sell_price, 4)
+            if sell_price > t.max_sell_price_seen:
+                t.max_sell_price_seen = round(sell_price, 4)
+            if sell_price < t.min_sell_price_seen:
+                t.min_sell_price_seen = round(sell_price, 4)
 
-    def log_trade_exit(
+    def log_hold_tick(
         self,
-        exit_type: str,
-        exit_price: float,
-        exit_shares_sold: float,
-        exit_revenue: float,
-        residual_shares: float,
-        latency_ms: float = 0.0,
+        seconds_remaining: float,
+        btc_price: float,
+        btc_delta_pct: float,
+        prob: float,
+        sell_price: float,
+        unrealized_pnl: float,
+        return_pct: float,
     ):
-        if not self._current_trade:
+        """Log one position-check tick to hold_ticks.csv (~every 3s)."""
+        if not self._active_trade:
             return
-        self._current_trade["exit_type"] = exit_type
-        self._current_trade["exit_price"] = round(exit_price, 4)
-        self._current_trade["exit_shares_sold"] = round(exit_shares_sold, 1)
-        self._current_trade["exit_revenue"] = round(exit_revenue, 2)
-        self._current_trade["residual_shares"] = round(residual_shares, 1)
-        self._current_trade["residual_value"] = round(residual_shares * exit_price, 2)
-        self._current_trade["exit_latency_ms"] = round(latency_ms, 0)
+        row = {
+            "timestamp": time.time(),
+            "trade_id": self._active_trade.trade_id,
+            "window_ts": self._active_trade.window_ts,
+            "seconds_remaining": round(seconds_remaining, 1),
+            "btc_price": round(btc_price, 2),
+            "btc_delta_pct": round(btc_delta_pct, 4),
+            "prob": round(prob, 4),
+            "sell_price": round(sell_price, 4),
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "return_pct": round(return_pct, 4),
+        }
+        self._append_row(self._tick_path, row, HOLD_TICK_FIELDS)
 
-    def log_trade_resolve(
+    def close_trade(
         self,
         btc_final_price: float,
         opening_price: float,
         won: bool,
-        profit: float,
         exit_revenue: float = 0.0,
+        claim_revenue: float = 0.0,
+        remaining_shares: float = 0.0,
         resolution_method: str = "binance_fallback",
         claim_result: str = "not_attempted",
-    ):
-        if not self._current_trade:
-            return
+    ) -> dict:
+        """Close the active trade, compute profit, write CSV row.
 
-        entry_cost = self._current_trade.get("entry_cost", 0)
-        entry_shares = self._current_trade.get("entry_shares", 0)
-        entry_price = self._current_trade.get("entry_price", 0)
-        side = self._current_trade.get("side", "")
+        Profit computation (centralized here — bot.py no longer computes):
+          - Exited early:  profit = exit_revenue - entry_cost
+          - Won + claimed: profit = exit_revenue + claim_revenue - entry_cost
+          - Won + unclaimed: profit = exit_revenue + remaining_shares * $1 - entry_cost
+          - Lost: profit = exit_revenue - entry_cost
 
+        Returns {"profit", "won", "return_pct"} so bot.py can use the
+        values for stats/alerts without recomputing.
+        """
+        if not self._active_trade:
+            return {"profit": 0.0, "won": won, "return_pct": 0.0}
+
+        t = self._active_trade
+        entry_cost = t.entry_cost
+        entry_shares = t.entry_shares
+        shares_at_resolution = remaining_shares if remaining_shares > 0 else entry_shares
+
+        # ── Compute profit ────────────────────────────────────────
+        if resolution_method == "exited":
+            # Sold before resolution — profit is just exit proceeds
+            profit = exit_revenue - entry_cost
+            won = profit > 0
+            resolution_payout = 0.0
+        elif won:
+            resolution_payout = shares_at_resolution * 1.0
+            if claim_revenue > 0:
+                profit = exit_revenue + claim_revenue - entry_cost
+            else:
+                profit = exit_revenue + resolution_payout - entry_cost
+        else:
+            resolution_payout = 0.0
+            profit = exit_revenue - entry_cost
+
+        return_pct = (profit / entry_cost * 100) if entry_cost > 0 else 0.0
         btc_delta = ((btc_final_price - opening_price) / opening_price * 100) if opening_price > 0 else 0
-        resolution_payout = entry_shares * 1.0 if won else 0.0
-        profit_if_held = resolution_payout - entry_cost
-
-        self._current_trade["btc_final_price"] = round(btc_final_price, 2)
-        self._current_trade["btc_final_delta_pct"] = round(btc_delta, 4)
-        self._current_trade["won_resolution"] = won
-        self._current_trade["resolution_payout"] = round(resolution_payout, 2)
-        self._current_trade["resolution_method"] = resolution_method
-        self._current_trade["claim_result"] = claim_result
-        self._current_trade["profit"] = round(profit, 2)
-        self._current_trade["return_pct"] = round(
-            (profit / entry_cost * 100) if entry_cost > 0 else 0, 2
-        )
-        self._current_trade["profit_if_held"] = round(profit_if_held, 2)
-
-        # Set defaults for missing exit fields (held to resolution)
-        if "exit_type" not in self._current_trade:
-            self._current_trade["exit_type"] = "resolution"
-            self._current_trade["exit_price"] = 0.0
-            self._current_trade["exit_shares_sold"] = 0.0
-            self._current_trade["exit_revenue"] = round(exit_revenue, 2)
-            self._current_trade["residual_shares"] = round(entry_shares, 1)
-            self._current_trade["residual_value"] = 0.0
-            self._current_trade["exit_latency_ms"] = 0
+        profit_if_held = (entry_shares * 1.0 - entry_cost) if won else -entry_cost
 
         # Fix min_sell_price sentinel
-        if self._current_trade.get("min_sell_price_seen", 999) >= 999:
-            self._current_trade["min_sell_price_seen"] = 0.0
+        min_sell = t.min_sell_price_seen if t.min_sell_price_seen < 999 else 0.0
 
-        # Write the complete trade record
-        self._append_row(self._trade_path, self._current_trade, TRADE_FIELDS)
-        self._current_trade = {}
+        # Build complete row: entry+hold from TradeRecord, exit+resolution computed here
+        row = asdict(t)
+        row["min_sell_price_seen"] = round(min_sell, 4)
+        row.update({
+            # Exit (defaults — bot.py doesn't currently track exit details to tracker)
+            "exit_type": "forced-exit" if resolution_method == "exited" else "hold-to-resolution",
+            "exit_price": 0.0,
+            "exit_shares_sold": 0.0,
+            "exit_revenue": round(exit_revenue, 2),
+            "residual_shares": round(shares_at_resolution, 1),
+            "residual_value": 0.0,
+            "exit_latency_ms": 0,
+            # Resolution
+            "btc_final_price": round(btc_final_price, 2),
+            "btc_final_delta_pct": round(btc_delta, 4),
+            "won_resolution": won,
+            "resolution_payout": round(resolution_payout, 2),
+            "resolution_method": resolution_method,
+            "claim_result": claim_result,
+            # P&L
+            "profit": round(profit, 2),
+            "return_pct": round(return_pct, 2),
+            "profit_if_held": round(profit_if_held, 2),
+        })
+
+        self._append_row(self._trade_path, row, TRADE_FIELDS)
+        self._active_trade = None
+
+        return {"profit": round(profit, 2), "won": won, "return_pct": round(return_pct, 2)}
 
     # ── Execution logging ───────────────────────────────────────────
 
