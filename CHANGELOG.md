@@ -6,6 +6,9 @@ Standard sections: **Strategy** (parameter/model/filter changes), **Bug fixes** 
 
 ## v16 — Data Collection Refactor
 
+### Dashboard
+- **Interactive dashboard**: `dashboard.py` — self-contained HTTP server (no external deps beyond stdlib) with Chart.js frontend. Equity curve, win rate by version, P&L waterfall, skipped signal analysis, recent trades table. Version filter buttons. Run with `python dashboard.py`.
+
 ### Infrastructure
 - **TradeRecord dataclass**: Replaced dict-based `_current_trade` in tracker.py with a typed `TradeRecord` dataclass. Entry and hold fields are populated during the trade lifecycle; exit and resolution fields are computed at close.
 - **Centralized profit computation**: `close_trade()` computes profit for all 5 resolution paths (exited, market_price, claim_sell, balance_check, binance_fallback). Bot.py no longer calculates profit — it uses the returned value from `close_trade()`.
