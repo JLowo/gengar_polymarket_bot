@@ -54,7 +54,11 @@ class OrderResult:
 
 
 def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
-    """Integer shares × price = clean 2-decimal USD amount."""
+    """Integer shares × price = clean 2-decimal USD amount.
+
+    If flooring to integer shares drops below POLY_MIN_NOTIONAL ($5),
+    round UP one share so the order isn't rejected.
+    """
     if price <= 0 or max_usd <= 0:
         return 0.0, 0.0
     price_cents = round(price * 100)
@@ -70,6 +74,12 @@ def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
 
     shares = int(max_shares)
     spend = shares * price_cents / 100.0
+
+    # If integer-share rounding dropped below $5 min, bump up one share
+    if spend < POLY_MIN_NOTIONAL and shares >= MIN_SHARES:
+        shares += 1
+        spend = shares * price_cents / 100.0
+
     if shares < MIN_SHARES:
         return 0.0, 0.0
     return float(shares), spend

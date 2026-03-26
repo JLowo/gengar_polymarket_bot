@@ -43,6 +43,8 @@ from telegram_notifier import TelegramNotifier
 from tracker import Tracker
 
 
+BOT_VERSION = "2026.03.26"
+
 FORCED_EXIT_START = 5
 FORCED_EXIT_END = 1
 POSITION_CHECK_INTERVAL = 3
@@ -476,6 +478,7 @@ class PolyBot:
                                 prob=0.0,
                                 btc_delta=self._pending_buy_delta,
                                 seconds_remaining=0.0,
+                                version=BOT_VERSION,
                             )
 
             self.stats.hourly.record_window(self._traded)
@@ -748,6 +751,7 @@ class PolyBot:
                 seconds_remaining=seconds_remaining,
                 entry_delta_pct=sig.btc_delta_pct,
                 entry_seconds_remaining=seconds_remaining,
+                version=BOT_VERSION,
             )
 
             mode = "PAPER" if self.dry_run else "LIVE"

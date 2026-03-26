@@ -79,6 +79,8 @@ TRADE_FIELDS = [
     # P&L
     "profit", "return_pct",
     "profit_if_held",           # What we'd have made holding to resolution
+    # Meta
+    "version",
 ]
 
 
@@ -109,6 +111,8 @@ class TradeRecord:
     min_prob_during_hold: float = 1.0
     max_sell_price_seen: float = 0.0
     min_sell_price_seen: float = 999.0
+    # Meta
+    version: str = ""
 
 
 # ── Execution record ────────────────────────────────────────────────
@@ -263,6 +267,7 @@ class Tracker:
         latency_ms: float = 0.0,
         entry_delta_pct: float = 0.0,
         entry_seconds_remaining: float = 0.0,
+        version: str = "",
     ):
         """Record trade entry. Creates a TradeRecord that tracks hold-period stats."""
         self._trade_counter += 1
@@ -284,6 +289,7 @@ class Tracker:
             entry_seconds_remaining=round(entry_seconds_remaining, 1),
             max_prob_during_hold=round(prob, 4),
             min_prob_during_hold=round(prob, 4),
+            version=version,
         )
 
     def update_hold_stats(self, prob: float, sell_price: float):
@@ -524,6 +530,19 @@ class Tracker:
 
     def _ensure_headers(self, path: str, fields: list):
         if not os.path.exists(path):
+            with open(path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+            return
+
+        # Check if existing header matches current schema — if not, archive and recreate
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            existing_header = next(reader, None)
+        if existing_header and existing_header != fields:
+            archive = path.replace(".csv", "_pre_schema_change.csv")
+            os.rename(path, archive)
+            print(f"[tracker] Schema changed — archived {path} → {archive}")
             with open(path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader()
