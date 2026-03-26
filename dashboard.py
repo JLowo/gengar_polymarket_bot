@@ -494,7 +494,7 @@ function renderSkippedPie(skipped) {
 
 function renderTradesTable(trades) {
   const recent = trades.slice(-20).reverse();
-  let html = '<table><thead><tr><th>Time</th><th>Ver</th><th>Side</th><th>Entry</th><th>Cost</th><th>Shares</th><th>Result</th><th>Profit</th><th>Return</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Time</th><th>Ver</th><th>Side</th><th>BTC</th><th>Entry</th><th>Cost</th><th>Shares</th><th>Result</th><th>Profit</th><th>Return</th></tr></thead><tbody>';
   recent.forEach((t, i) => {
     const won = t.won_resolution === 'True';
     const profit = parseFloat(t.profit || 0);
@@ -503,10 +503,17 @@ function renderTradesTable(trades) {
     const wts = t.window_ts || '';
     const tid = t.trade_id || '';
     const vc = vColor(v);
+    const delta = parseFloat(t.btc_delta_at_entry || 0);
+    const deltaAbs = Math.abs(delta).toFixed(3);
+    const deltaArrow = delta >= 0 ? '\u2191' : '\u2193';
+    const deltaColor = delta >= 0 ? 'won' : 'lost';
+    const btcFinal = parseFloat(t.btc_final_price || 0);
+    const btcStr = btcFinal > 0 ? `$${(btcFinal/1000).toFixed(1)}k` : '';
     html += `<tr class="clickable" data-window-ts="${wts}" data-trade-id="${tid}" data-idx="${i}" onclick="showTradeDetail(this)">
       <td>${t.window_time || ''}</td>
       <td><span class="version-badge" style="background:${vc}33;color:${vc}">${v}</span></td>
       <td>${t.side}</td>
+      <td><span class="${deltaColor}">${deltaArrow}${deltaAbs}%</span> <span style="color:#666;font-size:11px">${btcStr}</span></td>
       <td>$${parseFloat(t.entry_price).toFixed(2)}</td>
       <td>$${parseFloat(t.entry_cost).toFixed(2)}</td>
       <td>${parseFloat(t.entry_shares).toFixed(0)}</td>
@@ -565,6 +572,7 @@ function showTradeDetail(row) {
   const labels = ticks.map(tk => `T-${parseFloat(tk.seconds_remaining).toFixed(0)}s`);
 
   chartsDiv.innerHTML = `
+    <div class="detail-chart full"><h5>BTC Price ($)</h5><canvas id="detailBtcPriceChart"></canvas></div>
     <div class="detail-chart"><h5>BTC Delta %</h5><canvas id="detailBtcChart"></canvas></div>
     <div class="detail-chart"><h5>Model Probability</h5><canvas id="detailProbChart"></canvas></div>
     <div class="detail-chart"><h5>Unrealized P&L ($)</h5><canvas id="detailPnlChart"></canvas></div>
@@ -579,6 +587,14 @@ function showTradeDetail(row) {
       y: { title: { display: true, text: yTitle } }
     },
     elements: { point: { radius: 2 }, line: { tension: 0.3 } }
+  });
+
+  // BTC Price
+  const btcPriceData = ticks.map(tk => parseFloat(tk.btc_price));
+  DETAIL_CHARTS.btcPrice = new Chart(document.getElementById('detailBtcPriceChart'), {
+    type: 'line',
+    data: { labels, datasets: [{ data: btcPriceData, borderColor: '#fb923c', borderWidth: 2, fill: false }] },
+    options: { ...lineOpts('BTC ($)'), scales: { ...lineOpts('BTC ($)').scales, y: { title: { display: true, text: 'BTC ($)' }, ticks: { callback: v => '$' + v.toLocaleString() } } } }
   });
 
   // BTC Delta %
