@@ -536,8 +536,8 @@ function showTradeDetail(row) {
   const windowTs = row.dataset.windowTs;
   const tradeId = row.dataset.tradeId;
 
-  // Find matching ticks — prefer trade_id match, fall back to window_ts
-  let ticks = ALL_HOLD_TICKS.filter(tk => tradeId && tk.trade_id === tradeId);
+  // Find matching ticks — match on both trade_id + window_ts (trade_id resets between sessions)
+  let ticks = ALL_HOLD_TICKS.filter(tk => tradeId && tk.trade_id === tradeId && tk.window_ts === windowTs);
   if (!ticks.length) {
     ticks = ALL_HOLD_TICKS.filter(tk => tk.window_ts === windowTs);
   }
