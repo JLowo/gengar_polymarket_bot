@@ -34,11 +34,12 @@ def get_all_trades():
     for row in load_csv(os.path.join(LOG_DIR, "trades_v14.csv")):
         row["version"] = "v14"
         trades.append(row)
-    # v15+
-    for row in load_csv(os.path.join(LOG_DIR, "trades.csv")):
-        v = row.get("version", "15")
-        row["version"] = f"v{v}" if not str(v).startswith("v") else v
-        trades.append(row)
+    # v15+ (includes schema migration archive if it exists)
+    for f in ["trades_pre_schema_change.csv", "trades.csv"]:
+        for row in load_csv(os.path.join(LOG_DIR, f)):
+            v = row.get("version", "15")
+            row["version"] = f"v{v}" if not str(v).startswith("v") else v
+            trades.append(row)
     trades.sort(key=lambda r: float(r.get("timestamp", 0)))
     return trades
 
@@ -519,7 +520,7 @@ function renderTradesTable(trades) {
     const btcOpenStr = btcOpen > 0 ? `$${btcOpen.toLocaleString(undefined, {maximumFractionDigits: 0})}` : '';
     const finalMove = finalDelta !== 0 ? `${finalDelta >= 0 ? '+' : ''}${finalDelta.toFixed(3)}%` : '';
     const finalColor = (t.side === 'UP' ? finalDelta >= 0 : finalDelta < 0) ? 'won' : 'lost';
-    const portTotal = cumBal[startIdx + (recent.length - 1 - i)] || startBankroll;
+    const portTotal = parseFloat(t.bankroll) || cumBal[startIdx + (recent.length - 1 - i)] || startBankroll;
     html += `<tr class="clickable" data-window-ts="${wts}" data-trade-id="${tid}" data-idx="${i}" onclick="showTradeDetail(this)">
       <td>${t.window_time || ''}</td>
       <td><span class="version-badge" style="background:${vc}33;color:${vc}">${v}</span></td>

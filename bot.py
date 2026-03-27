@@ -868,6 +868,7 @@ class PolyBot:
                 remaining_shares=remaining_shares,
                 resolution_method="market_price",
                 claim_result="skipped_losing",
+                bankroll=self.stats.bankroll,
             )
             profit = result["profit"]
             net_loss = abs(profit)
@@ -966,6 +967,7 @@ class PolyBot:
             remaining_shares=remaining_shares,
             resolution_method=resolution_method,
             claim_result=claim_result,
+            bankroll=self.stats.bankroll,
         )
         profit = result["profit"]
 
