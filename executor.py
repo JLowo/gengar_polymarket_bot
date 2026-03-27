@@ -260,7 +260,10 @@ class Executor:
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 1.0:
-                actual_shares = spent / market_price if market_price > 0 else 0
+                # Cap at intended cost — concurrent settlements can inflate delta
+                intended_cost = shares * market_price
+                spent = min(spent, intended_cost)
+                actual_shares = min(spent / market_price, shares) if market_price > 0 else 0
                 print(f"  👻 GHOST BUY: balance dropped ${spent:.2f} despite error")
                 return OrderResult(
                     success=True, order_id="ghost-buy",
@@ -290,7 +293,10 @@ class Executor:
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 0.50:
-                actual_shares = spent / price if price > 0 else shares
+                # Cap at intended cost — concurrent settlements can inflate delta
+                intended_cost = shares * price
+                spent = min(spent, intended_cost)
+                actual_shares = min(spent / price, shares) if price > 0 else shares
                 suffix = f" (attempt {attempt+1})" if attempt > 0 else ""
                 print(f"  ✓ Balance verified{suffix}: spent ${spent:.2f} "
                       f"(~{actual_shares:.0f} shares @ ${price:.3f})")
@@ -408,8 +414,10 @@ class Executor:
             received = balance_after - balance_before
 
             if received > 0.10:  # Got some USDC back
-                # Estimate shares sold from received amount
-                shares_sold = received / price if price > 0 else 0
+                # Cap at intended revenue — concurrent settlements can inflate delta
+                intended_revenue = sell_shares * price
+                received = min(received, intended_revenue)
+                shares_sold = min(received / price, sell_shares) if price > 0 else 0
                 shares_left = max(0, sell_shares - shares_sold)
 
                 status = FILLED if shares_left < 1 else PARTIAL
@@ -454,7 +462,10 @@ class Executor:
             balance_after = self.get_balance()
             received = balance_after - balance_before
             if received > 0.10:
-                shares_sold = received / price if price > 0 else 0
+                # Cap at intended revenue — concurrent settlements can inflate delta
+                intended_revenue = sell_shares * price
+                received = min(received, intended_revenue)
+                shares_sold = min(received / price, sell_shares) if price > 0 else 0
                 shares_left = max(0, sell_shares - shares_sold)
                 print(f"  👻 Ghost sell! Got ${received:.2f} despite error")
                 return OrderResult(

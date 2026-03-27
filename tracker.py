@@ -81,6 +81,7 @@ TRADE_FIELDS = [
     "profit_if_held",           # What we'd have made holding to resolution
     # Meta
     "version",
+    "bankroll",                 # Portfolio balance after this trade resolves
 ]
 
 
@@ -344,6 +345,7 @@ class Tracker:
         remaining_shares: float = 0.0,
         resolution_method: str = "binance_fallback",
         claim_result: str = "not_attempted",
+        bankroll: float = 0.0,
     ) -> dict:
         """Close the active trade, compute profit, write CSV row.
 
@@ -410,6 +412,7 @@ class Tracker:
             "profit": round(profit, 2),
             "return_pct": round(return_pct, 2),
             "profit_if_held": round(profit_if_held, 2),
+            "bankroll": round(bankroll, 2),
         })
 
         self._append_row(self._trade_path, row, TRADE_FIELDS)

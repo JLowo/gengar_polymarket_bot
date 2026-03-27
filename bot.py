@@ -452,8 +452,11 @@ class PolyBot:
                     if real_bal > 0 and self._balance_before_buy > 0:
                         spent = self._balance_before_buy - real_bal
                         if spent > 1.0:
+                            # Cap at intended cost — concurrent settlements can inflate delta
+                            intended_cost = self._pending_buy_shares * self._pending_buy_price if self._pending_buy_price > 0 else spent
+                            spent = min(spent, intended_cost)
                             # The buy DID go through — retroactively track it
-                            est_shares = spent / self._pending_buy_price if self._pending_buy_price > 0 else 0
+                            est_shares = min(spent / self._pending_buy_price, self._pending_buy_shares) if self._pending_buy_price > 0 else 0
                             print(f"\n  👻 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
                             print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
                                   f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
@@ -801,6 +804,7 @@ class PolyBot:
                 won=True,  # close_trade overrides based on profit for "exited"
                 exit_revenue=self._exit_revenue,
                 resolution_method="exited",
+                bankroll=self.stats.bankroll,
             )
             profit = result["profit"]
             won = result["won"]

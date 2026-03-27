@@ -493,8 +493,14 @@ function renderSkippedPie(skipped) {
 }
 
 function renderTradesTable(trades) {
+  // Compute running portfolio value across ALL trades (starting from $100 bankroll)
+  const startBankroll = 100;
+  let cumBal = [];
+  let running = startBankroll;
+  trades.forEach(t => { running += parseFloat(t.profit || 0); cumBal.push(running); });
+  const startIdx = Math.max(0, trades.length - 20);
   const recent = trades.slice(-20).reverse();
-  let html = '<table><thead><tr><th>Time</th><th>Ver</th><th>Side</th><th>BTC</th><th>Entry</th><th>Cost</th><th>Shares</th><th>Result</th><th>Profit</th><th>Return</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Time</th><th>Ver</th><th>Side</th><th>BTC Open</th><th>BTC Move</th><th>Entry</th><th>Cost</th><th>Shares</th><th>Result</th><th>Profit</th><th>Return</th><th>Portfolio</th></tr></thead><tbody>';
   recent.forEach((t, i) => {
     const won = t.won_resolution === 'True';
     const profit = parseFloat(t.profit || 0);
@@ -508,18 +514,25 @@ function renderTradesTable(trades) {
     const deltaArrow = delta >= 0 ? '\u2191' : '\u2193';
     const deltaColor = delta >= 0 ? 'won' : 'lost';
     const btcFinal = parseFloat(t.btc_final_price || 0);
-    const btcStr = btcFinal > 0 ? `$${(btcFinal/1000).toFixed(1)}k` : '';
+    const finalDelta = parseFloat(t.btc_final_delta_pct || 0);
+    const btcOpen = (btcFinal > 0 && finalDelta !== 0) ? btcFinal / (1 + finalDelta / 100) : 0;
+    const btcOpenStr = btcOpen > 0 ? `$${btcOpen.toLocaleString(undefined, {maximumFractionDigits: 0})}` : '';
+    const finalMove = finalDelta !== 0 ? `${finalDelta >= 0 ? '+' : ''}${finalDelta.toFixed(3)}%` : '';
+    const finalColor = (t.side === 'UP' ? finalDelta >= 0 : finalDelta < 0) ? 'won' : 'lost';
+    const portTotal = cumBal[startIdx + (recent.length - 1 - i)] || startBankroll;
     html += `<tr class="clickable" data-window-ts="${wts}" data-trade-id="${tid}" data-idx="${i}" onclick="showTradeDetail(this)">
       <td>${t.window_time || ''}</td>
       <td><span class="version-badge" style="background:${vc}33;color:${vc}">${v}</span></td>
       <td>${t.side}</td>
-      <td><span class="${deltaColor}">${deltaArrow}${deltaAbs}%</span> <span style="color:#666;font-size:11px">${btcStr}</span></td>
+      <td style="font-size:11px;color:#888">${btcOpenStr}</td>
+      <td><span class="${finalColor}">${finalMove}</span></td>
       <td>$${parseFloat(t.entry_price).toFixed(2)}</td>
       <td>$${parseFloat(t.entry_cost).toFixed(2)}</td>
       <td>${parseFloat(t.entry_shares).toFixed(0)}</td>
       <td class="${won ? 'won' : 'lost'}">${won ? 'WIN' : 'LOSS'}</td>
       <td class="${profit >= 0 ? 'won' : 'lost'}">$${profit >= 0 ? '+' : ''}${profit.toFixed(2)}</td>
       <td class="${ret >= 0 ? 'won' : 'lost'}">${ret >= 0 ? '+' : ''}${ret.toFixed(0)}%</td>
+      <td class="${portTotal >= startBankroll ? 'won' : 'lost'}" style="font-weight:600">$${portTotal.toFixed(2)}</td>
     </tr>`;
   });
   html += '</tbody></table>';
