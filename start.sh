@@ -11,7 +11,7 @@ SESSION_NAME="polybot"
 echo "🚀 PolyBot Startup"
 echo "══════════════════════════════════"
 
-# 1. Kill stale Tor processes
+# 1. Kill stale Tor processes and clear cached data
 echo "🧹 Cleaning up stale Tor processes..."
 if pgrep -x tor > /dev/null 2>&1; then
     sudo pkill tor 2>/dev/null || pkill -9 tor 2>/dev/null || echo "   ⚠️  Couldn't kill tor (may need sudo)"
@@ -20,6 +20,8 @@ if pgrep -x tor > /dev/null 2>&1; then
 else
     echo "   ✓ No stale Tor processes"
 fi
+rm -rf "$HOME/gengar_bot/.tor/data"
+echo "   ✓ Tor data cache cleared"
 
 # 2. Free port 9050 if occupied
 if lsof -i :9050 > /dev/null 2>&1; then
