@@ -5,9 +5,8 @@
 
 set -e
 
-PROJ_DIR="$HOME/gengar_bot/gengar_polybot/gengar_polybot"
+PROJ_DIR="$HOME/gengar_bot/gengar_polybot"
 SESSION_NAME="polybot"
-VENV_DIR="$PROJ_DIR/venv"
 
 echo "🚀 PolyBot Startup"
 echo "══════════════════════════════════"
@@ -44,7 +43,7 @@ fi
 # 4. Launch tmux with caffeinate + bot
 echo "🖥  Starting tmux session '$SESSION_NAME'..."
 tmux new-session -d -s "$SESSION_NAME" -c "$PROJ_DIR" \
-    "source $VENV_DIR/bin/activate && caffeinate -i python bot.py; echo '⚠️  Bot exited. Press enter to close.'; read"
+    "caffeinate -i python bot.py; echo '⚠️  Bot exited. Press enter to close.'; read"
 
 echo ""
 echo "══════════════════════════════════"
