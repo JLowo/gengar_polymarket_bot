@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+.DS_Store
+logs/
+charts/

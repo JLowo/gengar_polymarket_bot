@@ -43,6 +43,8 @@ from telegram_notifier import TelegramNotifier
 from tracker import Tracker
 
 
+BOT_VERSION = "2026.03.26"
+
 FORCED_EXIT_START = 5
 FORCED_EXIT_END = 1
 POSITION_CHECK_INTERVAL = 3
@@ -354,6 +356,17 @@ class PolyBot:
         unrealized_pnl = current_value - self._trade_cost
         return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
 
+        # Log tick to hold_ticks.csv for trajectory analysis
+        self.tracker.log_hold_tick(
+            seconds_remaining=seconds_remaining,
+            btc_price=btc_price,
+            btc_delta_pct=btc_delta_pct,
+            prob=our_prob,
+            sell_price=current_sell_price,
+            unrealized_pnl=unrealized_pnl,
+            return_pct=return_pct,
+        )
+
         # Status line (monitoring only — no exits)
         d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
         pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
@@ -439,8 +452,11 @@ class PolyBot:
                     if real_bal > 0 and self._balance_before_buy > 0:
                         spent = self._balance_before_buy - real_bal
                         if spent > 1.0:
+                            # Cap at intended cost — concurrent settlements can inflate delta
+                            intended_cost = self._pending_buy_shares * self._pending_buy_price if self._pending_buy_price > 0 else spent
+                            spent = min(spent, intended_cost)
                             # The buy DID go through — retroactively track it
-                            est_shares = spent / self._pending_buy_price if self._pending_buy_price > 0 else 0
+                            est_shares = min(spent / self._pending_buy_price, self._pending_buy_shares) if self._pending_buy_price > 0 else 0
                             print(f"\n  👻 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
                             print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
                                   f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
@@ -455,6 +471,18 @@ class PolyBot:
                             self._last_real_balance = real_bal
                             self.stats.hourly.record_trade(
                                 self._pending_buy_edge, self._pending_buy_delta)
+                            self.tracker.open_trade(
+                                window_ts=self._current_window,
+                                side=self._pending_buy_side,
+                                entry_price=self._pending_buy_price,
+                                entry_shares=est_shares,
+                                entry_cost=spent,
+                                edge=self._pending_buy_edge,
+                                prob=0.0,
+                                btc_delta=self._pending_buy_delta,
+                                seconds_remaining=0.0,
+                                version=BOT_VERSION,
+                            )
 
             self.stats.hourly.record_window(self._traded)
             if self._traded:
@@ -714,7 +742,7 @@ class PolyBot:
                 actual_edge=sig.true_prob - result.price,
                 fill_price=result.price,
             )
-            self.tracker.log_trade_entry(
+            self.tracker.open_trade(
                 window_ts=self._current_window,
                 side=sig.side,
                 entry_price=result.price,
@@ -726,6 +754,7 @@ class PolyBot:
                 seconds_remaining=seconds_remaining,
                 entry_delta_pct=sig.btc_delta_pct,
                 entry_seconds_remaining=seconds_remaining,
+                version=BOT_VERSION,
             )
 
             mode = "PAPER" if self.dry_run else "LIVE"
@@ -768,29 +797,30 @@ class PolyBot:
 
     def _resolve_previous_trade(self):
         if self._exited:
-            profit = self._exit_revenue - self._trade_cost
-            if profit > 0:
+            btc_price, _ = self.price_feed.get_price()
+            result = self.tracker.close_trade(
+                btc_final_price=btc_price,
+                opening_price=self._opening_price,
+                won=True,  # close_trade overrides based on profit for "exited"
+                exit_revenue=self._exit_revenue,
+                resolution_method="exited",
+                bankroll=self.stats.bankroll,
+            )
+            profit = result["profit"]
+            won = result["won"]
+            if won:
                 self.stats.record_win(profit)
             else:
                 self.stats.record_loss(abs(profit))
-            result_emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
+            result_emoji = "✅ WIN" if won else "❌ LOSS"
             residual_note = f" (~{self._residual_shares:.0f} residual)" if self._residual_shares >= 1 else ""
             print(f"  {result_emoji} (exited{residual_note}) ${profit:+.2f} | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
-            if profit > 0:
+            if won:
                 self.telegram.win_alert(profit, self.stats.total_pnl)
             else:
                 self.telegram.loss_alert(abs(profit), self.stats.total_pnl)
-            btc_price, _ = self.price_feed.get_price()
-            self.tracker.log_trade_resolve(
-                btc_final_price=btc_price,
-                opening_price=self._opening_price,
-                won=profit > 0,
-                profit=profit,
-                exit_revenue=self._exit_revenue,
-                resolution_method="exited",
-            )
             return
 
         original_cost = self._trade_cost
@@ -829,24 +859,25 @@ class PolyBot:
         # Short-circuit: if last observed sell price is below $0.50, market has
         # already priced these shares as worthless — skip the claim API call.
         if self._last_sell_price_seen > 0 and self._last_sell_price_seen < 0.50:
-            net_loss = original_cost - self._exit_revenue
-            profit = -net_loss
+            btc_price, _ = self.price_feed.get_price()
+            result = self.tracker.close_trade(
+                btc_final_price=btc_price,
+                opening_price=self._opening_price,
+                won=False,
+                exit_revenue=self._exit_revenue,
+                remaining_shares=remaining_shares,
+                resolution_method="market_price",
+                claim_result="skipped_losing",
+                bankroll=self.stats.bankroll,
+            )
+            profit = result["profit"]
+            net_loss = abs(profit)
             self.stats.record_loss(net_loss)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
             print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [market_price] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(net_loss, self.stats.total_pnl)
-            btc_price, _ = self.price_feed.get_price()
-            self.tracker.log_trade_resolve(
-                btc_final_price=btc_price,
-                opening_price=self._opening_price,
-                won=False,
-                profit=profit,
-                exit_revenue=self._exit_revenue,
-                resolution_method="market_price",
-                claim_result="skipped_losing",
-            )
             return
 
         if live_token and claim_notional >= 5.0:
@@ -936,15 +967,27 @@ class PolyBot:
         resolution_method: str, claim_revenue: float, claim_result: str = "not_attempted",
     ):
         """Apply win/loss to stats, print result, alert Telegram, log to tracker."""
+        # Bankroll adjustment for unclaimed wins (claimed wins already added by caller)
+        if won and claim_revenue <= 0:
+            resolution_payout = remaining_shares * 1.0
+            self.stats.bankroll += resolution_payout
+            self._unclaimed_winnings += resolution_payout
+
+        btc_price, _ = self.price_feed.get_price()
+        result = self.tracker.close_trade(
+            btc_final_price=btc_price,
+            opening_price=self._opening_price,
+            won=won,
+            exit_revenue=self._exit_revenue,
+            claim_revenue=claim_revenue,
+            remaining_shares=remaining_shares,
+            resolution_method=resolution_method,
+            claim_result=claim_result,
+            bankroll=self.stats.bankroll,
+        )
+        profit = result["profit"]
+
         if won:
-            if claim_revenue > 0:
-                total_received = self._exit_revenue + claim_revenue
-            else:
-                resolution_payout = remaining_shares * 1.0
-                total_received = self._exit_revenue + resolution_payout
-                self.stats.bankroll += resolution_payout
-                self._unclaimed_winnings += resolution_payout
-            profit = total_received - original_cost
             self.stats.record_win(profit)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
             claimed_note = " (claimed)" if claim_revenue > 0 else " (unclaimed)"
@@ -953,25 +996,13 @@ class PolyBot:
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.win_alert(profit, self.stats.total_pnl)
         else:
-            net_loss = original_cost - self._exit_revenue
-            profit = -net_loss
+            net_loss = abs(profit)
             self.stats.record_loss(net_loss)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
             print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.loss_alert(net_loss, self.stats.total_pnl)
-
-        btc_price, _ = self.price_feed.get_price()
-        self.tracker.log_trade_resolve(
-            btc_final_price=btc_price,
-            opening_price=self._opening_price,
-            won=won,
-            profit=profit,
-            exit_revenue=self._exit_revenue,
-            resolution_method=resolution_method,
-            claim_result=claim_result,
-        )
 
     # ── Hourly + shutdown ───────────────────────────────────────────
 
