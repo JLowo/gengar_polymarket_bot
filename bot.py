@@ -851,17 +851,33 @@ class PolyBot:
 
         if live_token and claim_notional >= 5.0:
             print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
+            pre_sell_balance = self.executor.get_balance()
             claim = self.executor.sell(
                 token_id=self._trade_token_id,
                 shares=remaining_shares,
                 price=0.99,
             )
             if claim.success and claim.amount_usd > remaining_shares * 0.50:
-                # Got meaningful USDC back → shares had value → won
-                won = True
-                claim_revenue = claim.amount_usd
-                claim_result = "filled"
-                self.stats.bankroll += claim_revenue
+                # API says success — verify with balance check to catch phantom fills
+                time.sleep(2)
+                post_sell_balance = self.executor.get_balance()
+                balance_increase = post_sell_balance - pre_sell_balance if (
+                    pre_sell_balance > 0 and post_sell_balance > 0
+                ) else claim.amount_usd  # fallback: trust API if balance check fails
+                expected_revenue = remaining_shares * 0.99
+                if balance_increase > expected_revenue * 0.50:
+                    # Balance confirmed — real fill
+                    won = True
+                    claim_revenue = claim.amount_usd
+                    claim_result = "filled"
+                    self.stats.bankroll += claim_revenue
+                else:
+                    # API said success but no USDC arrived — phantom sell
+                    print(f"  ⚠️  Phantom sell detected "
+                          f"(api=${claim.amount_usd:.2f}, balance_increase=${balance_increase:.2f})"
+                          f" — recording as loss")
+                    won = False
+                    claim_result = "phantom_detected"
             elif "no match" in claim.error.lower() or (
                 claim.success and claim.amount_usd < remaining_shares * 0.10
             ):
