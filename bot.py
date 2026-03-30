@@ -117,6 +117,10 @@ class PolyBot:
         self._exit_gave_up: bool = False
         self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
 
+        # Pending phantom verification (claim sell reported success but balance didn't move yet)
+        # Resolved at next window boundary once Polygon settlement has had time to land.
+        self._pending_phantom: dict = {}
+
         # Pending buy (unverified — Polygon settlement too slow)
         self._pending_buy_side: str = ""
         self._pending_buy_price: float = 0.0
@@ -426,6 +430,60 @@ class PolyBot:
 
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
         if self._current_window > 0:
+            # Resolve any pending phantom sell from the previous window.
+            # Must run before trade state is reset below.
+            # Balance is fetched once here and reused by the sync below.
+            if self._pending_phantom:
+                pp = self._pending_phantom
+                if not self.dry_run and self.executor._initialized:
+                    real_bal = self.executor.get_balance()
+                    if real_bal > 0:
+                        balance_increase = max(0.0, real_bal - pp["pre_sell_balance"])
+                        if balance_increase > pp["expected_revenue"] * 0.50:
+                            # Settlement landed — it was a real win
+                            profit = balance_increase - pp["cost"]
+                            self.stats.record_win(profit)
+                            self.stats.bankroll = real_bal
+                            self._last_real_balance = real_bal
+                            print(f"  ✅ Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
+                                  f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
+                            self.telegram.win_alert(profit, self.stats.total_pnl)
+                            btc_price, _ = self.price_feed.get_price()
+                            self.tracker.log_trade_resolve(
+                                btc_final_price=btc_price,
+                                opening_price=pp["opening_price"],
+                                won=True,
+                                profit=profit,
+                                exit_revenue=pp["exit_revenue"],
+                                resolution_method="phantom_resolved",
+                                claim_result="phantom_resolved",
+                            )
+                        else:
+                            # Balance still hasn't moved — genuine loss
+                            net_loss = pp["cost"] - pp["exit_revenue"]
+                            self.stats.record_loss(net_loss)
+                            self.stats.bankroll = real_bal
+                            self._last_real_balance = real_bal
+                            print(f"  ❌ Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
+                                  f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
+                            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+                            btc_price, _ = self.price_feed.get_price()
+                            self.tracker.log_trade_resolve(
+                                btc_final_price=btc_price,
+                                opening_price=pp["opening_price"],
+                                won=False,
+                                profit=-net_loss,
+                                exit_revenue=pp["exit_revenue"],
+                                resolution_method="phantom_confirmed",
+                                claim_result="phantom_confirmed",
+                            )
+                        self._pending_phantom = {}
+                else:
+                    # Dry run or executor not ready — treat as loss
+                    net_loss = pp["cost"] - pp["exit_revenue"]
+                    self.stats.record_loss(net_loss)
+                    self._pending_phantom = {}
+
             # Record closing delta for rolling vol calculation
             if self._opening_price > 0 and closing_btc_price > 0:
                 closing_delta = abs((closing_btc_price - self._opening_price) / self._opening_price * 100)
@@ -872,12 +930,26 @@ class PolyBot:
                     claim_result = "filled"
                     self.stats.bankroll += claim_revenue
                 else:
-                    # API said success but no USDC arrived — phantom sell
-                    print(f"  ⚠️  Phantom sell detected "
+                    # API said success but no USDC arrived yet — defer to next
+                    # window boundary. Polygon settlement takes 5-15s; the 2s
+                    # wait is too short. Store state and let balance sync confirm.
+                    print(f"  ⏳ Possible phantom sell "
                           f"(api=${claim.amount_usd:.2f}, balance_increase=${balance_increase:.2f})"
-                          f" — recording as loss")
-                    won = False
-                    claim_result = "phantom_detected"
+                          f" — deferring to next window balance sync")
+                    self._pending_phantom = {
+                        "pre_sell_balance": pre_sell_balance,
+                        "expected_revenue": remaining_shares * 0.99,
+                        "cost": original_cost,
+                        "exit_revenue": self._exit_revenue,
+                        "shares": remaining_shares,
+                        "side": self._trade_side,
+                        "token_id": self._trade_token_id,
+                        "window_ts": self._current_window,
+                        "opening_price": self._opening_price,
+                    }
+                    # Don't record win or loss — don't update bankroll.
+                    # Window boundary sync will set bankroll to real balance.
+                    return
             elif "no match" in claim.error.lower() or (
                 claim.success and claim.amount_usd < remaining_shares * 0.10
             ):
