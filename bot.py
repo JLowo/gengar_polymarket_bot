@@ -907,6 +907,7 @@ class PolyBot:
             )
             return
 
+        pre_sell_balance = 0.0
         if live_token and claim_notional >= 5.0:
             print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
             pre_sell_balance = self.executor.get_balance()
@@ -919,77 +920,84 @@ class PolyBot:
                 # API says success — verify with balance check to catch phantom fills
                 time.sleep(2)
                 post_sell_balance = self.executor.get_balance()
-                balance_increase = post_sell_balance - pre_sell_balance if (
+                balance_increase = max(0.0, post_sell_balance - pre_sell_balance) if (
                     pre_sell_balance > 0 and post_sell_balance > 0
-                ) else claim.amount_usd  # fallback: trust API if balance check fails
-                expected_revenue = remaining_shares * 0.99
-                if balance_increase > expected_revenue * 0.50:
+                ) else claim.amount_usd
+                if balance_increase > remaining_shares * 0.99 * 0.50:
                     # Balance confirmed — real fill
                     won = True
                     claim_revenue = claim.amount_usd
                     claim_result = "filled"
                     self.stats.bankroll += claim_revenue
                 else:
-                    # API said success but no USDC arrived yet — defer to next
-                    # window boundary. Polygon settlement takes 5-15s; the 2s
-                    # wait is too short. Store state and let balance sync confirm.
+                    # API said success but no USDC arrived yet — defer to next window
                     print(f"  ⏳ Possible phantom sell "
                           f"(api=${claim.amount_usd:.2f}, balance_increase=${balance_increase:.2f})"
                           f" — deferring to next window balance sync")
-                    self._pending_phantom = {
-                        "pre_sell_balance": pre_sell_balance,
-                        "expected_revenue": remaining_shares * 0.99,
-                        "cost": original_cost,
-                        "exit_revenue": self._exit_revenue,
-                        "shares": remaining_shares,
-                        "side": self._trade_side,
-                        "token_id": self._trade_token_id,
-                        "window_ts": self._current_window,
-                        "opening_price": self._opening_price,
-                    }
-                    # Don't record win or loss — don't update bankroll.
-                    # Window boundary sync will set bankroll to real balance.
-                    return
             elif "no match" in claim.error.lower() or (
                 claim.success and claim.amount_usd < remaining_shares * 0.10
             ):
-                # No buyers for these shares → resolved against us → lost
+                # No buyers for these shares → shares worthless → definitive loss
                 won = False
                 claim_result = "no_match"
-            else:
-                # Network error or ambiguous result — fall back to balance check
-                print(f"  ⚠️  Claim inconclusive ({claim.error}) — falling back to balance check")
-                claim_result = "inconclusive"
-                resolution_method = "balance_check"
+            elif "not enough balance" in claim.error.lower():
+                # Tracked share count is slightly above on-chain balance (rounding).
+                # Retry with one fewer share to clear the discrepancy.
+                retry_shares = int(remaining_shares) - 1
+                print(f"  🔄 Rounding fix: retrying claim with {retry_shares} shares...")
+                if retry_shares > 0 and float(retry_shares) * 0.99 >= 5.0:
+                    retry = self.executor.sell(
+                        token_id=self._trade_token_id,
+                        shares=float(retry_shares),
+                        price=0.99,
+                    )
+                    if retry.success and retry.amount_usd > retry_shares * 0.50:
+                        time.sleep(2)
+                        post_bal = self.executor.get_balance()
+                        balance_increase = max(0.0, post_bal - pre_sell_balance)
+                        if balance_increase > float(retry_shares) * 0.99 * 0.50:
+                            won = True
+                            claim_revenue = retry.amount_usd
+                            claim_result = "filled"
+                            self.stats.bankroll += claim_revenue
+                        # else: retry succeeded but balance unconfirmed — fall to defer
+                # else: retry failed or too small — fall to defer (won still None)
+            # else: any other error — fall to defer (won still None)
         else:
-            # Below $5 notional or no valid token — use balance check
-            resolution_method = "balance_check"
             if live_token and claim_notional < 5.0:
-                print(f"  💰 {remaining_shares:.0f} shares below $5 min — using balance check")
+                print(f"  💰 {remaining_shares:.0f} shares below $5 min — deferring to auto-resolution")
 
-        # ── Balance-based fallback ────────────────────────────────────
-        if won is None and self.executor._initialized:
-            time.sleep(4)  # Wait for auto-resolution to settle on-chain
-            current_balance = self.executor.get_balance()
-            if current_balance > 0 and self._last_real_balance > 0:
-                # self._last_real_balance = balance at last window boundary (pre-trade)
-                # expected_if_lost = that balance minus what we spent
-                expected_if_lost = self._last_real_balance - original_cost
-                balance_delta = current_balance - expected_if_lost
-                won = balance_delta > (remaining_shares * 0.50)
-                print(f"  🔍 Balance check: expected_if_lost=${expected_if_lost:.2f} "
-                      f"actual=${current_balance:.2f} delta=${balance_delta:+.2f} "
-                      f"→ {'WON' if won else 'LOST'}")
-            else:
-                # Last resort: Binance price
-                resolution_method = "binance_fallback"
+        # ── Deferred fallback ────────────────────────────────────────
+        # The old balance check fired before auto-resolution settled on-chain.
+        # Any unresolved case is now deferred to the next window boundary
+        # (~5 min), where Polygon settlement is guaranteed to have landed.
+        if won is None:
+            if not live_token:
+                # No valid token/executor — Binance price as last resort
                 btc_price, _ = self.price_feed.get_price()
                 if self._opening_price > 0 and btc_price > 0:
                     won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
-                    print(f"  ⚠️  Balance unavailable — using Binance fallback")
+                    resolution_method = "binance_fallback"
+                    print(f"  ⚠️  No live token — using Binance fallback")
                 else:
                     print(f"  ⚠️  Cannot determine resolution outcome — skipping")
                     return
+            else:
+                if pre_sell_balance <= 0:
+                    pre_sell_balance = self.executor.get_balance()
+                print(f"  ⏳ Resolution deferred to next window balance sync")
+                self._pending_phantom = {
+                    "pre_sell_balance": pre_sell_balance,
+                    "expected_revenue": remaining_shares * 0.99,
+                    "cost": original_cost,
+                    "exit_revenue": self._exit_revenue,
+                    "shares": remaining_shares,
+                    "side": self._trade_side,
+                    "token_id": self._trade_token_id,
+                    "window_ts": self._current_window,
+                    "opening_price": self._opening_price,
+                }
+                return
 
         if won is None:
             return
