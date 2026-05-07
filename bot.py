@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PolyBot v13 — Recalibrated + Safety Systems
+PolyBot v14 — CLOBv2 + Safety Systems
 
 Strategy:
   - Brownian motion model with vol=0.12 (recalibrated from 0.08)
@@ -164,7 +164,7 @@ class PolyBot:
         mp = self.strategy_config.min_prob
         me = self.strategy_config.min_edge
         print("=" * 55)
-        print(f"  PolyBot v13 — Recalibrated (vol=0.12)")
+        print(f"  PolyBot v14 — CLOBv2 (vol=0.12)")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
@@ -1097,6 +1097,7 @@ class PolyBot:
         self.price_feed.stop()
         if self.executor._initialized:
             self.executor.cancel_all()
+            self.executor.shutdown()
 
         # Final real balance sync
         if not self.dry_run and self.executor._initialized:

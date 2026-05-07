@@ -12,19 +12,22 @@ balance snapshot before/after. Unverified buys are never cancelled —
 the bot detects them via balance sync at the next window boundary.
 """
 
+import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
     OrderArgs,
     MarketOrderArgs,
     OrderType,
     BalanceAllowanceParams,
     AssetType,
+    OrderPayload,
 )
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.constants import POLYGON
 
 
 FILLED = "FILLED"
@@ -82,25 +85,49 @@ class Executor:
         self.safe_address = safe_address
         self.client: Optional[ClobClient] = None
         self._initialized = False
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
 
     def initialize(self) -> bool:
         try:
+            host = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
             self.client = ClobClient(
-                host="https://clob.polymarket.com",
+                host=host,
                 key=self.private_key,
                 chain_id=POLYGON,
                 funder=self.safe_address if self.safe_address else None,
                 signature_type=2 if self.safe_address else 0,
             )
-            self.client.set_api_creds(self.client.create_or_derive_api_creds())
+            self.client.set_api_creds(self.client.create_or_derive_api_key())
             self._initialized = True
             print(f"[executor] Initialized ({'DRY RUN' if self.dry_run else 'LIVE'})")
             print(f"[executor] Max buy price: ${MAX_BUY_PRICE:.2f}")
             print(f"[executor] Address: {self.client.get_address()}")
+            if not self.dry_run:
+                self._start_heartbeat()
             return True
         except Exception as e:
             print(f"[executor] Init failed: {e}")
             return False
+
+    def _start_heartbeat(self):
+        """Send heartbeat every 8s — CLOB v2 cancels GTC orders after 10s without one."""
+        def _run():
+            while not self._heartbeat_stop.is_set():
+                try:
+                    self.client.post_heartbeat()
+                except Exception as e:
+                    print(f"[executor] Heartbeat failed: {e}")
+                self._heartbeat_stop.wait(8)
+        self._heartbeat_thread = threading.Thread(target=_run, daemon=True)
+        self._heartbeat_thread.start()
+        print("[executor] Heartbeat started (8s interval)")
+
+    def shutdown(self):
+        """Stop heartbeat thread cleanly."""
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=5)
 
     def get_balance(self) -> float:
         if not self._initialized:
@@ -108,7 +135,8 @@ class Executor:
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             bal = self.client.get_balance_allowance(params)
-            return float(bal.get("balance", 0)) / 1e6
+            balance_raw = bal.get("balance") or bal.get("pUSD") or 0
+            return float(balance_raw) / 1e6
         except Exception as e:
             print(f"[executor] Balance check failed: {e}")
             return 0.0
@@ -228,7 +256,7 @@ class Executor:
             signed_order = self.client.create_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
 
-            order_id = result.get("orderID", "")
+            order_id = result.get("orderID") or result.get("transactionID", "")
             if not order_id:
                 return OrderResult(
                     success=False, status=REJECTED,
@@ -388,7 +416,7 @@ class Executor:
 
             signed_order = self.client.create_market_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
-            order_id = result.get("orderID", "")
+            order_id = result.get("orderID") or result.get("transactionID", "")
 
             # Wait for settlement
             time.sleep(2)
@@ -489,7 +517,7 @@ class Executor:
         if self.dry_run or not self._initialized:
             return True
         try:
-            self.client.cancel(order_id=order_id)
+            self.client.cancel_order(OrderPayload(orderID=order_id))
             return True
         except Exception as e:
             print(f"[executor] Cancel failed: {e}")

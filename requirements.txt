@@ -1,4 +1,4 @@
-py-clob-client>=0.34.5
+py-clob-client-v2>=1.0.0
 python-dotenv>=1.0.0
 websockets>=12.0
 aiohttp>=3.9.0
