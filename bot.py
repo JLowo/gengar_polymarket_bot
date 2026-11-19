@@ -1076,8 +1076,10 @@ class PolyBot:
         payout = p["shares"] * per_share
         profit = p["exit_revenue"] + payout - p["cost"]
         if payout > 0 and self.dry_run:
-            # Paper payout. Live cash shows up via the window-boundary balance sync.
+            # Paper payout, counted as unclaimed like the old dry-run path did.
+            # Live cash shows up via the window-boundary balance sync.
             self.stats.bankroll += payout
+            self._unclaimed_winnings += payout
         if profit > 0:
             self.stats.record_win(profit)
             self.telegram.win_alert(profit, self.stats.total_pnl)
