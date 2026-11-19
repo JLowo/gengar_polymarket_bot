@@ -152,20 +152,19 @@ class Executor:
                 error=f"Amount ${amount_usd:.2f} below min", side="BUY",
             )
 
-        if self.dry_run:
-            sim_price = 0.55
-            return OrderResult(
-                success=True, order_id=f"DRY-{int(time.time())}",
-                status=FILLED, side="BUY", price=sim_price,
-                amount_usd=amount_usd, shares=amount_usd / sim_price,
-                token_id=token_id[:16] + "...", dry_run=True,
-            )
-
-        if not self._initialized:
+        if not self.dry_run and not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
+        # Dry run fills on paper at the real order-book price the caller
+        # passes in, sized exactly like a live order below (no flat $0.55).
         if price > 0:
             market_price = round(price, 2)
+        elif self.dry_run:
+            return OrderResult(
+                success=False, status=FAILED,
+                error="No market price for paper fill", side="BUY",
+                token_id=token_id[:16] + "...",
+            )
         else:
             market_price = self.get_market_price(token_id, "BUY", amount_usd)
             if market_price <= 0:
@@ -210,6 +209,14 @@ class Executor:
 
         print(f"  📊 Market price: ${market_price:.3f}/share "
               f"→ {int(shares)} shares for ${clean_amount:.2f}")
+
+        if self.dry_run:
+            return OrderResult(
+                success=True, order_id=f"DRY-{int(time.time())}",
+                status=FILLED, side="BUY", price=market_price,
+                amount_usd=clean_amount, shares=shares,
+                token_id=token_id[:16] + "...", dry_run=True,
+            )
 
         # Snapshot balance BEFORE buy
         balance_before = self.get_balance()

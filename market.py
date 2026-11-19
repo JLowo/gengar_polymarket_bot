@@ -164,6 +164,41 @@ def get_current_market(period_minutes: int = 5) -> Optional[MarketWindow]:
     )
 
 
+CLOB_API = "https://clob.polymarket.com"
+
+
+def get_book_price(token_id: str, side: str, amount: float) -> float:
+    """Price to BUY `amount` USD of a token, or to SELL `amount` shares of it,
+    from Polymarket's public order book (read-only, no wallet needed).
+
+    Walks the book from the best level until `amount` is covered, the same
+    rule py-clob-client's calculate_market_price() uses, so dry run sees the
+    price live mode would. If the book is too thin it returns the worst level
+    (as the SDK does for non-FOK orders). Returns 0.0 if there is no book.
+    """
+    try:
+        url = f"{CLOB_API}/book?token_id={token_id}"
+        req = urllib.request.Request(url, headers={"User-Agent": "PolyBot/1.0"})
+        book = json.loads(urllib.request.urlopen(req, timeout=5).read().decode())
+    except Exception:
+        return 0.0
+    try:
+        if side == "BUY":
+            levels = sorted(book.get("asks") or [], key=lambda lv: float(lv["price"]))
+            covered = lambda lv: float(lv["size"]) * float(lv["price"])   # USD
+        else:
+            levels = sorted(book.get("bids") or [], key=lambda lv: -float(lv["price"]))
+            covered = lambda lv: float(lv["size"])                         # shares
+        total = 0.0
+        for lv in levels:
+            total += covered(lv)
+            if total >= amount:
+                return float(lv["price"])
+        return float(levels[-1]["price"]) if levels else 0.0
+    except (KeyError, ValueError, TypeError):
+        return 0.0
+
+
 def get_resolved_side(window_ts: int, period_minutes: int = 5) -> Optional[str]:
     """Winning side of a finished window according to Polymarket itself.
 

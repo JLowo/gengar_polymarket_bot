@@ -34,7 +34,8 @@ from dotenv import load_dotenv
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from market import get_current_market, current_window_ts, get_resolved_side, PERIOD_SECONDS
+from market import (get_current_market, current_window_ts, get_resolved_side,
+                    get_book_price, PERIOD_SECONDS)
 from price_feed import BinancePriceFeed
 from strategy import evaluate, estimate_true_probability, get_skip_reason, StrategyConfig, TradingStats
 from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE
@@ -369,7 +370,7 @@ class PolyBot:
 
         # Get current sell price (for tracking only)
         if self.dry_run:
-            current_sell_price = round(max(our_prob, 0.01), 2)
+            current_sell_price = get_book_price(self._trade_token_id, "SELL", self._trade_shares)
         else:
             sell_probe = round(self._trade_shares * self._trade_price, 2)
             current_sell_price = self.executor.get_market_price(
@@ -597,16 +598,8 @@ class PolyBot:
         return self._vol_fallback
 
     def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
-        if self.dry_run or not self.executor._initialized:
-            if self._opening_price <= 0:
-                return 0.50, 0.50
-            delta_pct = (btc_price - self._opening_price) / self._opening_price
-            time_factor = 1 - (seconds_remaining / PERIOD_SECONDS[self.period])
-            lag_factor = min(time_factor * 0.7, 0.85)
-            implied = 0.5 + lag_factor * math.tanh(delta_pct * 500) * 0.45
-            up = round(min(max(implied, 0.02), 0.98), 3)
-            return up, round(1.0 - up, 3)
-
+        # Dry run reads the same real order book as live (public, read-only),
+        # instead of the old synthetic price model, so paper trades are realistic.
         now = time.time()
         if now - self._price_last_fetched < self._PRICE_REFRESH:
             return self._cached_up, self._cached_down
@@ -617,8 +610,8 @@ class PolyBot:
                 return self._cached_up, self._cached_down
 
             probe_amount = 5.0
-            up_price = self.executor.get_market_price(market.token_id_up, "BUY", probe_amount)
-            down_price = self.executor.get_market_price(market.token_id_down, "BUY", probe_amount)
+            up_price = self._buy_price(market.token_id_up, probe_amount)
+            down_price = self._buy_price(market.token_id_down, probe_amount)
 
             if up_price <= 0 and down_price <= 0:
                 return self._cached_up, self._cached_down
@@ -636,6 +629,13 @@ class PolyBot:
         except Exception as e:
             print(f"[price] Error: {e}")
             return self._cached_up, self._cached_down
+
+    def _buy_price(self, token_id: str, amount_usd: float) -> float:
+        """Price to buy amount_usd of a token: via the executor when trading
+        live, from the public order book in dry run (same book-walk rule)."""
+        if self.dry_run or not self.executor._initialized:
+            return get_book_price(token_id, "BUY", amount_usd)
+        return self.executor.get_market_price(token_id, "BUY", amount_usd)
 
     # ── Entry ───────────────────────────────────────────────────────
 
@@ -676,12 +676,11 @@ class PolyBot:
             self.telegram.status_update({"alert": msg})
             return
 
-        market = get_current_market(self.period) if not self.dry_run else None
-        token_id = ""
-        if market:
-            token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
-        else:
-            token_id = f"DRY-{sig.side}-{self._current_window}"
+        market = get_current_market(self.period)
+        if not market:
+            print(f"  ⚠️  {sig.side} signal, but this window's market wasn't found — skipping")
+            return
+        token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
 
         slug = f"btc-updown-{self.period}m-{self._current_window}"
         trade_amount = round(sig.kelly_size, 2)
@@ -693,8 +692,8 @@ class PolyBot:
         # Preview actual market price, re-check edge, then pass price into buy()
         # so executor skips a second fetch (saves one Tor roundtrip ~500ms)
         hint_price = 0.0
-        if not self.dry_run and self.executor._initialized:
-            actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
+        if self.dry_run or self.executor._initialized:
+            actual_price = self._buy_price(token_id, trade_amount)
             if actual_price > 0:
                 actual_edge = sig.true_prob - actual_price
                 print(f"  📊 Actual price: ${actual_price:.3f} (edge: {actual_edge:.3f})")
