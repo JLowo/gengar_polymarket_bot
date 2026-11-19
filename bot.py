@@ -146,6 +146,10 @@ class PolyBot:
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
 
+        # Every entry this session as (entry_price, edge, btc_delta_pct), for the
+        # session averages in sessions.csv (hourly stats reset each hour)
+        self._session_entries: list = []
+
         # Real balance tracking (source of truth)
         self._session_start_balance: float = 0.0
         self._last_real_balance: float = 0.0
@@ -491,6 +495,8 @@ class PolyBot:
                             self._last_real_balance = real_bal
                             self.stats.hourly.record_trade(
                                 self._pending_buy_edge, self._pending_buy_delta)
+                            self._session_entries.append(
+                                (self._pending_buy_price, self._pending_buy_edge, self._pending_buy_delta))
 
             self.stats.hourly.record_window(self._traded)
             if self._traded:
@@ -735,6 +741,7 @@ class PolyBot:
 
             self.stats.bankroll -= result.amount_usd
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
+            self._session_entries.append((result.price, sig.edge, sig.btc_delta_pct))
 
             btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
             self.tracker.log_signal(
@@ -1133,6 +1140,11 @@ class PolyBot:
             self.telegram.hourly_summary(h, o)
             self.stats.hourly.reset()
 
+    def _session_avg(self, field: int, absolute: bool = False) -> float:
+        """Mean of one field of this session's entries (0=price, 1=edge, 2=delta)."""
+        vals = [abs(e[field]) if absolute else e[field] for e in self._session_entries]
+        return sum(vals) / len(vals) if vals else 0.0
+
     def _handle_shutdown(self, signum, frame):
         print(f"\n\n🛑 Shutting down...")
         self._running = False
@@ -1175,9 +1187,9 @@ class PolyBot:
             trades=o["total_trades"],
             wins=o["wins"],
             losses=o["losses"],
-            avg_entry_price=self.stats.hourly.avg_edge,   # proxy via hourly stats
-            avg_edge=self.stats.hourly.avg_edge,
-            avg_delta=self.stats.hourly.avg_delta,
+            avg_entry_price=self._session_avg(0),
+            avg_edge=self._session_avg(1),
+            avg_delta=self._session_avg(2, absolute=True),
         )
 
         time.sleep(1)
