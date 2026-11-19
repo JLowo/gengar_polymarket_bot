@@ -1,26 +1,40 @@
 #!/bin/bash
 # PolyBot Startup Script
 # Handles: stale Tor, port conflicts, tmux, caffeinate
-# Usage: ./start.sh
+# Usage: ./start.sh   (works from any folder; paths come from this script's location)
 
 set -e
 
-PROJ_DIR="$HOME/gengar_bot/gengar_polybot"
+# The repo is the folder this script lives in. proxy.py keeps Tor's state one
+# level above the repo (<repo>/../.tor), so the Tor cache is cleared from there.
+PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOR_DIR="$(dirname "$PROJ_DIR")/.tor"
 SESSION_NAME="polybot"
 
 echo "🚀 PolyBot Startup"
 echo "══════════════════════════════════"
 
+# 0. The bot runs with the repo's own Python environment (.venv)
+if [ ! -x "$PROJ_DIR/.venv/bin/python" ]; then
+    echo "❌ No Python environment at $PROJ_DIR/.venv"
+    echo "   Create it from the repo folder with:"
+    echo "     uv venv --python 3.12 .venv"
+    echo "     uv pip install -r requirements.txt"
+    exit 1
+fi
+
 # 1. Kill stale Tor processes and clear cached data
+#    proxy.py starts Tor as you, so no sudo is needed. -x matches only processes
+#    named exactly "tor" (a bare "pkill tor" also hits system daemons like storagekitd).
 echo "🧹 Cleaning up stale Tor processes..."
 if pgrep -x tor > /dev/null 2>&1; then
-    sudo pkill tor 2>/dev/null || pkill -9 tor 2>/dev/null || echo "   ⚠️  Couldn't kill tor (may need sudo)"
+    pkill -x tor 2>/dev/null || echo "   ⚠️  Couldn't kill tor (it may belong to another user)"
     sleep 2
     echo "   ✓ Tor processes killed"
 else
     echo "   ✓ No stale Tor processes"
 fi
-rm -rf "$HOME/gengar_bot/.tor/data"
+rm -rf "$TOR_DIR/data"
 echo "   ✓ Tor data cache cleared"
 
 # 2. Free port 9050 if occupied
@@ -43,9 +57,11 @@ else
 fi
 
 # 4. Launch tmux with caffeinate + bot
+#    tmux starts in $PROJ_DIR, so the relative .venv path avoids quoting trouble
+#    when the folder name contains spaces.
 echo "🖥  Starting tmux session '$SESSION_NAME'..."
 tmux new-session -d -s "$SESSION_NAME" -c "$PROJ_DIR" \
-    "caffeinate -i python bot.py; echo '⚠️  Bot exited. Press enter to close.'; read"
+    "caffeinate -i .venv/bin/python bot.py; echo '⚠️  Bot exited. Press enter to close.'; read"
 
 echo ""
 echo "══════════════════════════════════"
