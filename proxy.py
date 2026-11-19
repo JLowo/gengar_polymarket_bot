@@ -292,14 +292,27 @@ def check_proxy(proxy_url: str) -> bool:
     """Quick connectivity check — verifies the proxy is reachable and working.
 
     Uses httpx (the library that will actually be proxied) for the check.
+    Succeeds only if a service actually reports our exit IP: an HTTP error
+    such as httpbin's frequent 429 for Tor exits is a failed check, not a pass.
     """
-    try:
-        import httpx
-        with httpx.Client(proxy=proxy_url, timeout=15) as client:
-            resp = client.get("https://httpbin.org/ip")
-            ip = resp.json().get("origin", "unknown")
-            logger.info(f"Proxy exit IP: {ip}")
-            return True
-    except Exception as e:
-        logger.error(f"Proxy check failed: {e}")
-        return False
+    import httpx
+    checks = [
+        ("https://check.torproject.org/api/ip", "IP"),   # also says whether it's Tor
+        ("https://httpbin.org/ip", "origin"),
+    ]
+    for url, ip_field in checks:
+        try:
+            with httpx.Client(proxy=proxy_url, timeout=15) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+            ip = data.get(ip_field)
+            if ip:
+                tor_note = f" (Tor: {data['IsTor']})" if "IsTor" in data else ""
+                logger.info(f"Proxy exit IP: {ip}{tor_note}")
+                return True
+            logger.warning(f"Proxy check via {url}: no IP in response")
+        except Exception as e:
+            logger.warning(f"Proxy check via {url} failed: {e}")
+    logger.error("Proxy check failed: no service reported an exit IP")
+    return False
