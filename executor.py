@@ -25,6 +25,7 @@ Winnings
 
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 import httpx
@@ -49,8 +50,10 @@ CLOB_HOST = "https://clob.polymarket.com"
 BASE_UNITS = 1_000_000          # pUSD and outcome shares both use 6 decimals
 DELAYED_CHECKS = 4              # get_order checks when Polymarket reports "delayed"
 DELAYED_CHECK_INTERVAL = 2.0    # seconds
-# Errors that mean the order was definitely not placed (no fill to look for)
-_NOT_PLACED = (pm_errors.UserInputError, pm_errors.RequestRejectedError)
+HEALTH_TIMEOUT = 5              # seconds; short so a trade near close can't run into the next window
+REDEEM_RETRY_AFTER = 900        # seconds before resubmitting a redemption that hasn't landed
+BALANCE_CHECK_TRIES = 3         # token-balance reads after an uncertain buy
+UNKNOWN_FILL = "UNKNOWN_FILL"   # error prefix: couldn't tell whether a buy filled
 
 
 @dataclass
@@ -110,7 +113,7 @@ class Executor:
         self.client: Optional[SecureClient] = None
         self.wallet_type = ""
         self._initialized = False
-        self._redeem_submitted: set = set()   # condition_ids already sent for redemption
+        self._redeem_submitted: dict = {}   # condition_id -> time its redemption was sent
 
     @property
     def can_redeem(self) -> bool:
@@ -118,9 +121,9 @@ class Executor:
 
     # ── Connection ───────────────────────────────────────────────────
 
-    def initialize(self) -> bool:
-        """Connect for live trading. Returns False (and says why) unless the
-        wallet is the Polymarket Safe for this key and trading is approved."""
+    def connect(self) -> bool:
+        """Create the SDK client for SAFE_ADDRESS (never without a wallet: the
+        SDK would deploy a new Deposit Wallet). Doesn't enable trading."""
         if not self.private_key or not self.safe_address:
             print("[executor] PRIVATE_KEY and SAFE_ADDRESS are both required for live trading")
             return False
@@ -133,26 +136,44 @@ class Executor:
         except Exception as e:
             print(f"[executor] Could not connect to Polymarket: {type(e).__name__}: {e}")
             return False
-
         self.wallet_type = self.client.wallet_type
-        if self.wallet_type != "GNOSIS_SAFE":
-            print(f"[executor] REFUSING to trade: the SDK sees SAFE_ADDRESS as {self.wallet_type}, "
-                  f"not GNOSIS_SAFE. Check SAFE_ADDRESS is the Polymarket Safe for this PRIVATE_KEY.")
-            self.close()
-            return False
+        return True
 
+    def account_status(self) -> SimpleNamespace:
+        """What live trading needs, read from Polymarket (after connect()):
+        wallet_type, approved, missing approvals, pUSD balance (None if unreadable),
+        and is_safe / ready summaries. Shared by initialize() and preflight.py."""
+        st = SimpleNamespace(wallet_type=self.wallet_type, is_safe=self.wallet_type == "GNOSIS_SAFE",
+                             approved=False, missing=None, balance=None, error="")
         try:
             approvals = self.client.get_trading_approvals_state()
+            st.approved, st.missing = approvals.is_fully_approved, approvals.missing
         except Exception as e:
-            print(f"[executor] Could not read trading approvals: {type(e).__name__}: {e}")
-            self.close()
-            return False
-        if not approvals.is_fully_approved:
-            print(f"[executor] REFUSING to trade: CLOB V2 trading approvals are missing "
-                  f"({approvals.missing}). Enable trading in the Polymarket UI, then run preflight.py.")
-            self.close()
-            return False
+            st.error = f"Could not read trading approvals: {type(e).__name__}: {e}"
+        try:
+            st.balance = self.client.get_balance_allowance(asset_type="COLLATERAL").balance / BASE_UNITS
+        except Exception as e:
+            st.error = st.error or f"Could not read the pUSD balance: {type(e).__name__}: {e}"
+        st.ready = st.is_safe and st.approved and st.balance is not None
+        return st
 
+    def initialize(self) -> bool:
+        """Connect for live trading. Returns False (and says why) unless the
+        wallet is the Polymarket Safe for this key and trading is approved."""
+        if not self.connect():
+            return False
+        st = self.account_status()
+        if not st.is_safe:
+            print(f"[executor] REFUSING to trade: the SDK sees SAFE_ADDRESS as {st.wallet_type}, "
+                  f"not GNOSIS_SAFE. Check SAFE_ADDRESS is the Polymarket Safe for this PRIVATE_KEY.")
+        elif not st.approved:
+            print(f"[executor] REFUSING to trade: CLOB V2 trading approvals are missing "
+                  f"({st.missing or st.error}). Enable trading in the Polymarket UI, then run preflight.py.")
+        elif st.balance is None:
+            print(f"[executor] REFUSING to trade: {st.error}")
+        if not st.ready:
+            self.close()
+            return False
         self._initialized = True
         print(f"[executor] Connected: Safe {self.safe_address[:6]}…{self.safe_address[-4:]} "
               f"(GNOSIS_SAFE), trading approved, "
@@ -171,7 +192,7 @@ class Executor:
     def health_check(self):
         """Raise if the CLOB API isn't answering (replaces py-clob-client's get_ok()).
         In live mode httpx is routed through the proxy by proxy.apply_proxy()."""
-        r = httpx.get(f"{CLOB_HOST}/", timeout=10)
+        r = httpx.get(f"{CLOB_HOST}/", timeout=HEALTH_TIMEOUT)
         r.raise_for_status()
 
     # ── Balances and prices ──────────────────────────────────────────
@@ -191,14 +212,14 @@ class Executor:
         """pUSD collateral balance in USD (0.0 if it can't be read)."""
         return self.read_balance() or 0.0
 
-    def token_balance(self, token_id: str) -> float:
-        """Shares of one outcome token held by the Safe (0.0 if unknown)."""
+    def token_balance(self, token_id: str) -> Optional[float]:
+        """Shares of one outcome token held by the Safe, or None if unreadable."""
         try:
             return self.client.get_balance_allowance(
                 asset_type="CONDITIONAL", token_id=token_id).balance / BASE_UNITS
         except Exception as e:
             print(f"[executor] Token balance check failed: {type(e).__name__}: {e}")
-            return 0.0
+            return None
 
     def get_market_price(self, token_id: str, side: str, amount: float) -> float:
         """Price to BUY `amount` USD or SELL `amount` shares, from the live book."""
@@ -267,26 +288,33 @@ class Executor:
             return OrderResult(success=False, status=REJECTED, side="BUY", token_id=tok,
                                error=f"Amount ${amount_usd:.2f} < ${POLY_MIN_NOTIONAL:.0f} min")
         cap = round(cap, 2)
+        # Cost estimate for fills the response doesn't report: the book price
+        # seen just before ordering (never above the cap)
+        est = price if 0 < price <= cap else cap
         print(f"  📊 FAK buy: up to ${amount_usd:.2f} at ≤ ${cap:.2f}/share")
         try:
             resp = self.client.place_market_order(
                 token_id=token_id, side="BUY", amount=f"{amount_usd:.2f}",
                 max_price=f"{cap:.2f}", order_type="FAK",
             )
-        except _NOT_PLACED as e:
+        except pm_errors.UserInputError as e:      # refused locally: nothing was sent
+            return OrderResult(success=False, status=REJECTED, side="BUY", token_id=tok,
+                               error=f"order not placed: {type(e).__name__}: {e}")
+        except pm_errors.RequestRejectedError as e:  # refused by the server
             return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok,
                                error=f"order not placed: {type(e).__name__}: {e}")
         except Exception as e:
-            return self._after_uncertain_buy(token_id, cap, e)
+            return self._after_uncertain_buy(token_id, est, e)
 
         if not resp.ok:
-            no_fill = resp.code in ("fak_not_filled", "fok_not_filled", "unmatched")
-            return OrderResult(success=False, status=REJECTED if no_fill else FAILED,
+            # A rejection with a known reason (no fill, not enough balance,
+            # market not ready...) isn't an API outage; only "unknown" counts.
+            return OrderResult(success=False, status=FAILED if resp.code == "unknown" else REJECTED,
                                side="BUY", token_id=tok, error=f"{resp.code}: {resp.message}")
 
         spent, shares = float(resp.making_amount), float(resp.taking_amount)
         if resp.status != "matched" or shares <= 0:
-            spent, shares = self._settle(resp.order_id, token_id, cap, spent, shares)
+            spent, shares = self._settle(resp.order_id, token_id, est, spent, shares)
         if shares > 0 and spent > shares:   # BUY: shares cost < $1 each, so shares > spent
             print(f"  ⚠️  Fill amounts look swapped (making {spent}, taking {shares}); swapping")
             spent, shares = shares, spent
@@ -297,9 +325,10 @@ class Executor:
                            price=spent / shares, amount_usd=spent, shares=shares,
                            token_id=tok, dry_run=False)
 
-    def _settle(self, order_id: str, token_id: str, cap: float,
+    def _settle(self, order_id: str, token_id: str, est: float,
                 spent: float, shares: float) -> tuple:
-        """For a 'delayed' (or unreported) match, ask the exchange what filled."""
+        """For a 'delayed' (or unreported) match, ask the exchange what filled.
+        Cost is estimated at `est`, the book price seen before ordering."""
         for _ in range(DELAYED_CHECKS):
             time.sleep(DELAYED_CHECK_INTERVAL)
             try:
@@ -308,45 +337,58 @@ class Executor:
                 break   # no longer an open order: fall back to the token balance
             matched = float(order.size_matched)
             if matched > 0:
-                return matched * float(order.price), matched
+                return matched * est, matched
             if order.status not in ("delayed", "live"):
                 break
         held = self.token_balance(token_id)
-        if held > shares:
+        if held is not None and held > shares:
             print(f"  ⚠️  Fill read from token balance: {held:.2f} shares "
-                  f"(cost estimated at the ${cap:.2f} cap)")
-            return held * cap, held
+                  f"(cost estimated at ${est:.2f}/share)")
+            return held * est, held
         return spent, shares
 
-    def _after_uncertain_buy(self, token_id: str, cap: float, err: Exception) -> OrderResult:
+    def _after_uncertain_buy(self, token_id: str, est: float, err: Exception) -> OrderResult:
         """The request failed in a way where the order may still have reached
         the exchange. FAK orders can't rest, so either we hold shares now or
         nothing happened. (The bot holds no shares of this window's tokens
-        before its one buy.)"""
+        before its one buy.) If the balance can't be read either, say so:
+        the bot then rechecks at the window boundary."""
         print(f"  ⚠️  Buy request failed ({type(err).__name__}: {err}); checking for a fill...")
-        time.sleep(3)
-        held = self.token_balance(token_id)
         tok = token_id[:16] + "..."
+        held = None
+        for _ in range(BALANCE_CHECK_TRIES):
+            time.sleep(3)
+            held = self.token_balance(token_id)
+            if held is not None:
+                break
+        if held is None:
+            return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok, price=est,
+                               error=f"{UNKNOWN_FILL}: can't tell whether the order filled "
+                                     f"({type(err).__name__}: {err})")
         if held >= MIN_SHARES:
             print(f"  👻 Order went through despite the error: {held:.2f} shares "
-                  f"(cost estimated at the ${cap:.2f} cap)")
-            return OrderResult(success=True, status=FILLED, side="BUY", price=cap,
-                               amount_usd=held * cap, shares=held, token_id=tok,
+                  f"(cost estimated at ${est:.2f}/share)")
+            return OrderResult(success=True, status=FILLED, side="BUY", price=est,
+                               amount_usd=held * est, shares=held, token_id=tok,
                                dry_run=False, error=f"filled despite error: {err}")
         return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok,
                            error=f"network: {type(err).__name__}: {err}")
 
     def redeem(self, condition_id: str) -> Optional[str]:
-        """Submit redemption of a resolved market's winning shares (once per
-        market). Returns the relayer transaction id, or None if not submitted."""
-        if not self._initialized or not self.can_redeem or condition_id in self._redeem_submitted:
+        """Submit redemption of a resolved market's winning shares. A market is
+        resubmitted only if it is still redeemable REDEEM_RETRY_AFTER after the
+        last attempt. Returns the relayer transaction id, or None if not sent."""
+        if not self._initialized or not self.can_redeem:
             return None
+        sent = self._redeem_submitted.get(condition_id)
+        if sent is not None and time.time() - sent < REDEEM_RETRY_AFTER:
+            return None   # sent recently; resubmit only if it still hasn't landed later
         try:
             handle = self.client.redeem_positions(condition_id=condition_id)
         except Exception as e:
             print(f"[executor] Redeem failed for {condition_id[:12]}…: {type(e).__name__}: {e}")
             return None
-        self._redeem_submitted.add(condition_id)
+        self._redeem_submitted[condition_id] = time.time()
         return handle.transaction_id
 
     def cancel_all(self) -> bool:

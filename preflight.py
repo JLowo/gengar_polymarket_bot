@@ -100,35 +100,32 @@ def main():
         check(False, "", f"CLOB API not reachable: {type(e).__name__}: {e}")
         return finish(proxy)
 
-    # 3. Account ------------------------------------------------------------
+    # 3. Account (the same checks the bot runs before live trading) ----------
     print("\nAccount")
-    from polymarket import SecureClient
     from polymarket.auth import BuilderApiKey
-    builder = BuilderApiKey(*builder_parts) if has_builder else None
-    try:
-        client = SecureClient.create(private_key=pk, wallet=safe, api_key=builder)
-    except Exception as e:
-        check(False, "", f"Could not connect as this wallet: {type(e).__name__}: {e}")
+    ex.builder_key = BuilderApiKey(*builder_parts) if has_builder else None
+    if not check(ex.connect(), "Connected to Polymarket as this wallet",
+                 "Could not connect as this wallet (see the message above)"):
         return finish(proxy)
     try:
-        if not check(client.wallet_type == "GNOSIS_SAFE",
+        st = ex.account_status()
+        if not check(st.is_safe,
                      "SAFE_ADDRESS is this key's Polymarket Safe (GNOSIS_SAFE)",
-                     f"SDK sees SAFE_ADDRESS as {client.wallet_type}, not GNOSIS_SAFE: "
+                     f"SDK sees SAFE_ADDRESS as {st.wallet_type}, not GNOSIS_SAFE: "
                      f"wrong address for this key?"):
             return finish(proxy)
-
-        approvals = client.get_trading_approvals_state()
-        check(approvals.is_fully_approved, "CLOB V2 trading approvals are in place",
-              f"Trading approvals missing: {approvals.missing} "
+        check(st.approved, "CLOB V2 trading approvals are in place",
+              f"Trading approvals missing: {st.missing or st.error} "
               f"(enable trading in the Polymarket UI)")
-
-        balance = client.get_balance_allowance(asset_type="COLLATERAL").balance / 1_000_000
         min_bet = float(os.getenv("MIN_BET", "5.0"))
-        check(balance >= min_bet, f"pUSD balance: ${balance:.2f}",
-              f"pUSD balance is ${balance:.2f} (below MIN_BET ${min_bet:.2f}): "
-              f"deposit or convert USDC.e to pUSD in the Polymarket UI")
+        if st.balance is None:
+            check(False, "", st.error)
+        else:
+            check(st.balance >= min_bet, f"pUSD balance: ${st.balance:.2f}",
+                  f"pUSD balance is ${st.balance:.2f} (below MIN_BET ${min_bet:.2f}): "
+                  f"deposit or convert USDC.e to pUSD in the Polymarket UI")
 
-        ex.client, ex._initialized = client, True
+        ex._initialized = True
         winnings = ex.redeemable_winnings()
         total = sum(v for _, v in winnings)
         print(f"  {NOTE} Redeemable winnings: ${total:.2f} in {len(winnings)} market(s)")
@@ -138,15 +135,16 @@ def main():
         if has_builder:
             print(f"  {OK} Builder API key configured: the bot will redeem winnings itself")
         elif args.create_builder_key:
-            key = client.create_builder_api_key()
+            key = ex.client.create_builder_api_key()
             save_builder_key(key)
             print(f"  {OK} Builder API key created and saved to .env (not shown). "
                   f"Run preflight again to confirm it loads.")
         else:
             print(f"  {NOTE} No builder API key: winnings will need claiming in the Polymarket UI.")
-            print(f"     To let the bot redeem them, run: .venv/bin/python preflight.py --create-builder-key")
+            print(f"     To let the bot redeem them, add BUILDER_API_KEY/SECRET/PASSPHRASE to .env,")
+            print(f"     or create one with: .venv/bin/python preflight.py --create-builder-key")
     finally:
-        client.close()
+        ex.close()
     return finish(proxy)
 
 
