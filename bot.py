@@ -9,19 +9,18 @@ Strategy:
   - Exit: hold all positions to resolution — no stops, no take-profit
 
 Safety systems:
-  1. CLOB health check: get_ok() before every trade; 3 consecutive
-     failures halt trading and send Telegram alert. Auto-recovers
-     when API comes back at next window boundary.
+  1. CLOB health check before every live trade; 3 consecutive failures
+     halt trading and send a Telegram alert. Auto-recovers when the API
+     answers again at a window boundary.
   2. Daily loss limit: if session P&L <= -DAILY_LOSS_LIMIT, halt trading.
-  3. Balance-verified buys: snapshot USDC before/after; ghost fills
-     caught even when API throws. Never cancels on timeout — returns
-     UNVERIFIED_BUY for pending detection at next window boundary.
-  4. Pending buy safety net: if buy unverified, check balance at next
-     window boundary; retroactively track as filled if balance dropped.
-  5. Window-boundary balance sync: real USDC balance overwrites internal
-     tracking every 5 minutes. Corrects any accumulated drift.
-  6. Minimum notional guard: skip sells below $5 notional; hold to
-     resolution instead of hitting Polymarket's minimum-size rejection.
+  3. Fill-and-kill buys capped at the price that still leaves MIN_EDGE:
+     nothing rests on the book and the response says what filled.
+  4. Live trading only starts for the Polymarket Safe (GNOSIS_SAFE) with
+     CLOB V2 trading approvals in place (see executor.py, preflight.py).
+  5. Results are booked from Polymarket's own resolution, and winnings
+     are redeemed when a builder API key is configured.
+  6. Window-boundary sync: bankroll = pUSD + redeemable winnings + stakes
+     awaiting a result, so sizing and the loss limit use real money.
 """
 
 import os
@@ -39,6 +38,7 @@ from market import (get_current_market, current_window_ts, get_resolution_payout
 from price_feed import BinancePriceFeed
 from strategy import evaluate, estimate_true_probability, get_skip_reason, StrategyConfig, TradingStats
 from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE
+from polymarket.auth import BuilderApiKey
 from telegram_notifier import TelegramNotifier
 from tracker import Tracker
 
@@ -48,8 +48,6 @@ BOT_VERSION = "2026.11.19"  # bump when trading logic changes; the dashboard gro
 FORCED_EXIT_START = 5
 FORCED_EXIT_END = 1
 POSITION_CHECK_INTERVAL = 3
-MAX_EXIT_RETRIES = 3
-EXIT_RETRY_COOLDOWN = 10
 # If the first fresh BTC price of a window arrives later than this (bot just
 # started mid-window, or the feed stalled), the real opening price is unknown,
 # so that window is not traded and not used for the vol estimate.
@@ -93,6 +91,7 @@ class PolyBot:
             private_key=os.getenv("PRIVATE_KEY", ""),
             safe_address=os.getenv("SAFE_ADDRESS", ""),
             dry_run=self.dry_run,
+            builder_key=self._builder_key_from_env(),
         )
         self.telegram = TelegramNotifier()
         self.tracker = Tracker(
@@ -118,6 +117,8 @@ class PolyBot:
         self._trade_shares: float = 0.0
         self._trade_token_id: str = ""
         self._trade_id: int = 0  # tracker trade_id of the current trade
+        self._trade_condition_id: str = ""
+        self._claim_note_total: float = -1.0   # last "claim in the UI" total printed
 
         # Exit state
         self._exited: bool = False
@@ -139,15 +140,6 @@ class PolyBot:
         self._pending_resolutions: list = []
         self._last_resolution_check: float = 0.0
 
-        # Pending buy (unverified — Polygon settlement too slow)
-        self._pending_buy_side: str = ""
-        self._pending_buy_price: float = 0.0
-        self._pending_buy_amount: float = 0.0
-        self._pending_buy_shares: float = 0.0
-        self._pending_buy_token_id: str = ""
-        self._pending_buy_edge: float = 0.0
-        self._pending_buy_delta: float = 0.0
-        self._balance_before_buy: float = 0.0
 
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
@@ -172,6 +164,18 @@ class PolyBot:
         self._clob_halted: bool = False
         self._HALT_AFTER_FAILURES: int = 3
         self._daily_loss_halted: bool = False
+
+    @staticmethod
+    def _builder_key_from_env():
+        """Builder API key for redeeming winnings, if all three parts are set."""
+        parts = [os.getenv(k, "") for k in
+                 ("BUILDER_API_KEY", "BUILDER_API_SECRET", "BUILDER_API_PASSPHRASE")]
+        if all(parts):
+            return BuilderApiKey(key=parts[0], secret=parts[1], passphrase=parts[2])
+        if any(parts):
+            print("[config] BUILDER_API_KEY/SECRET/PASSPHRASE are only partly set — "
+                  "winnings won't be redeemed automatically")
+        return None
 
     def start(self):
         if not self.dry_run:
@@ -205,11 +209,17 @@ class PolyBot:
                 print("\n❌ Failed to initialize. Check credentials.")
                 return
             balance = self.executor.get_balance()
-            print(f"  USDC balance: ${balance:.2f}")
-            self.stats.bankroll = balance
-            self._session_start_balance = balance
-            self._last_real_balance = balance
-            self.tracker.set_session_balance(balance)
+            winnings = self.executor.redeemable_winnings()
+            equity = self._live_equity(winnings)
+            if equity <= 0:
+                print("\n❌ Couldn't read the pUSD balance. Check the connection and run preflight.py.")
+                return
+            print(f"  pUSD balance: ${balance:.2f} | with redeemable winnings: ${equity:.2f}")
+            self.stats.bankroll = equity
+            self._session_start_balance = equity
+            self._last_real_balance = equity
+            self.tracker.set_session_balance(equity)
+            self._redeem_winnings(winnings)
         else:
             print("  [dry run — no wallet connection]")
             self._session_start_balance = self.stats.bankroll
@@ -383,9 +393,8 @@ class PolyBot:
         if self.dry_run:
             current_sell_price = get_book_price(self._trade_token_id, "SELL", self._trade_shares)
         else:
-            sell_probe = round(self._trade_shares * self._trade_price, 2)
             current_sell_price = self.executor.get_market_price(
-                self._trade_token_id, "SELL", max(sell_probe, 1.0)
+                self._trade_token_id, "SELL", self._trade_shares
             )
 
         if current_sell_price <= 0:
@@ -424,61 +433,6 @@ class PolyBot:
 
     # ── Execute exit (balance-verified, partial fill aware) ─────────
 
-    def _exit_position(self, sell_price: float, seconds_remaining: float, reason: str):
-        if self.dry_run:
-            revenue = self._trade_shares * sell_price
-            self._exited = True
-            self._exit_revenue = revenue
-            self.stats.bankroll += revenue
-            profit = revenue - self._trade_cost
-            print(f"  💰 EXIT ({reason}, paper): {self._trade_shares:.0f} shares @ "
-                  f"${sell_price:.3f} = ${revenue:.2f} | Profit: ${profit:+.2f}")
-            return
-
-        result = self.executor.sell(
-            token_id=self._trade_token_id,
-            shares=self._trade_shares,
-            price=sell_price,
-        )
-
-        if result.success:
-            self._exit_revenue += result.amount_usd
-            self._exit_shares_sold += result.shares
-            self._residual_shares = result.shares_remaining
-            self.stats.bankroll += result.amount_usd
-
-            if result.status == PARTIAL and result.shares_remaining >= 1:
-                # Partial fill: got some USDC back, still have shares
-                print(f"  💰 EXIT ({reason}, partial): ~{result.shares:.0f} shares @ "
-                      f"${result.price:.3f} = ${result.amount_usd:.2f} | "
-                      f"~{result.shares_remaining:.0f} shares remaining → holding to resolution")
-                # Update shares but keep original cost for clean P&L math
-                self._trade_shares = result.shares_remaining
-                # Mark exited — residual resolves at window close
-                self._exited = True
-            else:
-                # Full fill (or residual < 1 share)
-                self._exited = True
-                profit = self._exit_revenue - self._trade_cost
-                print(f"  💰 EXIT ({reason}): {result.shares:.0f} shares @ "
-                      f"${result.price:.3f} = ${result.amount_usd:.2f} | "
-                      f"Profit: ${profit:+.2f}")
-        elif "hold to resolution" in result.error:
-            # Below $5 minimum — can't sell, hold to resolution
-            notional = self._trade_shares * sell_price
-            print(f"  📌 Can't sell: ${notional:.2f} below $5 minimum — holding to resolution")
-            self._exit_gave_up = True  # Skip further exit attempts
-        else:
-            self._exit_retries += 1
-            if self._exit_retries >= MAX_EXIT_RETRIES:
-                print(f"  ❌ Exit failed {MAX_EXIT_RETRIES} times ({reason}) — "
-                      f"holding to resolution")
-                self._exit_gave_up = True
-            else:
-                print(f"  ⚠️  Exit failed ({reason}, attempt "
-                      f"{self._exit_retries}/{MAX_EXIT_RETRIES}): {result.error}")
-                self._last_position_check = time.time() + EXIT_RETRY_COOLDOWN - POSITION_CHECK_INTERVAL
-
     # ── Window management ───────────────────────────────────────────
 
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
@@ -493,47 +447,6 @@ class PolyBot:
                 self._recent_window_deltas.append(closing_delta)
                 if len(self._recent_window_deltas) > self._rolling_vol_windows:
                     self._recent_window_deltas.pop(0)
-            # Detect pending buy that settled after our verification timeout
-            if self._pending_buy_side and not self._traded:
-                if not self.dry_run and self.executor._initialized:
-                    real_bal = self.executor.get_balance()
-                    if real_bal > 0 and self._balance_before_buy > 0:
-                        spent = self._balance_before_buy - real_bal
-                        if spent > 1.0:
-                            # Cap at intended cost — concurrent settlements can inflate delta
-                            intended_cost = self._pending_buy_shares * self._pending_buy_price if self._pending_buy_price > 0 else spent
-                            spent = min(spent, intended_cost)
-                            # The buy DID go through — retroactively track it
-                            est_shares = min(spent / self._pending_buy_price, self._pending_buy_shares) if self._pending_buy_price > 0 else 0
-                            print(f"\n  👻 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
-                            print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
-                                  f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
-
-                            self._traded = True
-                            self._trade_side = self._pending_buy_side
-                            self._trade_price = self._pending_buy_price
-                            self._trade_cost = spent
-                            self._trade_shares = est_shares
-                            self._trade_token_id = self._pending_buy_token_id
-                            self._trade_id = self.tracker.open_trade(
-                                window_ts=self._current_window,
-                                side=self._pending_buy_side,
-                                entry_price=self._pending_buy_price,
-                                entry_shares=est_shares,
-                                entry_cost=spent,
-                                edge=self._pending_buy_edge,
-                                prob=self._pending_buy_edge + self._pending_buy_price,
-                                btc_delta=self._pending_buy_delta,
-                                seconds_remaining=0.0,
-                                version=BOT_VERSION,
-                            )
-                            self.stats.bankroll = real_bal
-                            self._last_real_balance = real_bal
-                            self.stats.hourly.record_trade(
-                                self._pending_buy_edge, self._pending_buy_delta)
-                            self._session_entries.append(
-                                (self._pending_buy_price, self._pending_buy_edge, self._pending_buy_delta))
-
             self.stats.hourly.record_window(self._traded)
             if self._traded:
                 self._resolve_previous_trade()
@@ -566,9 +479,11 @@ class PolyBot:
                     skip_reason=skip_reason,
                 )
 
-            # Sync real balance at window boundary (catches any drift)
+            # Sync real money at window boundary (catches any drift), and
+            # redeem any winnings that have become redeemable
             if not self.dry_run and self.executor._initialized:
-                real_bal = self.executor.get_balance()
+                winnings = self.executor.redeemable_winnings()
+                real_bal = self._live_equity(winnings)
                 if real_bal > 0:
                     drift = abs(real_bal - self.stats.bankroll)
                     if drift > 0.50:
@@ -576,6 +491,7 @@ class PolyBot:
                               f"${real_bal:.2f} (drift ${drift:.2f})")
                     self.stats.bankroll = real_bal
                     self._last_real_balance = real_bal
+                self._redeem_winnings(winnings)
 
         self._current_window = window_ts
         self._opening_price = 0.0
@@ -595,14 +511,6 @@ class PolyBot:
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
-        self._pending_buy_side = ""
-        self._pending_buy_price = 0.0
-        self._pending_buy_amount = 0.0
-        self._pending_buy_shares = 0.0
-        self._pending_buy_token_id = ""
-        self._pending_buy_edge = 0.0
-        self._pending_buy_delta = 0.0
-        self._balance_before_buy = 0.0
 
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
         print(f"\n{'─' * 55}")
@@ -614,7 +522,7 @@ class PolyBot:
         # Circuit breaker auto-recovery: ping CLOB each new window
         if self._clob_halted and not self.dry_run and self.executor._initialized:
             try:
-                self.executor.client.get_ok()
+                self.executor.health_check()
                 self._clob_halted = False
                 self._consecutive_buy_failures = 0
                 print(f"  ✅ CLOB recovered (health check OK) — resuming trades")
@@ -707,7 +615,7 @@ class PolyBot:
 
         if not self.dry_run and self.executor._initialized:
             try:
-                self.executor.client.get_ok()
+                self.executor.health_check()
             except Exception as e:
                 self._consecutive_buy_failures += 1
                 print(f"  🔌 CLOB health check failed: {e}")
@@ -739,6 +647,7 @@ class PolyBot:
             print(f"  ⚠️  {sig.side} signal, but this window's market wasn't found — skipping")
             return
         token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
+        self._trade_condition_id = market.condition_id
 
         slug = f"btc-updown-{self.period}m-{self._current_window}"
         trade_amount = round(sig.kelly_size, 2)
@@ -780,7 +689,10 @@ class PolyBot:
 
                 hint_price = actual_price
 
-        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
+        # Never pay more than leaves MIN_EDGE (executor also caps at MAX_BUY_PRICE)
+        max_price = sig.true_prob - self.strategy_config.min_edge
+        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount,
+                                   price=hint_price, max_price=max_price)
 
         if result.success:
             self._consecutive_buy_failures = 0  # Reset circuit breaker
@@ -839,30 +751,16 @@ class PolyBot:
                 edge=sig.edge, kelly_size=sig.kelly_size,
             )
         else:
-            if result.error == "UNVERIFIED_BUY":
-                # Order likely filled but Polygon hasn't settled.
-                # Save details — window boundary sync will detect the fill.
-                self._pending_buy_side = sig.side
-                self._pending_buy_price = result.price
-                self._pending_buy_amount = result.amount_usd
-                self._pending_buy_shares = result.shares
-                self._pending_buy_token_id = token_id
-                self._pending_buy_edge = sig.edge
-                self._pending_buy_delta = sig.btc_delta_pct
-                self._balance_before_buy = self.stats.bankroll
-                print(f"  ⏳ Buy sent but unverified — will detect via balance sync")
-            else:
-                print(f"  ❌ Buy failed: {result.error}")
-                # Circuit breaker: track consecutive API failures
-                err = str(result.error).lower()
-                if "request exception" in err or "service not ready" in err or "status_code=none" in err:
-                    self._consecutive_buy_failures += 1
-                    if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
-                        self._clob_halted = True
-                        msg = (f"🔌 CLOB HALTED after {self._consecutive_buy_failures} "
-                               f"consecutive API failures — stopping trades until restart")
-                        print(f"\n  {msg}")
-                        self.telegram.status_update({"alert": msg})
+            print(f"  ❌ Buy failed: {result.error}")
+            # Circuit breaker: consecutive API failures (not "no fill at my price")
+            if result.status == FAILED and not self.dry_run:
+                self._consecutive_buy_failures += 1
+                if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
+                    self._clob_halted = True
+                    msg = (f"🔌 CLOB HALTED after {self._consecutive_buy_failures} "
+                           f"consecutive API failures — stopping trades until recovery")
+                    print(f"\n  {msg}")
+                    self.telegram.status_update({"alert": msg})
 
     # ── Resolve (partial fill aware) ────────────────────────────────
 
@@ -898,145 +796,11 @@ class PolyBot:
         original_cost = self._trade_cost
         remaining_shares = self._trade_shares
 
-        # ── Dry run: book from Polymarket's real result ──────────────
-        # (Binance can disagree with the Chainlink price the market settles on.)
-        if self.dry_run:
-            self._defer_resolution(original_cost, remaining_shares)
-            return
-
-        # ── Live: attempt claim sell first — result is the truth ─────
-        # Binance price and oracle can disagree when BTC is near the opening
-        # price at resolution. The claim sell result is ground truth:
-        #   - Sell succeeds at ~$0.99 → shares had value → won
-        #   - "no match" or near-zero fill → shares worthless → lost
-        won = None
-        claim_revenue = 0.0
-        claim_result = "not_attempted"
-        resolution_method = "claim_sell"
-
-        claim_notional = remaining_shares * 0.99
-        live_token = (self._trade_token_id
-                      and not self._trade_token_id.startswith("DRY-")
-                      and self.executor._initialized)
-
-        # Short-circuit: if last observed sell price is below $0.50, market has
-        # already priced these shares as worthless — skip the claim API call.
-        if self._last_sell_price_seen > 0 and self._last_sell_price_seen < 0.50:
-            net_loss = original_cost - self._exit_revenue
-            profit = -net_loss
-            self.stats.record_loss(net_loss)
-            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [market_price] | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
-            btc_price, _ = self.price_feed.get_price()
-            self.tracker.close_trade(
-                btc_final_price=btc_price,
-                opening_price=self._opening_price,
-                won=False,
-                profit=profit,
-                exit_revenue=self._exit_revenue,
-                resolution_method="market_price",
-                claim_result="skipped_losing",
-                bankroll=self.stats.bankroll,
-                trade_id=self._trade_id,
-            )
-            return
-
-        pre_sell_balance = 0.0
-        if live_token and claim_notional >= 5.0:
-            print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
-            pre_sell_balance = self.executor.get_balance()
-            claim = self.executor.sell(
-                token_id=self._trade_token_id,
-                shares=remaining_shares,
-                price=0.99,
-            )
-            if claim.success and claim.amount_usd > remaining_shares * 0.50:
-                # API says success — verify with balance check to catch phantom fills
-                time.sleep(2)
-                post_sell_balance = self.executor.get_balance()
-                balance_increase = max(0.0, post_sell_balance - pre_sell_balance) if (
-                    pre_sell_balance > 0 and post_sell_balance > 0
-                ) else claim.amount_usd
-                if balance_increase > remaining_shares * 0.99 * 0.50:
-                    # Balance confirmed — real fill
-                    won = True
-                    claim_revenue = claim.amount_usd
-                    claim_result = "filled"
-                    self.stats.bankroll += claim_revenue
-                else:
-                    # API said success but no USDC arrived yet — defer to next window
-                    print(f"  ⏳ Possible phantom sell "
-                          f"(api=${claim.amount_usd:.2f}, balance_increase=${balance_increase:.2f})"
-                          f" — deferring to next window balance sync")
-            elif "no match" in claim.error.lower() or (
-                claim.success and claim.amount_usd < remaining_shares * 0.10
-            ):
-                # No buyers for these shares → shares worthless → definitive loss
-                won = False
-                claim_result = "no_match"
-            elif "not enough balance" in claim.error.lower():
-                # Tracked share count is slightly above on-chain balance (rounding).
-                # Retry with one fewer share to clear the discrepancy.
-                retry_shares = int(remaining_shares) - 1
-                print(f"  🔄 Rounding fix: retrying claim with {retry_shares} shares...")
-                if retry_shares > 0 and float(retry_shares) * 0.99 >= 5.0:
-                    retry = self.executor.sell(
-                        token_id=self._trade_token_id,
-                        shares=float(retry_shares),
-                        price=0.99,
-                    )
-                    if retry.success and retry.amount_usd > retry_shares * 0.50:
-                        time.sleep(2)
-                        post_bal = self.executor.get_balance()
-                        balance_increase = max(0.0, post_bal - pre_sell_balance)
-                        if balance_increase > float(retry_shares) * 0.99 * 0.50:
-                            won = True
-                            claim_revenue = retry.amount_usd
-                            claim_result = "filled"
-                            self.stats.bankroll += claim_revenue
-                        # else: retry succeeded but balance unconfirmed — fall to defer
-                # else: retry failed or too small — fall to defer (won still None)
-            # else: any other error — fall to defer (won still None)
-        else:
-            if live_token and claim_notional < 5.0:
-                print(f"  💰 {remaining_shares:.0f} shares below $5 min — deferring to auto-resolution")
-
-        # ── Deferred fallback ────────────────────────────────────────
-        # The old balance check fired before auto-resolution settled on-chain.
-        # Any unresolved case is now deferred to the next window boundary
-        # (~5 min), where Polygon settlement is guaranteed to have landed.
-        if won is None:
-            if not live_token:
-                # No valid token/executor — Binance price as last resort
-                btc_price, _ = self.price_feed.get_price()
-                if self._opening_price > 0 and btc_price > 0:
-                    won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
-                    resolution_method = "binance_fallback"
-                    print(f"  ⚠️  No live token — using Binance fallback")
-                else:
-                    print(f"  ⚠️  Cannot determine resolution outcome — skipping")
-                    return
-            else:
-                # Claim couldn't be confirmed. Don't infer the result from
-                # balance changes (a buy in the next window can make a win
-                # look like a loss): wait for Polymarket's resolution.
-                self._defer_resolution(original_cost, remaining_shares, claim_result)
-                return
-
-        if won is None:
-            return
-
-        self._record_resolution(
-            won=won,
-            original_cost=original_cost,
-            remaining_shares=remaining_shares,
-            resolution_method=resolution_method,
-            claim_revenue=claim_revenue,
-            claim_result=claim_result,
-        )
+        # ── Both modes: book from Polymarket's own result ────────────
+        # (Binance can disagree with the Chainlink price the market settles
+        # on; live winnings are redeemed by _redeem_winnings() once they show
+        # up as redeemable.)
+        self._defer_resolution(original_cost, remaining_shares)
 
     def _defer_resolution(self, original_cost: float, remaining_shares: float,
                           claim_result: str = "not_attempted"):
@@ -1052,6 +816,7 @@ class PolyBot:
             "opening_price": self._opening_price,
             "closing_price": btc_price,
             "claim_result": claim_result,
+            "condition_id": self._trade_condition_id,
             "since": time.time(),
         })
         t = time.strftime("%H:%M", time.localtime(self._current_window))
@@ -1089,6 +854,39 @@ class PolyBot:
             self._book_market_resolution(p, payouts)
         self._pending_resolutions = still_waiting
 
+    def _live_equity(self, winnings: list = None) -> float:
+        """Real money in live mode: pUSD + redeemable winnings + stakes still
+        awaiting a result (0.0 if the balance can't be read). Pass the
+        redeemable winnings if already fetched, to avoid a second lookup."""
+        balance = self.executor.read_balance()
+        if balance is None:
+            return 0.0
+        if winnings is None:
+            winnings = self.executor.redeemable_winnings()
+        pending = {str(p.get("condition_id", "")) for p in self._pending_resolutions}
+        won = sum(v for cid, v in winnings if cid not in pending)
+        stakes = sum(p["cost"] for p in self._pending_resolutions)
+        return balance + won + stakes
+
+    def _redeem_winnings(self, winnings: list = None):
+        """Submit redemption for every resolved winning position (live only)."""
+        if self.dry_run or not self.executor._initialized:
+            return
+        if winnings is None:
+            winnings = self.executor.redeemable_winnings()
+        if not winnings:
+            return
+        if not self.executor.can_redeem:
+            total = round(sum(v for _, v in winnings), 2)
+            if total != self._claim_note_total:      # say it once per change, not every window
+                self._claim_note_total = total
+                print(f"  💰 ${total:.2f} of winnings to claim in the Polymarket UI (no builder key)")
+            return
+        for cid, value in winnings:
+            tx = self.executor.redeem(cid)
+            if tx:
+                print(f"  💰 Redeeming ${value:.2f} (tx {tx[:12]}…)")
+
     def _book_market_resolution(self, p: dict, payouts: dict):
         """Apply a queued trade's result now that Polymarket has resolved it.
         payouts is per-share, e.g. {"UP": 1.0, "DOWN": 0.0}, or 0.5/0.5 if split."""
@@ -1123,50 +921,6 @@ class PolyBot:
             resolution_payout=payout,
             bankroll=self.stats.bankroll,
             trade_id=p["trade_id"],
-        )
-
-    def _record_resolution(
-        self, won: bool, original_cost: float, remaining_shares: float,
-        resolution_method: str, claim_revenue: float, claim_result: str = "not_attempted",
-    ):
-        """Apply win/loss to stats, print result, alert Telegram, log to tracker."""
-        if won:
-            if claim_revenue > 0:
-                total_received = self._exit_revenue + claim_revenue
-            else:
-                resolution_payout = remaining_shares * 1.0
-                total_received = self._exit_revenue + resolution_payout
-                self.stats.bankroll += resolution_payout
-                self._unclaimed_winnings += resolution_payout
-            profit = total_received - original_cost
-            self.stats.record_win(profit)
-            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            claimed_note = " (claimed)" if claim_revenue > 0 else " (unclaimed)"
-            print(f"  ✅ WIN{partial_note}{claimed_note} +${profit:.2f} [{resolution_method}] | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.win_alert(profit, self.stats.total_pnl)
-        else:
-            net_loss = original_cost - self._exit_revenue
-            profit = -net_loss
-            self.stats.record_loss(net_loss)
-            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [{resolution_method}] | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
-
-        btc_price, _ = self.price_feed.get_price()
-        self.tracker.close_trade(
-            btc_final_price=btc_price,
-            opening_price=self._opening_price,
-            won=won,
-            profit=profit,
-            exit_revenue=self._exit_revenue,
-            resolution_method=resolution_method,
-            claim_result=claim_result,
-            bankroll=self.stats.bankroll,
-            trade_id=self._trade_id,
         )
 
     # ── Hourly + shutdown ───────────────────────────────────────────
@@ -1219,9 +973,9 @@ class PolyBot:
         if self.executor._initialized:
             self.executor.cancel_all()
 
-        # Final real balance sync
+        # Final real money sync
         if not self.dry_run and self.executor._initialized:
-            real_bal = self.executor.get_balance()
+            real_bal = self._live_equity()
             if real_bal > 0:
                 self.stats.bankroll = real_bal
                 self._last_real_balance = real_bal
