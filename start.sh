@@ -59,9 +59,12 @@ fi
 # 4. Launch tmux with caffeinate + bot
 #    tmux starts in $PROJ_DIR, so the relative .venv path avoids quoting trouble
 #    when the folder name contains spaces.
+#    `trap true INT` keeps the wrapper shell alive when you press Ctrl+C (the bot
+#    still gets it and shuts down cleanly), so the window stays open with the
+#    final summary instead of vanishing. Children get the default Ctrl+C handling.
 echo "🖥  Starting tmux session '$SESSION_NAME'..."
 tmux new-session -d -s "$SESSION_NAME" -c "$PROJ_DIR" \
-    "caffeinate -i .venv/bin/python bot.py; echo '⚠️  Bot exited. Press enter to close.'; read"
+    "trap true INT; caffeinate -i .venv/bin/python bot.py; echo '⚠️  Bot exited. Press enter to close.'; read"
 
 echo ""
 echo "══════════════════════════════════"
