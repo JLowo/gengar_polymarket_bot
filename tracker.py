@@ -122,8 +122,12 @@ class Tracker:
         if self.log_executions:
             self._ensure_headers(self._exec_path, EXECUTION_FIELDS)
 
-        # In-memory state for current trade
-        self._current_trade: dict = {}
+        # In-memory state for trades not yet written, keyed by trade_id.
+        # A trade's result can arrive after the next trade has opened
+        # (deferred resolution), so the trade being held right now (hold
+        # stats, exits) is tracked separately as the "active" trade.
+        self._open_trades: dict[int, dict] = {}
+        self._active_trade_id: int = 0
         self._trade_counter: int = 0
 
         # Session stats
@@ -222,9 +226,10 @@ class Tracker:
         latency_ms: float = 0.0,
         entry_delta_pct: float = 0.0,
         entry_seconds_remaining: float = 0.0,
-    ):
+    ) -> int:
+        """Open a trade record and make it the active trade. Returns its trade_id."""
         self._trade_counter += 1
-        self._current_trade = {
+        trade = {
             "timestamp": time.time(),
             "window_ts": window_ts,
             "window_time": time.strftime("%H:%M", time.localtime(window_ts)),
@@ -246,20 +251,24 @@ class Tracker:
             "max_sell_price_seen": 0.0,
             "min_sell_price_seen": 999.0,
         }
+        self._open_trades[self._trade_counter] = trade
+        self._active_trade_id = self._trade_counter
+        return self._trade_counter
 
     def update_hold_stats(self, prob: float, sell_price: float):
         """Call on each position check tick to track hold-period extremes."""
-        if not self._current_trade:
+        t = self._open_trades.get(self._active_trade_id)
+        if not t:
             return
-        if prob > self._current_trade["max_prob_during_hold"]:
-            self._current_trade["max_prob_during_hold"] = round(prob, 4)
-        if prob < self._current_trade["min_prob_during_hold"]:
-            self._current_trade["min_prob_during_hold"] = round(prob, 4)
+        if prob > t["max_prob_during_hold"]:
+            t["max_prob_during_hold"] = round(prob, 4)
+        if prob < t["min_prob_during_hold"]:
+            t["min_prob_during_hold"] = round(prob, 4)
         if sell_price > 0:
-            if sell_price > self._current_trade["max_sell_price_seen"]:
-                self._current_trade["max_sell_price_seen"] = round(sell_price, 4)
-            if sell_price < self._current_trade["min_sell_price_seen"]:
-                self._current_trade["min_sell_price_seen"] = round(sell_price, 4)
+            if sell_price > t["max_sell_price_seen"]:
+                t["max_sell_price_seen"] = round(sell_price, 4)
+            if sell_price < t["min_sell_price_seen"]:
+                t["min_sell_price_seen"] = round(sell_price, 4)
 
     def log_trade_exit(
         self,
@@ -270,15 +279,16 @@ class Tracker:
         residual_shares: float,
         latency_ms: float = 0.0,
     ):
-        if not self._current_trade:
+        t = self._open_trades.get(self._active_trade_id)
+        if not t:
             return
-        self._current_trade["exit_type"] = exit_type
-        self._current_trade["exit_price"] = round(exit_price, 4)
-        self._current_trade["exit_shares_sold"] = round(exit_shares_sold, 1)
-        self._current_trade["exit_revenue"] = round(exit_revenue, 2)
-        self._current_trade["residual_shares"] = round(residual_shares, 1)
-        self._current_trade["residual_value"] = round(residual_shares * exit_price, 2)
-        self._current_trade["exit_latency_ms"] = round(latency_ms, 0)
+        t["exit_type"] = exit_type
+        t["exit_price"] = round(exit_price, 4)
+        t["exit_shares_sold"] = round(exit_shares_sold, 1)
+        t["exit_revenue"] = round(exit_revenue, 2)
+        t["residual_shares"] = round(residual_shares, 1)
+        t["residual_value"] = round(residual_shares * exit_price, 2)
+        t["exit_latency_ms"] = round(latency_ms, 0)
 
     def log_trade_resolve(
         self,
@@ -289,48 +299,71 @@ class Tracker:
         exit_revenue: float = 0.0,
         resolution_method: str = "binance_fallback",
         claim_result: str = "not_attempted",
+        resolution_payout: Optional[float] = None,
+        *,
+        trade_id: int,
     ):
-        if not self._current_trade:
+        """Write the trade's row. trade_id is required: a trade can resolve after
+        the next one has opened, so never fall back to "whichever is active"."""
+        t = self._open_trades.pop(trade_id, None)
+        if not t:
+            print(f"[tracker] No open trade #{trade_id} to resolve — row not written")
             return
+        if trade_id == self._active_trade_id:
+            self._active_trade_id = 0
 
-        entry_cost = self._current_trade.get("entry_cost", 0)
-        entry_shares = self._current_trade.get("entry_shares", 0)
-        entry_price = self._current_trade.get("entry_price", 0)
-        side = self._current_trade.get("side", "")
+        entry_cost = t.get("entry_cost", 0)
+        entry_shares = t.get("entry_shares", 0)
+        entry_price = t.get("entry_price", 0)
+        side = t.get("side", "")
 
         btc_delta = ((btc_final_price - opening_price) / opening_price * 100) if opening_price > 0 else 0
-        resolution_payout = entry_shares * 1.0 if won else 0.0
+        if resolution_payout is None:   # caller didn't give the real payout
+            resolution_payout = entry_shares * 1.0 if won else 0.0
         profit_if_held = resolution_payout - entry_cost
 
-        self._current_trade["btc_final_price"] = round(btc_final_price, 2)
-        self._current_trade["btc_final_delta_pct"] = round(btc_delta, 4)
-        self._current_trade["won_resolution"] = won
-        self._current_trade["resolution_payout"] = round(resolution_payout, 2)
-        self._current_trade["resolution_method"] = resolution_method
-        self._current_trade["claim_result"] = claim_result
-        self._current_trade["profit"] = round(profit, 2)
-        self._current_trade["return_pct"] = round(
+        t["btc_final_price"] = round(btc_final_price, 2)
+        t["btc_final_delta_pct"] = round(btc_delta, 4)
+        t["won_resolution"] = won
+        t["resolution_payout"] = round(resolution_payout, 2)
+        t["resolution_method"] = resolution_method
+        t["claim_result"] = claim_result
+        t["profit"] = round(profit, 2)
+        t["return_pct"] = round(
             (profit / entry_cost * 100) if entry_cost > 0 else 0, 2
         )
-        self._current_trade["profit_if_held"] = round(profit_if_held, 2)
+        t["profit_if_held"] = round(profit_if_held, 2)
 
         # Set defaults for missing exit fields (held to resolution)
-        if "exit_type" not in self._current_trade:
-            self._current_trade["exit_type"] = "resolution"
-            self._current_trade["exit_price"] = 0.0
-            self._current_trade["exit_shares_sold"] = 0.0
-            self._current_trade["exit_revenue"] = round(exit_revenue, 2)
-            self._current_trade["residual_shares"] = round(entry_shares, 1)
-            self._current_trade["residual_value"] = 0.0
-            self._current_trade["exit_latency_ms"] = 0
+        if "exit_type" not in t:
+            t["exit_type"] = "resolution"
+            t["exit_price"] = 0.0
+            t["exit_shares_sold"] = 0.0
+            t["exit_revenue"] = round(exit_revenue, 2)
+            t["residual_shares"] = round(entry_shares, 1)
+            t["residual_value"] = 0.0
+            t["exit_latency_ms"] = 0
 
         # Fix min_sell_price sentinel
-        if self._current_trade.get("min_sell_price_seen", 999) >= 999:
-            self._current_trade["min_sell_price_seen"] = 0.0
+        if t.get("min_sell_price_seen", 999) >= 999:
+            t["min_sell_price_seen"] = 0.0
 
         # Write the complete trade record
-        self._append_row(self._trade_path, self._current_trade, TRADE_FIELDS)
-        self._current_trade = {}
+        self._append_row(self._trade_path, t, TRADE_FIELDS)
+
+    def log_trade_unresolved(self, reason: str, *, trade_id: int):
+        """Write a row for a trade whose result never arrived (bot stopped, or
+        no resolution in time) so trades.csv still has it. The result columns
+        (won_resolution, profit, ...) stay blank; resolution_method says why."""
+        t = self._open_trades.pop(trade_id, None)
+        if not t:
+            return
+        if trade_id == self._active_trade_id:
+            self._active_trade_id = 0
+        t["resolution_method"] = reason
+        if t.get("min_sell_price_seen", 999) >= 999:
+            t["min_sell_price_seen"] = 0.0
+        self._append_row(self._trade_path, t, TRADE_FIELDS)
 
     # ── Execution logging ───────────────────────────────────────────
 

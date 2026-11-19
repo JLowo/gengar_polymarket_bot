@@ -164,6 +164,74 @@ def get_current_market(period_minutes: int = 5) -> Optional[MarketWindow]:
     )
 
 
+CLOB_API = "https://clob.polymarket.com"
+
+
+def get_book_price(token_id: str, side: str, amount: float) -> float:
+    """Price to BUY `amount` USD of a token, or to SELL `amount` shares of it,
+    from Polymarket's public order book (read-only, no wallet needed).
+
+    Walks the book from the best level until `amount` is covered, the same
+    rule py-clob-client's calculate_market_price() uses, so dry run sees the
+    price live mode would. If the book is too thin it returns the worst level
+    (as the SDK does for non-FOK orders). Returns 0.0 if there is no book.
+    """
+    try:
+        url = f"{CLOB_API}/book?token_id={token_id}"
+        req = urllib.request.Request(url, headers={"User-Agent": "PolyBot/1.0"})
+        book = json.loads(urllib.request.urlopen(req, timeout=5).read().decode())
+    except Exception:
+        return 0.0
+    try:
+        if side == "BUY":
+            levels = sorted(book.get("asks") or [], key=lambda lv: float(lv["price"]))
+            covered = lambda lv: float(lv["size"]) * float(lv["price"])   # USD
+        else:
+            levels = sorted(book.get("bids") or [], key=lambda lv: -float(lv["price"]))
+            covered = lambda lv: float(lv["size"])                         # shares
+        total = 0.0
+        for lv in levels:
+            total += covered(lv)
+            if total >= amount:
+                return float(lv["price"])
+        return float(levels[-1]["price"]) if levels else 0.0
+    except (KeyError, ValueError, TypeError):
+        return 0.0
+
+
+def get_resolution_payouts(window_ts: int, period_minutes: int = 5) -> Optional[dict]:
+    """Payout per share for each side of a finished window, per Polymarket.
+
+    Returns e.g. {"UP": 1.0, "DOWN": 0.0} once Gamma shows the market closed
+    with umaResolutionStatus "resolved" (usually ~20s after the window ends,
+    sometimes minutes later). A split or cancelled market comes back as its
+    real payouts (e.g. 0.5 / 0.5). Returns None if it isn't resolved yet or
+    Gamma can't be reached; callers should simply ask again later.
+
+    This is the ground truth the market pays out on (Chainlink BTC/USD),
+    unlike Binance prices or balance changes.
+    """
+    slug = market_slug(period_minutes, window_ts)
+    try:
+        url = f"{GAMMA_API}/markets/slug/{slug}"
+        req = urllib.request.Request(url, headers={"User-Agent": "PolyBot/1.0"})
+        m = json.loads(urllib.request.urlopen(req, timeout=5).read().decode())
+    except Exception:
+        return None
+    if not m.get("closed") or m.get("umaResolutionStatus") != "resolved":
+        return None
+    try:
+        outcomes = m.get("outcomes", "[]")
+        prices = m.get("outcomePrices", "[]")
+        outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        prices = json.loads(prices) if isinstance(prices, str) else prices
+        payouts = {o.upper(): float(p) for o, p in zip(outcomes, prices)
+                   if o.lower() in ("up", "down")}
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return payouts if set(payouts) == {"UP", "DOWN"} else None
+
+
 if __name__ == "__main__":
     # Quick test
     print(f"Current window ts: {current_window_ts()}")

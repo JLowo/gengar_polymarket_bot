@@ -65,9 +65,6 @@ Polymarket's CLOB API (the order placement endpoint) blocks requests from many c
 ```bash
 # macOS
 brew install tor
-
-# Ubuntu/Debian
-sudo apt install tor
 ```
 
 **Do not start Tor manually.** The bot manages its own Tor process automatically at startup, including writing a custom `torrc` that pins exit nodes to Polymarket-friendly countries (Switzerland, Sweden, Romania, etc.).
