@@ -3,7 +3,7 @@ Proxy setup — routes all requests traffic through a SOCKS5 proxy (e.g. Tor).
 
 Call `apply_proxy()` once at startup, before any HTTP calls are made.
 This patches the default requests session so that ALL libraries using
-requests (including py_clob_client) automatically go through the proxy.
+requests (including the Polymarket SDK's) automatically go through the proxy.
 
 For Tor, call `ensure_tor()` to auto-generate a torrc that pins exit nodes
 to Polymarket-friendly countries and (re)start Tor with it.
@@ -242,7 +242,7 @@ def apply_proxy(proxy_url: str) -> None:
     Polymarket's geoblocking only applies to the CLOB API (clob.polymarket.com).
     The Gamma API (gamma-api.polymarket.com) is read-only and does not geoblock.
     Routing Gamma through Tor adds ~5-10s latency per page of market results,
-    which makes scans painfully slow. So we only proxy httpx (py_clob_client).
+    which makes scans painfully slow. So we only proxy httpx (the Polymarket SDK).
 
     Args:
         proxy_url: e.g. "socks5h://127.0.0.1:9050" for Tor.
@@ -255,7 +255,7 @@ def apply_proxy(proxy_url: str) -> None:
         return
 
     # ── 1. httpx monkey-patch (CLOB / trading) ────────────────
-    # py_clob_client constructs httpx.Client() internally. Patching __init__
+    # The Polymarket SDK constructs httpx.Client() internally. Patching __init__
     # ensures every Client gets the proxy even if it was already imported.
     try:
         import httpx
@@ -276,19 +276,9 @@ def apply_proxy(proxy_url: str) -> None:
 
         httpx.AsyncClient.__init__ = _patched_async_client_init
 
-        # Also patch the module-level singleton in py_clob_client's http_helpers.
-        # This client is created at import time (before our patch), so it never
-        # gets the proxy. Replace it with a new proxied client.
-        try:
-            from py_clob_client.http_helpers import helpers as _clob_helpers
-            _clob_helpers._http_client = httpx.Client(http2=True, proxy=proxy_url)
-            logger.info("Patched py_clob_client singleton httpx client with proxy")
-        except Exception as e:
-            logger.warning(f"Could not patch py_clob_client singleton: {e}")
-
         logger.info("httpx (CLOB) proxy patch applied — trading calls routed through proxy")
     except ImportError:
-        pass  # httpx not installed — py_clob_client won't be usable anyway
+        pass  # httpx not installed — the Polymarket SDK won't be usable anyway
 
     # NOTE: requests (Gamma API) is intentionally NOT proxied.
     # Gamma is read-only, not geoblocked, and proxying it through Tor

@@ -25,7 +25,7 @@ proxy.py            → Tor proxy for CLOB API geo-restrictions
 
 ### Key dependencies
 
-- `py-clob-client` v0.34.6 — Polymarket CLOB SDK
+- `polymarket-client` 0.20.0 (pinned) — Polymarket's unified SDK, CLOB V2. The old `py-clob-client` (v1) stopped working when CLOB V2 went live on 2026-04-28.
 - Binance WebSocket — real-time BTC price feed
 - Polymarket Gamma API (`gamma-api.polymarket.com`) — market discovery
 
@@ -71,37 +71,27 @@ All trades hold until the 5-minute window closes. No prob-stop, no price-stop, n
 
 ### 1. CLOB health check (circuit breaker)
 
-Before every trade: `self.executor.client.get_ok()` — pings Polymarket's unauthenticated health endpoint.
+Before every live trade: `self.executor.health_check()` — a plain request to the CLOB API (the SDK has no `get_ok()`).
 - Fail → increment `_consecutive_buy_failures`, skip trade
 - 3 consecutive failures → `_clob_halted = True`, Telegram alert, stop all trading
-- Auto-recovery: each new 5-min window, probe `get_ok()` again. If OK, reset and resume.
+- Auto-recovery: each new 5-min window, check again. If OK, reset and resume.
 
 ### 2. Daily loss limit
 
 `session_pnl = self.stats.bankroll - self._session_start_balance`
 If `session_pnl ≤ -DAILY_LOSS_LIMIT` (default $30): halt all trading, Telegram alert.
 
-### 3. Balance-verified buys
+### 3. Safe-only live trading
 
-- Snapshot USDC before order
-- Wait 5s + 3 verification rounds (balance check + order API check + 3s wait each)
-- Ghost fills caught via balance drop even when API throws exception
-- NEVER cancel on timeout — returns `UNVERIFIED_BUY` for pending detection
+`executor.initialize()` creates the SDK client for `SAFE_ADDRESS` and refuses to trade unless the SDK classifies it as `GNOSIS_SAFE` and the CLOB V2 trading approvals are in place. Never create the client without `wallet=` (the SDK would deploy a new Deposit Wallet). `preflight.py` runs the same checks without trading.
 
-### 4. Pending buy safety net
+### 4. Fill-and-kill buys
 
-If buy can't be verified in 14s, save order details. Next window boundary:
-- Query real balance
-- If balance dropped > $1 since buy attempt → retroactively track as filled position
-- Resolve normally (claim if won, record loss if lost)
+Buys are FAK market orders capped at `true_prob - MIN_EDGE` (and `MAX_BUY_PRICE` 0.90): fill now or cancel, nothing rests on the book. The response reports making/taking amounts; "delayed" matches are settled via `get_order`; a request that fails after possibly reaching the exchange is checked once via the token balance. (This replaced the old balance-verified buys, `UNVERIFIED_BUY` and the late-fill/phantom machinery.)
 
-### 5. Window-boundary balance sync
+### 5. Results and window-boundary sync
 
-Every new window: query real USDC balance, overwrite internal tracking. Logs drift > $0.50. This is the ultimate source of truth that corrects any accumulated errors.
-
-### 6. Minimum notional guard
-
-Before any sell: check `shares × price ≥ $5`. If below, don't attempt — hold to resolution. Polymarket rejects sells below $5 and the error previously stranded shares.
+Every trade (dry run and live) is booked from Polymarket's own resolution (Gamma `outcomePrices`), polled after the window ends. Each new window, live bankroll = pUSD balance + redeemable winnings + stakes awaiting a result; drift > $0.50 is logged. Winnings are redeemed via `redeem_positions` when a builder API key is in `.env`, otherwise claimed in the UI.
 
 ---
 
@@ -143,9 +133,9 @@ Balance API returns 6 decimals (1e6). Conditional tokens are ERC-1155 requiring 
 
 CLOB API blocks POST `/order` from datacenter/VPN IPs. Resolved by routing through Tor (`proxy.py`). If Tor exit node gets blocked, restart Tor for a new circuit. Don't try to fix with header patching — it doesn't work.
 
-### Order verification timing
+### Order verification timing (historical, v1 SDK)
 
-`create_order` (limit order) routes through complement engine in 5-15s (slower than market orders). Initial wait is 5s, then 3 rounds of verification at 3s intervals = ~14s total. If still unverified, return `UNVERIFIED_BUY` — never cancel.
+With the old v1 `create_order` path, limit orders took 5-15s to verify. The unified SDK's FAK orders report fills in the order response, so this no longer applies.
 
 ---
 
@@ -240,7 +230,7 @@ Available from Polymarket UI. Columns: `marketName`, `action` (Buy/Sell/Redeem),
 ### Key API endpoints
 
 - CLOB API: `https://clob.polymarket.com`
-  - `GET /` → health check (`get_ok()`)
+  - `GET /` → health check (`executor.health_check()`)
   - `GET /time` → server time
   - `POST /order` → place order (requires auth + Tor routing)
 - Gamma API: `https://gamma-api.polymarket.com`

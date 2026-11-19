@@ -9,9 +9,9 @@ This guide walks you through setting up PolyBot from scratch — a trading bot f
 
 ## What you'll need
 
-- A Polymarket account funded with USDC
+- A Polymarket account (with its Safe wallet) funded with pUSD, Polymarket's USD token since CLOB V2
 - A Polygon wallet (private key)
-- Python 3.10+
+- Python 3.11+ (Polymarket's SDK requires it; 3.12 recommended)
 - Tor (for geo-restriction bypass)
 - A Telegram bot (optional but strongly recommended for mobile alerts)
 
@@ -28,7 +28,7 @@ cd gengar_polybot
 
 ## Step 2 — Python environment
 
-**Check your Python version** (must be 3.10 or higher):
+**Check your Python version** (must be 3.11 or higher):
 
 ```bash
 python3 --version
@@ -49,9 +49,9 @@ pip install -r requirements.txt
 ```
 
 The key packages this installs:
-- `py-clob-client` — Polymarket CLOB SDK for order execution
+- `polymarket-client` — Polymarket's unified SDK (CLOB V2) for order execution, pinned to a tested version
 - `python-dotenv` — reads your `.env` config file
-- `websockets` + `aiohttp` — Binance real-time price feed
+- `websockets` — Binance real-time price feed
 - `httpx[socks]` + `pysocks` — Tor SOCKS5 proxy routing
 
 ---
@@ -85,30 +85,26 @@ If Tor bootstrap fails or trading starts getting rejected, just restart the bot 
 
 ## Step 4 — Polymarket wallet setup
 
-You need a Polygon wallet with USDC deposited on Polymarket. There are two wallet configurations:
+The bot trades from your **Polymarket Safe**, the proxy wallet Polymarket creates for each account (signature type 2). It refuses to trade with any other wallet type, so a wrong `SAFE_ADDRESS` can't send orders from somewhere unexpected.
 
-### Option A: Standard EOA wallet (simpler)
-
-Use your wallet's private key directly. Leave `SAFE_ADDRESS` blank in `.env`.
-
-### Option B: Polymarket Safe wallet (used by the original bot)
-
-Polymarket creates a Safe (multi-sig proxy) for each account. If you use the Polymarket UI normally, you likely have one. To find it:
+### Find your Safe address
 
 1. Go to your Polymarket profile
 2. Open browser dev tools → Network tab
 3. Look for API calls containing your wallet address — the Safe address appears as `proxyWallet`
 
-If using a Safe, set `SAFE_ADDRESS` in `.env` to that address and `signature_type` in the code will automatically be set to `2`.
+Set `PRIVATE_KEY` (the key that owns the Safe) and `SAFE_ADDRESS` in `.env`.
 
-### Depositing funds
+### Funds and trading approvals (CLOB V2)
 
-1. Go to [polymarket.com](https://polymarket.com)
-2. Connect your wallet
-3. Deposit USDC via the UI (bridges from Ethereum or direct on Polygon)
-4. Recommended starting balance: **$50–$100** to start
+Since Polymarket's CLOB V2 upgrade (28 April 2026), trading uses **pUSD** (Polymarket USD, backed 1:1 by USDC) and new exchange contracts.
 
-> **Note:** The bot tracks bankroll internally. Set `BANKROLL` in `.env` to match your actual USDC balance on Polymarket when you start.
+1. Go to [polymarket.com](https://polymarket.com) and connect your wallet
+2. Deposit, or convert existing USDC.e to pUSD, via the UI
+3. If the UI asks you to enable trading, do it: that sets the V2 approvals the bot needs
+4. Recommended starting balance: **$50–$100**
+
+> **Note:** In live mode the bot uses your real pUSD balance (plus redeemable winnings and stakes awaiting a result) as its bankroll; `BANKROLL` in `.env` only matters for dry run.
 
 ---
 
@@ -157,7 +153,7 @@ ENTRY_WINDOW_END=10
 KELLY_FRACTION=0.25
 MIN_BET=5.0
 MAX_BET=25.0
-BANKROLL=100.0   # set this to your actual USDC balance on Polymarket
+BANKROLL=100.0   # dry run only: live mode uses your real pUSD balance
 
 # ── Safety ───────────────────────────────────────────────────────────
 DAILY_LOSS_LIMIT=30   # bot halts trading if session P&L drops below -$30
@@ -236,14 +232,27 @@ The bot will then wait for trading opportunities, printing each 5-minute window 
 
 When dry-run looks healthy for a session or two:
 
-1. Set `DRY_RUN=false` in `.env`
-2. Confirm `BANKROLL` matches your actual Polymarket USDC balance
-3. Set `DAILY_LOSS_LIMIT` to a number you're comfortable losing in one day
-4. Run:
+1. **Run the pre-flight check** (places no orders, moves no money, never prints secrets):
 
-```bash
-python bot.py
-```
+   ```bash
+   .venv/bin/python preflight.py
+   ```
+
+   It checks Tor, the CLOB, that `SAFE_ADDRESS` is this key's Safe, the V2 trading approvals and your pUSD balance, and ends with **READY** or a list of what to fix.
+2. **Optional, so the bot collects winnings itself:** create a builder API key. It's saved to `.env` without being shown:
+
+   ```bash
+   .venv/bin/python preflight.py --create-builder-key
+   ```
+
+   Without it, winnings stay redeemable and you claim them in the Polymarket UI.
+3. **Start small.** For the first live session set `MAX_BET=5` and `DAILY_LOSS_LIMIT=10` in `.env`.
+4. **Make sure no other copy of the bot is running with this wallet** (another computer, an old tmux session).
+5. Set `DRY_RUN=false` in `.env` and start:
+
+   ```bash
+   ./start.sh
+   ```
 
 ---
 
@@ -273,11 +282,15 @@ The bot has several automatic safeguards:
 
 **Daily loss limit** — If your session P&L drops below `-DAILY_LOSS_LIMIT`, the bot halts and sends a Telegram alert. You must restart it manually to resume.
 
-**CLOB health check** — Before every trade, the bot pings Polymarket's health endpoint. Three consecutive failures → trading halts automatically. It auto-recovers when the API comes back.
+**CLOB health check** — Before every trade, the bot checks that Polymarket's CLOB answers. Three consecutive failures → trading halts automatically. It auto-recovers when the API comes back.
 
-**Pending buy safety net** — If an order can't be verified within ~14 seconds, it's flagged as `UNVERIFIED_BUY`. At the next window boundary, the bot checks your real balance — if it dropped, the order is retroactively tracked as filled. Orders are **never cancelled** on timeout.
+**Safe-only trading** — Live trading only starts if the SDK recognises `SAFE_ADDRESS` as this key's Polymarket Safe and the V2 trading approvals are in place.
 
-**Window-boundary balance sync** — Every 5 minutes, the bot queries your real USDC balance and overwrites internal tracking. This corrects any accumulated drift.
+**Fill-and-kill buys** — Buys fill immediately at or below the highest price that still leaves `MIN_EDGE` (never above $0.90), and anything unfilled is cancelled. Nothing rests on the book, and the order response says exactly what filled.
+
+**Results from Polymarket** — Each trade is booked from the market's own resolution (not from Binance prices or balance changes). Winnings are redeemed automatically if a builder API key is set.
+
+**Window-boundary balance sync** — Every 5 minutes, the bot sets its bankroll to your real pUSD balance plus redeemable winnings plus stakes awaiting a result. This corrects any accumulated drift.
 
 ---
 
@@ -297,7 +310,7 @@ This is the float precision bug. Make sure you're on the latest `bot.py` — the
 ### Orders not filling / always getting rejected
 - The CLOB API may be blocking your Tor exit node — restart the bot to get a new circuit
 - Check `https://status.polymarket.com` for outages
-- Verify your USDC balance is sufficient (minimum $5 per order)
+- Verify your pUSD balance is sufficient (minimum $5 per order); `preflight.py` shows it
 
 ### No trades firing in dry-run
 This is normal if BTC isn't moving significantly. The model requires an 80% probability signal, which only fires on genuine moves (0.10%+ within a 5-minute window). You may watch several empty windows before seeing a signal.
@@ -345,7 +358,7 @@ WantedBy=multi-user.target
 
 ## Key facts to understand before going live
 
-1. **This trades real USDC on Polygon.** Start with a small bankroll ($50–$100) and observe several sessions.
+1. **This trades real money (pUSD) on Polygon.** Start with a small bankroll ($50–$100) and observe several sessions.
 
 2. **The strategy holds all positions to resolution** (no stops, no take-profits). This is intentional — data showed stops cost more than they saved in 5-minute windows.
 
