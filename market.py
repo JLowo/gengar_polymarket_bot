@@ -167,14 +167,31 @@ def get_current_market(period_minutes: int = 5) -> Optional[MarketWindow]:
 CLOB_API = "https://clob.polymarket.com"
 
 
+def walk_book(asks: list, bids: list, side: str, amount: float) -> float:
+    """Price to BUY `amount` USD (walking asks) or SELL `amount` shares
+    (walking bids), from the best level until `amount` is covered. Levels are
+    (price, size) pairs in any order. If the book is too thin it returns the
+    worst level; 0.0 if that side is empty. Shared by dry run (public book)
+    and live mode (the SDK's book), so both see prices the same way.
+    """
+    if side == "BUY":
+        levels = sorted(asks, key=lambda lv: lv[0])
+        covered = lambda lv: lv[1] * lv[0]     # USD
+    else:
+        levels = sorted(bids, key=lambda lv: -lv[0])
+        covered = lambda lv: lv[1]             # shares
+    total = 0.0
+    for price, size in levels:
+        total += covered((price, size))
+        if total >= amount:
+            return price
+    return levels[-1][0] if levels else 0.0
+
+
 def get_book_price(token_id: str, side: str, amount: float) -> float:
     """Price to BUY `amount` USD of a token, or to SELL `amount` shares of it,
     from Polymarket's public order book (read-only, no wallet needed).
-
-    Walks the book from the best level until `amount` is covered, the same
-    rule py-clob-client's calculate_market_price() uses, so dry run sees the
-    price live mode would. If the book is too thin it returns the worst level
-    (as the SDK does for non-FOK orders). Returns 0.0 if there is no book.
+    Returns 0.0 if there is no book. See walk_book().
     """
     try:
         url = f"{CLOB_API}/book?token_id={token_id}"
@@ -183,18 +200,9 @@ def get_book_price(token_id: str, side: str, amount: float) -> float:
     except Exception:
         return 0.0
     try:
-        if side == "BUY":
-            levels = sorted(book.get("asks") or [], key=lambda lv: float(lv["price"]))
-            covered = lambda lv: float(lv["size"]) * float(lv["price"])   # USD
-        else:
-            levels = sorted(book.get("bids") or [], key=lambda lv: -float(lv["price"]))
-            covered = lambda lv: float(lv["size"])                         # shares
-        total = 0.0
-        for lv in levels:
-            total += covered(lv)
-            if total >= amount:
-                return float(lv["price"])
-        return float(levels[-1]["price"]) if levels else 0.0
+        asks = [(float(lv["price"]), float(lv["size"])) for lv in book.get("asks") or []]
+        bids = [(float(lv["price"]), float(lv["size"])) for lv in book.get("bids") or []]
+        return walk_book(asks, bids, side, amount)
     except (KeyError, ValueError, TypeError):
         return 0.0
 
