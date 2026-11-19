@@ -43,7 +43,7 @@ from telegram_notifier import TelegramNotifier
 from tracker import Tracker
 
 
-BOT_VERSION = "2026.03.26"
+BOT_VERSION = "2026.11.19"  # bump when trading logic changes; the dashboard groups by it
 
 FORCED_EXIT_START = 5
 FORCED_EXIT_END = 1
