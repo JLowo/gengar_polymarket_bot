@@ -469,9 +469,12 @@ class PolyBot:
 
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
         if self._current_window > 0:
-            # Record closing delta for rolling vol calculation (skip partial
-            # windows: their "open" was a mid-window price)
-            if self._opening_price > 0 and closing_btc_price > 0 and not self._partial_window:
+            # Record closing delta for rolling vol calculation. Skip partial
+            # windows (their "open" was a mid-window price) and boundaries seen
+            # late (feed stalled), whose "close" is a price from the next window.
+            close_lag = time.time() - window_ts
+            if (self._opening_price > 0 and closing_btc_price > 0 and not self._partial_window
+                    and close_lag <= OPEN_PRICE_MAX_LAG):
                 closing_delta = (closing_btc_price - self._opening_price) / self._opening_price * 100
                 self._recent_window_deltas.append(closing_delta)
                 if len(self._recent_window_deltas) > self._rolling_vol_windows:
