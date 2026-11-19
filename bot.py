@@ -315,12 +315,16 @@ class PolyBot:
             return
 
         btc_delta_pct = ((btc_price - self._opening_price) / self._opening_price) * 100
-        updated_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
-
-        if self._trade_side == "DOWN":
-            our_prob = 1.0 - updated_prob
-        else:
-            our_prob = updated_prob
+        # estimate_true_probability() works on |delta|: it returns the chance
+        # BTC finishes on the side it is on NOW, not the chance it finishes UP.
+        # Convert to P(UP) first, then take our side. (Using it directly as
+        # P(UP) inverted the figure for winning DOWN and losing UP trades.)
+        # Same vol as entry uses, so hold-period figures are comparable.
+        p_current_side = estimate_true_probability(
+            btc_delta_pct, seconds_remaining, vol=self._compute_realized_vol()
+        )
+        p_up = p_current_side if btc_delta_pct >= 0 else 1.0 - p_current_side
+        our_prob = p_up if self._trade_side == "UP" else 1.0 - p_up
 
         # Throttled check
         if now - self._last_position_check < POSITION_CHECK_INTERVAL:
