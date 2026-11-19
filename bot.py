@@ -29,7 +29,6 @@ import sys
 import time
 import signal
 import math
-import statistics
 from dotenv import load_dotenv
 
 import logging
@@ -112,7 +111,7 @@ class PolyBot:
         self._last_status_print: float = 0.0
         self._last_tick_context: dict = {}   # last entry-window state, for window-end signal logging
         self._session_start_time: float = time.time()
-        self._recent_window_deltas: list = []  # rolling abs(close_delta_pct) per window
+        self._recent_window_deltas: list = []  # rolling signed close_delta_pct per window
         self._exit_retries: int = 0
         self._exit_gave_up: bool = False
         self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
@@ -490,7 +489,7 @@ class PolyBot:
 
             # Record closing delta for rolling vol calculation
             if self._opening_price > 0 and closing_btc_price > 0:
-                closing_delta = abs((closing_btc_price - self._opening_price) / self._opening_price * 100)
+                closing_delta = (closing_btc_price - self._opening_price) / self._opening_price * 100
                 self._recent_window_deltas.append(closing_delta)
                 if len(self._recent_window_deltas) > self._rolling_vol_windows:
                     self._recent_window_deltas.pop(0)
@@ -605,15 +604,19 @@ class PolyBot:
     # ── Market prices (cached, complement engine) ───────────────────
 
     def _compute_realized_vol(self) -> float:
-        """Rolling std dev of recent window closing deltas.
+        """Realized 5-min vol: RMS of recent SIGNED window closing deltas (in %).
 
+        The Brownian model assumes zero drift, so sqrt(mean(delta²)) estimates
+        its vol directly. (The old stdev of |delta| measured only ~0.60× the
+        true vol, making the model overconfident.)
         Returns the realized vol to pass into the Brownian motion model.
         Falls back to 0.12 until at least 6 windows have accumulated.
         Floored/capped to prevent extreme values breaking the model.
         """
         min_samples = max(6, self._rolling_vol_windows // 2)
-        if len(self._recent_window_deltas) >= min_samples:
-            vol = statistics.stdev(self._recent_window_deltas)
+        deltas = self._recent_window_deltas
+        if len(deltas) >= min_samples:
+            vol = math.sqrt(sum(d * d for d in deltas) / len(deltas))
             return max(self._vol_floor, min(self._vol_cap, vol))
         return self._vol_fallback
 
