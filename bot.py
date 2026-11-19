@@ -47,6 +47,10 @@ FORCED_EXIT_END = 1
 POSITION_CHECK_INTERVAL = 3
 MAX_EXIT_RETRIES = 3
 EXIT_RETRY_COOLDOWN = 10
+# If the first fresh BTC price of a window arrives later than this (bot just
+# started mid-window, or the feed stalled), the real opening price is unknown,
+# so that window is not traded and not used for the vol estimate.
+OPEN_PRICE_MAX_LAG = 5  # seconds
 
 
 class PolyBot:
@@ -94,6 +98,7 @@ class PolyBot:
         self._last_hour_check: int = 0
 
         # Trade state
+        self._partial_window: bool = False  # True if this window's open price is unknown
         self._traded: bool = False
         self._trade_attempted: bool = False
         self._trade_side: str = ""
@@ -244,7 +249,13 @@ class PolyBot:
 
         if self._opening_price <= 0:
             self._opening_price = btc_price
-            print(f"  📌 Open: ${btc_price:,.2f}")
+            open_lag = now - window_ts
+            self._partial_window = open_lag > OPEN_PRICE_MAX_LAG
+            if self._partial_window:
+                print(f"  📌 Open: ${btc_price:,.2f} — first price came {open_lag:.0f}s into the "
+                      f"window, so the real open is unknown: not trading this window")
+            else:
+                print(f"  📌 Open: ${btc_price:,.2f}")
 
         # HOLDING: active position management
         if self._traded and not self._exited and not self._exit_gave_up:
@@ -253,6 +264,14 @@ class PolyBot:
 
         # Already done
         if self._traded or self._trade_attempted:
+            return
+
+        # Partial window: never trade against a guessed opening price
+        if self._partial_window:
+            if now - self._last_status_print >= 30:
+                self._last_status_print = now
+                print(f"  ⏱  T-{seconds_remaining:5.1f}s | BTC ${btc_price:,.2f} | "
+                      f"[PARTIAL WINDOW — waiting for the next one]")
             return
 
         # IDLE: look for entry
@@ -487,8 +506,9 @@ class PolyBot:
                     self.stats.record_loss(net_loss)
                     self._pending_phantom = {}
 
-            # Record closing delta for rolling vol calculation
-            if self._opening_price > 0 and closing_btc_price > 0:
+            # Record closing delta for rolling vol calculation (skip partial
+            # windows: their "open" was a mid-window price)
+            if self._opening_price > 0 and closing_btc_price > 0 and not self._partial_window:
                 closing_delta = (closing_btc_price - self._opening_price) / self._opening_price * 100
                 self._recent_window_deltas.append(closing_delta)
                 if len(self._recent_window_deltas) > self._rolling_vol_windows:
@@ -562,6 +582,8 @@ class PolyBot:
 
         self._current_window = window_ts
         self._opening_price = 0.0
+        self._partial_window = False
+        self._last_tick_context = {}
         self._traded = False
         self._trade_attempted = False
         self._exited = False
