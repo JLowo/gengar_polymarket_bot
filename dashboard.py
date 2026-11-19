@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import webbrowser
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 LOG_DIR = "logs"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8050
@@ -44,14 +44,38 @@ def get_all_trades():
     return trades
 
 def get_skipped():
-    return load_csv(os.path.join(LOG_DIR, "skipped.csv"))
+    """Signals the bot evaluated but didn't trade.
+
+    Uses skipped.csv if one exists; otherwise derives the rows from
+    signals.csv (every non-traded row, with its skip reason). The bot doesn't
+    yet record whether a skipped signal would have won, so would_have_won is
+    left blank there and the charts show it as "not logged".
+    """
+    path = os.path.join(LOG_DIR, "skipped.csv")
+    if os.path.exists(path):
+        return load_csv(path)
+    skipped = []
+    for row in load_csv(os.path.join(LOG_DIR, "signals.csv")):
+        if row.get("action") == "traded":
+            continue
+        v = row.get("version") or "15"
+        skipped.append({
+            "reason": row.get("skip_reason") or row.get("action") or "unknown",
+            "version": v if str(v).startswith("v") else f"v{v}",
+            "would_have_won": "",
+            "window_time": row.get("window_time", ""),
+            "side": row.get("side", ""),
+        })
+    return skipped
 
 def get_hold_ticks():
     return load_csv(os.path.join(LOG_DIR, "hold_ticks.csv"))
 
 # ── HTTP handler ───────────────────────────────────────────────────
 
-class DashboardHandler(SimpleHTTPRequestHandler):
+# BaseHTTPRequestHandler, not SimpleHTTPRequestHandler: only the routes below
+# exist, so no request can reach files on disk (e.g. .env).
+class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/trades":
             self._json_response(get_all_trades())
@@ -69,7 +93,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -92,7 +115,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PolyBot Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.js"
+        integrity="sha384-zYPBGXwO4633CABX/5Spf6emCKUJCfoOkhOMYyxMsatqQZPnDblmmOewfjsIVWCM" crossorigin="anonymous"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #0a0a1a; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
@@ -275,6 +299,7 @@ function renderStats(trades, skipped) {
   const pnl = trades.reduce((s, t) => s + parseFloat(t.profit || 0), 0);
   const wr = totalTrades > 0 ? (wins / totalTrades * 100) : 0;
   const skippedWon = skipped.filter(s => s.would_have_won === 'True').length;
+  const skippedKnown = skipped.filter(s => s.would_have_won === 'True' || s.would_have_won === 'False').length;
 
   // Profit factor = gross wins / gross losses
   const grossWins = trades.filter(t => parseFloat(t.profit || 0) > 0).reduce((s, t) => s + parseFloat(t.profit), 0);
@@ -312,7 +337,7 @@ function renderStats(trades, skipped) {
     <div class="stat-card"><div class="label">Expectancy</div><div class="value ${expectancy >= 0 ? 'green' : 'red'}">$${expectancy >= 0 ? '+' : ''}${expectancy.toFixed(2)}</div><div class="sub">per trade</div></div>
     <div class="stat-card"><div class="label">Max Drawdown</div><div class="value red">$${maxDD.toFixed(2)}</div></div>
     <div class="stat-card"><div class="label">ROI</div><div class="value ${roi >= 0 ? 'green' : 'red'}">${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%</div><div class="sub">on $${totalDeployed.toFixed(0)} deployed</div></div>
-    <div class="stat-card"><div class="label">Skipped</div><div class="value">${skipped.length}</div><div class="sub">${skippedWon} would have won</div></div>
+    <div class="stat-card"><div class="label">Skipped</div><div class="value">${skipped.length}</div><div class="sub">${skippedKnown ? `${skippedWon} of ${skippedKnown} would have won` : 'outcome not logged'}</div></div>
   `;
 }
 
@@ -462,8 +487,10 @@ function renderSkippedBar(skipped) {
   const reasons = {};
   skipped.forEach(s => {
     const r = s.reason || 'unknown';
-    if (!reasons[r]) reasons[r] = { won: 0, lost: 0 };
-    s.would_have_won === 'True' ? reasons[r].won++ : reasons[r].lost++;
+    if (!reasons[r]) reasons[r] = { won: 0, lost: 0, unknown: 0 };
+    if (s.would_have_won === 'True') reasons[r].won++;
+    else if (s.would_have_won === 'False') reasons[r].lost++;
+    else reasons[r].unknown++;
   });
   const labels = Object.keys(reasons).map(r => r.replace(/_/g, ' '));
   CHART_INSTANCES.skippedBar = new Chart(document.getElementById('skippedBarChart'), {
@@ -473,6 +500,7 @@ function renderSkippedBar(skipped) {
       datasets: [
         { label: 'Would Have Won', data: Object.values(reasons).map(v => v.won), backgroundColor: GREEN + 'cc', borderColor: GREEN, borderWidth: 1 },
         { label: 'Would Have Lost', data: Object.values(reasons).map(v => v.lost), backgroundColor: RED + 'cc', borderColor: RED, borderWidth: 1 },
+        { label: 'Outcome Not Logged', data: Object.values(reasons).map(v => v.unknown), backgroundColor: '#888888cc', borderColor: '#888888', borderWidth: 1 },
       ]
     },
     options: { plugins: { legend: { position: 'top' } }, scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } } }
@@ -482,7 +510,8 @@ function renderSkippedBar(skipped) {
 function renderSkippedPie(skipped) {
   if (!skipped.length) return;
   const won = skipped.filter(s => s.would_have_won === 'True').length;
-  const lost = skipped.length - won;
+  const lost = skipped.filter(s => s.would_have_won === 'False').length;
+  if (!won && !lost) return;   // outcomes not logged: don't draw a fake 0%
   CHART_INSTANCES.skippedPie = new Chart(document.getElementById('skippedPieChart'), {
     type: 'doughnut',
     data: {
@@ -679,6 +708,7 @@ init();
 if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
     print(f"  PolyBot Dashboard running at http://localhost:{PORT}")
+    print(f"  (also reachable from other devices on your network)")
     print(f"  Press Ctrl+C to stop\n")
     webbrowser.open(f"http://localhost:{PORT}")
     try:

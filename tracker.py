@@ -47,6 +47,7 @@ SIGNAL_FIELDS = [
     "actual_edge",      # Edge at actual price
     "fill_price",       # What we actually paid (0 if not traded)
     "slippage",         # fill_price - market_price (0 if not traded)
+    "version",          # BOT_VERSION that logged the row (dashboard filter)
 ]
 
 # ── Trade record ────────────────────────────────────────────────────
@@ -150,7 +151,8 @@ SESSION_FIELDS = [
 
 
 class Tracker:
-    def __init__(self, log_dir: str = "logs", log_executions: bool = False):
+    def __init__(self, log_dir: str = "logs", log_executions: bool = False, version: str = ""):
+        self.version = version   # written to every signals.csv row
         self.log_dir = log_dir
         self.log_executions = log_executions
         os.makedirs(log_dir, exist_ok=True)
@@ -252,6 +254,7 @@ class Tracker:
             "actual_edge": round(actual_edge, 4),
             "fill_price": round(fill_price, 4),
             "slippage": round(slippage, 4),
+            "version": self.version,
         }
         self._append_row(self._signal_path, row, SIGNAL_FIELDS)
 

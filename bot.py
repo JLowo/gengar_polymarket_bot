@@ -98,6 +98,7 @@ class PolyBot:
         self.tracker = Tracker(
             log_dir=os.getenv("LOG_DIR", "logs"),
             log_executions=os.getenv("LOG_EXECUTIONS", "false").lower() == "true",
+            version=BOT_VERSION,
         )
         self.stats = TradingStats(bankroll=initial_bankroll)
         self.stats.hourly.hour_start = time.time()
