@@ -199,12 +199,13 @@ def get_book_price(token_id: str, side: str, amount: float) -> float:
         return 0.0
 
 
-def get_resolved_side(window_ts: int, period_minutes: int = 5) -> Optional[str]:
-    """Winning side of a finished window according to Polymarket itself.
+def get_resolution_payouts(window_ts: int, period_minutes: int = 5) -> Optional[dict]:
+    """Payout per share for each side of a finished window, per Polymarket.
 
-    Returns "UP" or "DOWN" once Gamma shows the market closed with
-    umaResolutionStatus "resolved" (usually ~20s after the window ends,
-    sometimes minutes later). Returns None if it isn't resolved yet or
+    Returns e.g. {"UP": 1.0, "DOWN": 0.0} once Gamma shows the market closed
+    with umaResolutionStatus "resolved" (usually ~20s after the window ends,
+    sometimes minutes later). A split or cancelled market comes back as its
+    real payouts (e.g. 0.5 / 0.5). Returns None if it isn't resolved yet or
     Gamma can't be reached; callers should simply ask again later.
 
     This is the ground truth the market pays out on (Chainlink BTC/USD),
@@ -224,12 +225,11 @@ def get_resolved_side(window_ts: int, period_minutes: int = 5) -> Optional[str]:
         prices = m.get("outcomePrices", "[]")
         outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
         prices = json.loads(prices) if isinstance(prices, str) else prices
-        for outcome, price in zip(outcomes, prices):
-            if float(price) >= 0.99 and outcome.lower() in ("up", "down"):
-                return outcome.upper()
+        payouts = {o.upper(): float(p) for o, p in zip(outcomes, prices)
+                   if o.lower() in ("up", "down")}
     except (ValueError, TypeError, AttributeError):
-        pass
-    return None
+        return None
+    return payouts if set(payouts) == {"UP", "DOWN"} else None
 
 
 if __name__ == "__main__":

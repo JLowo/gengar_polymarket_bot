@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from market import (get_current_market, current_window_ts, get_resolved_side,
+from market import (get_current_market, current_window_ts, get_resolution_payouts,
                     get_book_price, PERIOD_SECONDS)
 from price_feed import BinancePriceFeed
 from strategy import evaluate, estimate_true_probability, get_skip_reason, StrategyConfig, TradingStats
@@ -1052,8 +1052,8 @@ class PolyBot:
 
         still_waiting = []
         for p in self._pending_resolutions:
-            winner = get_resolved_side(p["window_ts"], self.period)
-            if winner is None:
+            payouts = get_resolution_payouts(p["window_ts"], self.period)
+            if payouts is None:
                 if now - p["since"] > RESOLUTION_GIVE_UP_AFTER:
                     t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
                     msg = (f"No Polymarket result for the {t} window after "
@@ -1064,15 +1064,18 @@ class PolyBot:
                 else:
                     still_waiting.append(p)
                 continue
-            self._book_market_resolution(p, winner)
+            self._book_market_resolution(p, payouts)
         self._pending_resolutions = still_waiting
 
-    def _book_market_resolution(self, p: dict, winner: str):
-        """Apply a queued trade's result now that Polymarket has resolved it."""
-        won = winner == p["side"]
-        payout = p["shares"] * 1.0 if won else 0.0
+    def _book_market_resolution(self, p: dict, payouts: dict):
+        """Apply a queued trade's result now that Polymarket has resolved it.
+        payouts is per-share, e.g. {"UP": 1.0, "DOWN": 0.0}, or 0.5/0.5 if split."""
+        per_share = payouts.get(p["side"], 0.0)
+        won = per_share >= 0.99
+        winner = max(payouts, key=payouts.get) if max(payouts.values()) >= 0.99 else "SPLIT"
+        payout = p["shares"] * per_share
         profit = p["exit_revenue"] + payout - p["cost"]
-        if won and self.dry_run:
+        if payout > 0 and self.dry_run:
             # Paper payout. Live cash shows up via the window-boundary balance sync.
             self.stats.bankroll += payout
         if profit > 0:
@@ -1093,6 +1096,7 @@ class PolyBot:
             exit_revenue=p["exit_revenue"],
             resolution_method="market_outcome",
             claim_result=p["claim_result"],
+            resolution_payout=payout,
             trade_id=p["trade_id"],
         )
 

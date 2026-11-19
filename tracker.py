@@ -299,6 +299,7 @@ class Tracker:
         exit_revenue: float = 0.0,
         resolution_method: str = "binance_fallback",
         claim_result: str = "not_attempted",
+        resolution_payout: Optional[float] = None,
         *,
         trade_id: int,
     ):
@@ -317,7 +318,8 @@ class Tracker:
         side = t.get("side", "")
 
         btc_delta = ((btc_final_price - opening_price) / opening_price * 100) if opening_price > 0 else 0
-        resolution_payout = entry_shares * 1.0 if won else 0.0
+        if resolution_payout is None:   # caller didn't give the real payout
+            resolution_payout = entry_shares * 1.0 if won else 0.0
         profit_if_held = resolution_payout - entry_cost
 
         t["btc_final_price"] = round(btc_final_price, 2)
