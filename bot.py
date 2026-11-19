@@ -56,6 +56,9 @@ OPEN_PRICE_MAX_LAG = 5  # seconds
 # are booked from Polymarket's own resolution (Gamma), checked this often.
 RESOLUTION_POLL_INTERVAL = 10      # seconds
 RESOLUTION_GIVE_UP_AFTER = 3600    # stop waiting (and alert) after an hour
+# No price fetches this close to the window end, so a slow request can't delay
+# the boundary tick past OPEN_PRICE_MAX_LAG and make the next window "partial".
+PRICE_FETCH_CUTOFF = 15            # seconds before close
 
 
 class PolyBot:
@@ -159,6 +162,7 @@ class PolyBot:
         self._cached_down: float = 0.50
         self._price_last_fetched: float = 0.0
         self._PRICE_REFRESH: float = 5.0
+        self._market = None              # this window's MarketWindow, looked up once
 
         # Circuit breaker — detects CLOB API degradation
         self._consecutive_buy_failures: int = 0
@@ -606,12 +610,17 @@ class PolyBot:
     def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
         # Dry run reads the same real order book as live (public, read-only),
         # instead of the old synthetic price model, so paper trades are realistic.
+        # Only fetch inside the entry window (and not right before close).
+        cfg = self.strategy_config
+        if (seconds_remaining > cfg.entry_window_start
+                or seconds_remaining < max(cfg.entry_window_end, PRICE_FETCH_CUTOFF)):
+            return self._cached_up, self._cached_down
         now = time.time()
         if now - self._price_last_fetched < self._PRICE_REFRESH:
             return self._cached_up, self._cached_down
 
         try:
-            market = get_current_market(self.period)
+            market = self._window_market()
             if not market:
                 return self._cached_up, self._cached_down
 
@@ -635,6 +644,16 @@ class PolyBot:
         except Exception as e:
             print(f"[price] Error: {e}")
             return self._cached_up, self._cached_down
+
+    def _window_market(self):
+        """This window's market (token ids never change within a window), looked
+        up on Gamma once and cached instead of on every price refresh."""
+        if self._market is None or self._market.window_start != self._current_window:
+            market = get_current_market(self.period)
+            if market and market.window_start == self._current_window:
+                self._market = market
+            return market
+        return self._market
 
     def _buy_price(self, token_id: str, amount_usd: float) -> float:
         """Price to buy amount_usd of a token: via the executor when trading
@@ -682,7 +701,7 @@ class PolyBot:
             self.telegram.status_update({"alert": msg})
             return
 
-        market = get_current_market(self.period)
+        market = self._window_market()
         if not market:
             print(f"  ⚠️  {sig.side} signal, but this window's market wasn't found — skipping")
             return
