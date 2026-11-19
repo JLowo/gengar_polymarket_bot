@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from market import get_current_market, current_window_ts, PERIOD_SECONDS
+from market import get_current_market, current_window_ts, get_resolved_side, PERIOD_SECONDS
 from price_feed import BinancePriceFeed
 from strategy import evaluate, estimate_true_probability, get_skip_reason, StrategyConfig, TradingStats
 from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE
@@ -51,6 +51,10 @@ EXIT_RETRY_COOLDOWN = 10
 # started mid-window, or the feed stalled), the real opening price is unknown,
 # so that window is not traded and not used for the vol estimate.
 OPEN_PRICE_MAX_LAG = 5  # seconds
+# Trades whose result isn't known at the window boundary wait in a list and
+# are booked from Polymarket's own resolution (Gamma), checked this often.
+RESOLUTION_POLL_INTERVAL = 10      # seconds
+RESOLUTION_GIVE_UP_AFTER = 3600    # stop waiting (and alert) after an hour
 
 
 class PolyBot:
@@ -122,9 +126,11 @@ class PolyBot:
         self._exit_gave_up: bool = False
         self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
 
-        # Pending phantom verification (claim sell reported success but balance didn't move yet)
-        # Resolved at next window boundary once Polygon settlement has had time to land.
-        self._pending_phantom: dict = {}
+        # Trades whose result wasn't known at the window boundary (dry run, or a
+        # live claim that couldn't be confirmed). Booked from Polymarket's own
+        # resolution by _check_pending_resolutions(), not from balance changes.
+        self._pending_resolutions: list = []
+        self._last_resolution_check: float = 0.0
 
         # Pending buy (unverified — Polygon settlement too slow)
         self._pending_buy_side: str = ""
@@ -229,6 +235,7 @@ class PolyBot:
             try:
                 self._tick()
                 self._check_hourly_summary()
+                self._check_pending_resolutions()
             except Exception as e:
                 print(f"[error] {e}")
                 self.telegram.error_alert(str(e))
@@ -453,62 +460,6 @@ class PolyBot:
 
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
         if self._current_window > 0:
-            # Resolve any pending phantom sell from the previous window.
-            # Must run before trade state is reset below.
-            # Balance is fetched once here and reused by the sync below.
-            if self._pending_phantom:
-                pp = self._pending_phantom
-                if not self.dry_run and self.executor._initialized:
-                    real_bal = self.executor.get_balance()
-                    if real_bal > 0:
-                        balance_increase = max(0.0, real_bal - pp["pre_sell_balance"])
-                        if balance_increase > pp["expected_revenue"] * 0.50:
-                            # Settlement landed — it was a real win
-                            profit = balance_increase - pp["cost"]
-                            self.stats.record_win(profit)
-                            self.stats.bankroll = real_bal
-                            self._last_real_balance = real_bal
-                            print(f"  ✅ Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
-                                  f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
-                            self.telegram.win_alert(profit, self.stats.total_pnl)
-                            btc_price, _ = self.price_feed.get_price()
-                            self.tracker.log_trade_resolve(
-                                btc_final_price=btc_price,
-                                opening_price=pp["opening_price"],
-                                won=True,
-                                profit=profit,
-                                exit_revenue=pp["exit_revenue"],
-                                resolution_method="phantom_resolved",
-                                claim_result="phantom_resolved",
-                                trade_id=pp.get("trade_id", 0),
-                            )
-                        else:
-                            # Balance still hasn't moved — genuine loss
-                            net_loss = pp["cost"] - pp["exit_revenue"]
-                            self.stats.record_loss(net_loss)
-                            self.stats.bankroll = real_bal
-                            self._last_real_balance = real_bal
-                            print(f"  ❌ Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
-                                  f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
-                            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
-                            btc_price, _ = self.price_feed.get_price()
-                            self.tracker.log_trade_resolve(
-                                btc_final_price=btc_price,
-                                opening_price=pp["opening_price"],
-                                won=False,
-                                profit=-net_loss,
-                                exit_revenue=pp["exit_revenue"],
-                                resolution_method="phantom_confirmed",
-                                claim_result="phantom_confirmed",
-                                trade_id=pp.get("trade_id", 0),
-                            )
-                        self._pending_phantom = {}
-                else:
-                    # Dry run or executor not ready — treat as loss
-                    net_loss = pp["cost"] - pp["exit_revenue"]
-                    self.stats.record_loss(net_loss)
-                    self._pending_phantom = {}
-
             # Record closing delta for rolling vol calculation (skip partial
             # windows: their "open" was a mid-window price)
             if self._opening_price > 0 and closing_btc_price > 0 and not self._partial_window:
@@ -886,19 +837,10 @@ class PolyBot:
         original_cost = self._trade_cost
         remaining_shares = self._trade_shares
 
-        # ── Dry run: Binance price fallback ──────────────────────────
+        # ── Dry run: book from Polymarket's real result ──────────────
+        # (Binance can disagree with the Chainlink price the market settles on.)
         if self.dry_run:
-            btc_price, _ = self.price_feed.get_price()
-            if self._opening_price <= 0 or btc_price <= 0:
-                return
-            won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
-            self._record_resolution(
-                won=won,
-                original_cost=original_cost,
-                remaining_shares=remaining_shares,
-                resolution_method="binance_fallback",
-                claim_revenue=0.0,
-            )
+            self._defer_resolution(original_cost, remaining_shares)
             return
 
         # ── Live: attempt claim sell first — result is the truth ─────
@@ -1015,21 +957,10 @@ class PolyBot:
                     print(f"  ⚠️  Cannot determine resolution outcome — skipping")
                     return
             else:
-                if pre_sell_balance <= 0:
-                    pre_sell_balance = self.executor.get_balance()
-                print(f"  ⏳ Resolution deferred to next window balance sync")
-                self._pending_phantom = {
-                    "pre_sell_balance": pre_sell_balance,
-                    "expected_revenue": remaining_shares * 0.99,
-                    "cost": original_cost,
-                    "exit_revenue": self._exit_revenue,
-                    "shares": remaining_shares,
-                    "side": self._trade_side,
-                    "token_id": self._trade_token_id,
-                    "window_ts": self._current_window,
-                    "opening_price": self._opening_price,
-                    "trade_id": self._trade_id,
-                }
+                # Claim couldn't be confirmed. Don't infer the result from
+                # balance changes (a buy in the next window can make a win
+                # look like a loss): wait for Polymarket's resolution.
+                self._defer_resolution(original_cost, remaining_shares, claim_result)
                 return
 
         if won is None:
@@ -1042,6 +973,85 @@ class PolyBot:
             resolution_method=resolution_method,
             claim_revenue=claim_revenue,
             claim_result=claim_result,
+        )
+
+    def _defer_resolution(self, original_cost: float, remaining_shares: float,
+                          claim_result: str = "not_attempted"):
+        """Queue the just-finished trade to be booked from Polymarket's result."""
+        btc_price, _ = self.price_feed.get_price()
+        self._pending_resolutions.append({
+            "window_ts": self._current_window,
+            "side": self._trade_side,
+            "trade_id": self._trade_id,
+            "cost": original_cost,
+            "shares": remaining_shares,
+            "exit_revenue": self._exit_revenue,
+            "opening_price": self._opening_price,
+            "closing_price": btc_price,
+            "claim_result": claim_result,
+            "since": time.time(),
+        })
+        t = time.strftime("%H:%M", time.localtime(self._current_window))
+        print(f"  ⏳ {self._trade_side} trade in the {t} window: waiting for Polymarket's result")
+
+    def _check_pending_resolutions(self):
+        """Book any queued trades whose market Polymarket has now resolved."""
+        if not self._pending_resolutions:
+            return
+        now = time.time()
+        if now - self._last_resolution_check < RESOLUTION_POLL_INTERVAL:
+            return
+        # Keep slow HTTP calls away from the window boundary, where the
+        # opening price is captured.
+        into_window = now % PERIOD_SECONDS[self.period]
+        if into_window < 2 or PERIOD_SECONDS[self.period] - into_window < 10:
+            return
+        self._last_resolution_check = now
+
+        still_waiting = []
+        for p in self._pending_resolutions:
+            winner = get_resolved_side(p["window_ts"], self.period)
+            if winner is None:
+                if now - p["since"] > RESOLUTION_GIVE_UP_AFTER:
+                    t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
+                    msg = (f"No Polymarket result for the {t} window after "
+                           f"{RESOLUTION_GIVE_UP_AFTER // 60} min — trade {p['trade_id']} "
+                           f"({p['side']}, ${p['cost']:.2f}) NOT booked; check it manually")
+                    print(f"  ⚠️  {msg}")
+                    self.telegram.error_alert(msg)
+                else:
+                    still_waiting.append(p)
+                continue
+            self._book_market_resolution(p, winner)
+        self._pending_resolutions = still_waiting
+
+    def _book_market_resolution(self, p: dict, winner: str):
+        """Apply a queued trade's result now that Polymarket has resolved it."""
+        won = winner == p["side"]
+        payout = p["shares"] * 1.0 if won else 0.0
+        profit = p["exit_revenue"] + payout - p["cost"]
+        if won and self.dry_run:
+            # Paper payout. Live cash shows up via the window-boundary balance sync.
+            self.stats.bankroll += payout
+        if profit > 0:
+            self.stats.record_win(profit)
+            self.telegram.win_alert(profit, self.stats.total_pnl)
+        else:
+            self.stats.record_loss(-profit)
+            self.telegram.loss_alert(-profit, self.stats.total_pnl)
+        t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
+        print(f"  {'✅ WIN' if won else '❌ LOSS'} ({p['side']} in the {t} window; "
+              f"Polymarket resolved {winner}) ${profit:+.2f} [market_outcome] | "
+              f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
+        self.tracker.log_trade_resolve(
+            btc_final_price=p["closing_price"],
+            opening_price=p["opening_price"],
+            won=won,
+            profit=profit,
+            exit_revenue=p["exit_revenue"],
+            resolution_method="market_outcome",
+            claim_result=p["claim_result"],
+            trade_id=p["trade_id"],
         )
 
     def _record_resolution(
@@ -1149,6 +1159,10 @@ class PolyBot:
               f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})")
         if self._unclaimed_winnings > 0:
             print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
+        for p in self._pending_resolutions:
+            t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
+            print(f"  ⏳ Not booked (no Polymarket result yet): {p['side']} in the {t} window, "
+                  f"${p['cost']:.2f} staked")
         print(f"{'═' * 55}")
 
         self.telegram.status_update(o)

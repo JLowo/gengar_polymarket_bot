@@ -164,6 +164,39 @@ def get_current_market(period_minutes: int = 5) -> Optional[MarketWindow]:
     )
 
 
+def get_resolved_side(window_ts: int, period_minutes: int = 5) -> Optional[str]:
+    """Winning side of a finished window according to Polymarket itself.
+
+    Returns "UP" or "DOWN" once Gamma shows the market closed with
+    umaResolutionStatus "resolved" (usually ~20s after the window ends,
+    sometimes minutes later). Returns None if it isn't resolved yet or
+    Gamma can't be reached; callers should simply ask again later.
+
+    This is the ground truth the market pays out on (Chainlink BTC/USD),
+    unlike Binance prices or balance changes.
+    """
+    slug = market_slug(period_minutes, window_ts)
+    try:
+        url = f"{GAMMA_API}/markets/slug/{slug}"
+        req = urllib.request.Request(url, headers={"User-Agent": "PolyBot/1.0"})
+        m = json.loads(urllib.request.urlopen(req, timeout=5).read().decode())
+    except Exception:
+        return None
+    if not m.get("closed") or m.get("umaResolutionStatus") != "resolved":
+        return None
+    try:
+        outcomes = m.get("outcomes", "[]")
+        prices = m.get("outcomePrices", "[]")
+        outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        prices = json.loads(prices) if isinstance(prices, str) else prices
+        for outcome, price in zip(outcomes, prices):
+            if float(price) >= 0.99 and outcome.lower() in ("up", "down"):
+                return outcome.upper()
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
 if __name__ == "__main__":
     # Quick test
     print(f"Current window ts: {current_window_ts()}")
