@@ -63,8 +63,11 @@ def main():
     check(bool(pk), "PRIVATE_KEY is set", "PRIVATE_KEY is empty")
     check(bool(safe), f"SAFE_ADDRESS is set ({safe[:6]}…{safe[-4:]})" if safe else "",
           "SAFE_ADDRESS is empty")
-    dry = os.getenv("DRY_RUN", "true")
-    print(f"  {NOTE} DRY_RUN={dry!r} ({'dry run' if dry.lower() == 'true' else 'LIVE TRADING'})")
+    from bot import dry_run_from_env   # the bot's own rule: only "false" is live
+    dry_raw = os.getenv("DRY_RUN")
+    is_dry, recognised = dry_run_from_env(dry_raw)
+    print(f"  {NOTE} DRY_RUN={dry_raw!r} → {'dry run' if is_dry else 'LIVE TRADING'}"
+          f"{'' if recognised else ' (not true/false, so the bot treats it as a dry run)'}")
     print(f"  {NOTE} MAX_BET={os.getenv('MAX_BET', '25.0 (default)')} | "
           f"DAILY_LOSS_LIMIT={os.getenv('DAILY_LOSS_LIMIT', '30.0 (default)')} | "
           f"BANKROLL={os.getenv('BANKROLL', '100.0 (default)')} (live uses the real balance)")

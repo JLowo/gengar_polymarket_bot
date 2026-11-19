@@ -64,11 +64,22 @@ PRICE_FETCH_CUTOFF = 15            # seconds before close
 AWAITING_PAYOUT_MAX = 1800         # seconds
 
 
+def dry_run_from_env(value) -> tuple:
+    """(dry_run, recognised) for a DRY_RUN setting. Only an explicit "false"
+    trades live; anything else (missing, empty, a typo) is a dry run, so a
+    blank line in .env can never start live trading by accident."""
+    v = (value if value is not None else "true").strip().lower()
+    return v != "false", v in ("true", "false")
+
+
 class PolyBot:
     def __init__(self):
         load_dotenv()
 
-        self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+        self.dry_run, recognised = dry_run_from_env(os.getenv("DRY_RUN"))
+        if not recognised:
+            print(f"[config] DRY_RUN={os.getenv('DRY_RUN')!r} isn't 'true' or 'false': "
+                  f"running as a DRY RUN. Set DRY_RUN=false to trade live.")
         self.period = int(os.getenv("MARKET_PERIOD", "5"))
 
         self.strategy_config = StrategyConfig(
