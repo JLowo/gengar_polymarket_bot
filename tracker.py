@@ -351,6 +351,20 @@ class Tracker:
         # Write the complete trade record
         self._append_row(self._trade_path, t, TRADE_FIELDS)
 
+    def log_trade_unresolved(self, reason: str, *, trade_id: int):
+        """Write a row for a trade whose result never arrived (bot stopped, or
+        no resolution in time) so trades.csv still has it. The result columns
+        (won_resolution, profit, ...) stay blank; resolution_method says why."""
+        t = self._open_trades.pop(trade_id, None)
+        if not t:
+            return
+        if trade_id == self._active_trade_id:
+            self._active_trade_id = 0
+        t["resolution_method"] = reason
+        if t.get("min_sell_price_seen", 999) >= 999:
+            t["min_sell_price_seen"] = 0.0
+        self._append_row(self._trade_path, t, TRADE_FIELDS)
+
     # ── Execution logging ───────────────────────────────────────────
 
     def log_execution(

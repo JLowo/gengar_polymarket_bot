@@ -1061,6 +1061,7 @@ class PolyBot:
                            f"({p['side']}, ${p['cost']:.2f}) NOT booked; check it manually")
                     print(f"  ⚠️  {msg}")
                     self.telegram.error_alert(msg)
+                    self.tracker.log_trade_unresolved("unresolved_timeout", trade_id=p["trade_id"])
                 else:
                     still_waiting.append(p)
                 continue
@@ -1213,10 +1214,16 @@ class PolyBot:
               f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})")
         if self._unclaimed_winnings > 0:
             print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
+        # Trades without a result still get a trades.csv row (result left blank)
         for p in self._pending_resolutions:
             t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
             print(f"  ⏳ Not booked (no Polymarket result yet): {p['side']} in the {t} window, "
                   f"${p['cost']:.2f} staked")
+            self.tracker.log_trade_unresolved("unresolved_at_shutdown", trade_id=p["trade_id"])
+        if self._traded and self._trade_id:
+            print(f"  ⏳ Open position at shutdown: {self._trade_side}, ${self._trade_cost:.2f} staked "
+                  f"— resolves on Polymarket without the bot")
+            self.tracker.log_trade_unresolved("open_at_shutdown", trade_id=self._trade_id)
         print(f"{'═' * 55}")
 
         self.telegram.status_update(o)
