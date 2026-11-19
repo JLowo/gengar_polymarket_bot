@@ -56,6 +56,21 @@ BALANCE_CHECK_TRIES = 3         # token-balance reads after an uncertain buy
 UNKNOWN_FILL = "UNKNOWN_FILL"   # error prefix: couldn't tell whether a buy filled
 
 
+def _optional_approval_targets() -> set:
+    """Contracts whose approvals the bot doesn't need: Polymarket's perpetuals
+    deposit contract and its auto-redeem operator (the bot redeems winnings
+    itself). The SDK's "fully approved" includes them, but granting them would
+    give contracts the bot never uses unlimited pUSD spending or control of
+    all outcome shares. If the SDK layout changes, nothing is optional."""
+    try:
+        from polymarket.environments import PRODUCTION
+        from polymarket._internal.environment import get_environment_config
+        c = get_environment_config(PRODUCTION)
+        return {c.perps_deposit_contract.lower(), c.auto_redeem_operator.lower()}
+    except Exception:
+        return set()
+
+
 @dataclass
 class OrderResult:
     success: bool
@@ -141,13 +156,19 @@ class Executor:
 
     def account_status(self) -> SimpleNamespace:
         """What live trading needs, read from Polymarket (after connect()):
-        wallet_type, approved, missing approvals, pUSD balance (None if unreadable),
+        wallet_type, approved (every approval CLOB trading needs), missing (those
+        still to grant), optional_missing (perps / auto-redeem approvals not
+        granted, which the bot doesn't need), pUSD balance (None if unreadable),
         and is_safe / ready summaries. Shared by initialize() and preflight.py."""
         st = SimpleNamespace(wallet_type=self.wallet_type, is_safe=self.wallet_type == "GNOSIS_SAFE",
-                             approved=False, missing=None, balance=None, error="")
+                             approved=False, missing=None, optional_missing=0, balance=None, error="")
         try:
-            approvals = self.client.get_trading_approvals_state()
-            st.approved, st.missing = approvals.is_fully_approved, approvals.missing
+            missing = self.client.get_trading_approvals_state().missing
+            optional = _optional_approval_targets()
+            needed = ([a for a in missing.erc20 if a.spender.lower() not in optional]
+                      + [a for a in missing.erc1155 if a.operator.lower() not in optional])
+            st.approved, st.missing = not needed, tuple(needed)
+            st.optional_missing = len(missing.erc20) + len(missing.erc1155) - len(needed)
         except Exception as e:
             st.error = f"Could not read trading approvals: {type(e).__name__}: {e}"
         try:

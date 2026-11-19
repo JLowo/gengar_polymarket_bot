@@ -117,6 +117,9 @@ def main():
         check(st.approved, "CLOB V2 trading approvals are in place",
               f"Trading approvals missing: {st.missing or st.error} "
               f"(enable trading in the Polymarket UI)")
+        if st.optional_missing:
+            print(f"  {NOTE} {st.optional_missing} approval(s) for Polymarket perps / auto-redeem "
+                  f"not granted: not needed by the bot, and safer left off")
         min_bet = float(os.getenv("MIN_BET", "5.0"))
         if st.balance is None:
             check(False, "", st.error)
