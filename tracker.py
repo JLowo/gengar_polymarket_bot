@@ -299,15 +299,16 @@ class Tracker:
         exit_revenue: float = 0.0,
         resolution_method: str = "binance_fallback",
         claim_result: str = "not_attempted",
-        trade_id: int = 0,
+        *,
+        trade_id: int,
     ):
-        """Write the trade's row. trade_id defaults to the active trade; pass it
-        explicitly when resolving a trade after the next one has opened."""
-        tid = trade_id or self._active_trade_id
-        t = self._open_trades.pop(tid, None)
+        """Write the trade's row. trade_id is required: a trade can resolve after
+        the next one has opened, so never fall back to "whichever is active"."""
+        t = self._open_trades.pop(trade_id, None)
         if not t:
+            print(f"[tracker] No open trade #{trade_id} to resolve — row not written")
             return
-        if tid == self._active_trade_id:
+        if trade_id == self._active_trade_id:
             self._active_trade_id = 0
 
         entry_cost = t.get("entry_cost", 0)

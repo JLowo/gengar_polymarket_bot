@@ -495,6 +495,17 @@ class PolyBot:
                             self._trade_cost = spent
                             self._trade_shares = est_shares
                             self._trade_token_id = self._pending_buy_token_id
+                            self._trade_id = self.tracker.log_trade_entry(
+                                window_ts=self._current_window,
+                                side=self._pending_buy_side,
+                                entry_price=self._pending_buy_price,
+                                entry_shares=est_shares,
+                                entry_cost=spent,
+                                edge=self._pending_buy_edge,
+                                prob=self._pending_buy_edge + self._pending_buy_price,
+                                btc_delta=self._pending_buy_delta,
+                                seconds_remaining=0.0,
+                            )
                             self.stats.bankroll = real_bal
                             self._last_real_balance = real_bal
                             self.stats.hourly.record_trade(
@@ -549,6 +560,7 @@ class PolyBot:
         self._opening_price = 0.0
         self._partial_window = False
         self._last_tick_context = {}
+        self._trade_id = 0
         self._traded = False
         self._trade_attempted = False
         self._exited = False
@@ -856,6 +868,7 @@ class PolyBot:
                 profit=profit,
                 exit_revenue=self._exit_revenue,
                 resolution_method="exited",
+                trade_id=self._trade_id,
             )
             return
 
@@ -903,6 +916,7 @@ class PolyBot:
                 exit_revenue=self._exit_revenue,
                 resolution_method="market_price",
                 claim_result="skipped_losing",
+                trade_id=self._trade_id,
             )
             return
 
@@ -1119,6 +1133,7 @@ class PolyBot:
             exit_revenue=self._exit_revenue,
             resolution_method=resolution_method,
             claim_result=claim_result,
+            trade_id=self._trade_id,
         )
 
     # ── Hourly + shutdown ───────────────────────────────────────────
