@@ -37,7 +37,7 @@ from market import (get_current_market, current_window_ts, get_resolution_payout
                     get_book_price, PERIOD_SECONDS)
 from price_feed import BinancePriceFeed
 from strategy import evaluate, estimate_true_probability, get_skip_reason, StrategyConfig, TradingStats
-from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE
+from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE, MIN_SHARES, UNKNOWN_FILL
 from polymarket.auth import BuilderApiKey
 from telegram_notifier import TelegramNotifier
 from tracker import Tracker
@@ -59,6 +59,9 @@ RESOLUTION_GIVE_UP_AFTER = 3600    # stop waiting (and alert) after an hour
 # No price fetches this close to the window end, so a slow request can't delay
 # the boundary tick past OPEN_PRICE_MAX_LAG and make the next window "partial".
 PRICE_FETCH_CUTOFF = 15            # seconds before close
+# A booked live win counts as owed money until Polymarket's data lists it as
+# redeemable (that can lag); stop counting it after this long.
+AWAITING_PAYOUT_MAX = 1800         # seconds
 
 
 class PolyBot:
@@ -119,6 +122,8 @@ class PolyBot:
         self._trade_id: int = 0  # tracker trade_id of the current trade
         self._trade_condition_id: str = ""
         self._claim_note_total: float = -1.0   # last "claim in the UI" total printed
+        self._unknown_fill: dict = {}          # a buy whose fill couldn't be checked
+        self._awaiting_payout: dict = {}       # condition_id -> (payout, booked_at), live wins
 
         # Exit state
         self._exited: bool = False
@@ -389,6 +394,11 @@ class PolyBot:
 
         self._last_position_check = now
 
+        # No price fetch right before close: a slow request (Tor) could delay the
+        # boundary tick past OPEN_PRICE_MAX_LAG and make the next window "partial"
+        if seconds_remaining < PRICE_FETCH_CUTOFF:
+            return
+
         # Get current sell price (for tracking only)
         if self.dry_run:
             current_sell_price = get_book_price(self._trade_token_id, "SELL", self._trade_shares)
@@ -447,6 +457,9 @@ class PolyBot:
                 self._recent_window_deltas.append(closing_delta)
                 if len(self._recent_window_deltas) > self._rolling_vol_windows:
                     self._recent_window_deltas.pop(0)
+            if self._unknown_fill and not self._traded:
+                self._recheck_unknown_fill()
+
             self.stats.hourly.record_window(self._traded)
             if self._traded:
                 self._resolve_previous_trade()
@@ -629,7 +642,9 @@ class PolyBot:
 
         # ── Daily loss limit ─────────────────────────────────────
         if self._daily_loss_halted:
-            print(f"  🛑 DAILY LOSS LIMIT — session P&L ${self.stats.total_pnl:+.2f} "
+            # Same figure the limit is checked on (bankroll vs session start)
+            print(f"  🛑 DAILY LOSS LIMIT — session P&L "
+                  f"${self.stats.bankroll - self._session_start_balance:+.2f} "
                   f"exceeds -${self._daily_loss_limit:.0f}")
             return
 
@@ -752,6 +767,15 @@ class PolyBot:
             )
         else:
             print(f"  ❌ Buy failed: {result.error}")
+            if result.error.startswith(UNKNOWN_FILL):
+                self._unknown_fill = {
+                    "token_id": token_id, "side": sig.side, "price": result.price,
+                    "edge": sig.edge, "prob": sig.true_prob, "delta": sig.btc_delta_pct,
+                    "seconds_remaining": seconds_remaining,
+                    "condition_id": self._trade_condition_id,
+                }
+                self.telegram.error_alert(
+                    f"Couldn't tell whether a {sig.side} buy filled; rechecking at the window end")
             # Circuit breaker: consecutive API failures (not "no fill at my price")
             if result.status == FAILED and not self.dry_run:
                 self._consecutive_buy_failures += 1
@@ -854,6 +878,38 @@ class PolyBot:
             self._book_market_resolution(p, payouts)
         self._pending_resolutions = still_waiting
 
+    def _recheck_unknown_fill(self):
+        """A buy failed in a way where the fill couldn't be checked. Look at the
+        token balance once more and, if it filled, track it like any trade."""
+        uf, self._unknown_fill = self._unknown_fill, {}
+        t = time.strftime("%H:%M", time.localtime(self._current_window))
+        held = self.executor.token_balance(uf["token_id"])
+        if held is None:
+            msg = (f"Still can't verify the {uf['side']} buy in the {t} window — "
+                   f"check Polymarket for an untracked position")
+            print(f"  ⚠️  {msg}")
+            self.telegram.error_alert(msg)
+            return
+        if held < MIN_SHARES:
+            print(f"  ✓ The unverified {uf['side']} buy in the {t} window didn't fill")
+            return
+        cost = held * uf["price"]
+        print(f"  👻 The unverified {uf['side']} buy did fill: {held:.0f} shares "
+              f"(cost estimated at ${uf['price']:.2f}/share = ${cost:.2f})")
+        self._traded = True
+        self._trade_side, self._trade_price = uf["side"], uf["price"]
+        self._trade_cost, self._trade_shares = cost, held
+        self._trade_token_id, self._trade_condition_id = uf["token_id"], uf["condition_id"]
+        self.stats.bankroll -= cost
+        self.stats.hourly.record_trade(uf["edge"], uf["delta"])
+        self._session_entries.append((uf["price"], uf["edge"], uf["delta"]))
+        self._trade_id = self.tracker.open_trade(
+            window_ts=self._current_window, side=uf["side"], entry_price=uf["price"],
+            entry_shares=held, entry_cost=cost, edge=uf["edge"], prob=uf["prob"],
+            btc_delta=uf["delta"], seconds_remaining=uf["seconds_remaining"],
+            version=BOT_VERSION,
+        )
+
     def _live_equity(self, winnings: list = None) -> float:
         """Real money in live mode: pUSD + redeemable winnings + stakes still
         awaiting a result (0.0 if the balance can't be read). Pass the
@@ -866,7 +922,14 @@ class PolyBot:
         pending = {str(p.get("condition_id", "")) for p in self._pending_resolutions}
         won = sum(v for cid, v in winnings if cid not in pending)
         stakes = sum(p["cost"] for p in self._pending_resolutions)
-        return balance + won + stakes
+        # Wins already booked but not yet listed as redeemable (Polymarket's data
+        # can lag): count them until they show up there, or for AWAITING_PAYOUT_MAX
+        listed, now = {cid for cid, _ in winnings}, time.time()
+        for cid in list(self._awaiting_payout):
+            if cid in listed or now - self._awaiting_payout[cid][1] > AWAITING_PAYOUT_MAX:
+                del self._awaiting_payout[cid]
+        owed = sum(v for v, _ in self._awaiting_payout.values())
+        return balance + won + stakes + owed
 
     def _redeem_winnings(self, winnings: list = None):
         """Submit redemption for every resolved winning position (live only)."""
@@ -895,11 +958,17 @@ class PolyBot:
         winner = max(payouts, key=payouts.get) if max(payouts.values()) >= 0.99 else "SPLIT"
         payout = p["shares"] * per_share
         profit = p["exit_revenue"] + payout - p["cost"]
-        if payout > 0 and self.dry_run:
-            # Paper payout, counted as unclaimed like the old dry-run path did.
-            # Live cash shows up via the window-boundary balance sync.
-            self.stats.bankroll += payout
-            self._unclaimed_winnings += payout
+        if self.dry_run:
+            if payout > 0:
+                # Paper payout, counted as unclaimed like the old dry-run path did.
+                self.stats.bankroll += payout
+                self._unclaimed_winnings += payout
+        else:
+            # Live bankroll is "equity" (see _live_equity): the stake is no longer
+            # awaiting a result, and any payout is owed until it is redeemable.
+            self.stats.bankroll += payout - p["cost"]
+            if payout > 0 and p.get("condition_id"):
+                self._awaiting_payout[p["condition_id"]] = (payout, time.time())
         if profit > 0:
             self.stats.record_win(profit)
             self.telegram.win_alert(profit, self.stats.total_pnl)
