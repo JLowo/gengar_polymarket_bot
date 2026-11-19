@@ -276,6 +276,16 @@ def apply_proxy(proxy_url: str) -> None:
 
         httpx.AsyncClient.__init__ = _patched_async_client_init
 
+        # Also patch the module-level singleton in py_clob_client's http_helpers.
+        # This client is created at import time (before our patch), so it never
+        # gets the proxy. Replace it with a new proxied client.
+        try:
+            from py_clob_client.http_helpers import helpers as _clob_helpers
+            _clob_helpers._http_client = httpx.Client(http2=True, proxy=proxy_url)
+            logger.info("Patched py_clob_client singleton httpx client with proxy")
+        except Exception as e:
+            logger.warning(f"Could not patch py_clob_client singleton: {e}")
+
         logger.info("httpx (CLOB) proxy patch applied — trading calls routed through proxy")
     except ImportError:
         pass  # httpx not installed — py_clob_client won't be usable anyway
