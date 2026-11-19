@@ -132,18 +132,21 @@ class TradingStats:
     def win_rate(self) -> float:
         return (self.wins / self.total_trades * 100) if self.total_trades > 0 else 0.0
 
+    # record_win / record_loss only update the P&L stats. They must NOT touch
+    # bankroll: callers already move the cash when it moves (stake out at
+    # entry, sale proceeds / claim revenue / payout in at exit or resolution).
+    # Changing bankroll here as well counted every result twice.
+
     def record_win(self, profit: float):
         self.total_trades += 1
         self.wins += 1
         self.total_pnl += profit
-        self.bankroll += profit
         self.hourly.record_result(profit, won=True)
 
     def record_loss(self, loss: float):
         self.total_trades += 1
         self.losses += 1
         self.total_pnl -= abs(loss)
-        self.bankroll -= abs(loss)
         self.hourly.record_result(-abs(loss), won=False)
 
     def to_dict(self) -> dict:
