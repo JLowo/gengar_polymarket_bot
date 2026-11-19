@@ -54,9 +54,16 @@ def get_skipped():
     path = os.path.join(LOG_DIR, "skipped.csv")
     if os.path.exists(path):
         return load_csv(path)
+    rows = load_csv(os.path.join(LOG_DIR, "signals.csv"))
+    # A window can log a specific skip (e.g. skipped_edge_gone) and then a
+    # generic end-of-window "no_signal" row; count each window once, keeping
+    # the specific reason. Windows that traded aren't skipped at all.
+    traded = {r.get("window_ts") for r in rows if r.get("action") == "traded"}
+    specific = {r.get("window_ts") for r in rows if r.get("action") not in ("traded", "no_signal")}
     skipped = []
-    for row in load_csv(os.path.join(LOG_DIR, "signals.csv")):
-        if row.get("action") == "traded":
+    for row in rows:
+        w, action = row.get("window_ts"), row.get("action")
+        if w in traded or action == "traded" or (action == "no_signal" and w in specific):
             continue
         v = row.get("version") or "15"
         skipped.append({
