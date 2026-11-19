@@ -47,11 +47,11 @@ No stops. All trades hold to resolution. Data from 15 trades showed that probabi
 
 ### Circuit breaker — CLOB health check
 
-Before every trade, the bot pings `client.get_ok()` — Polymarket's unauthenticated health endpoint. If the CLOB operator isn't responding:
+Before every trade, the bot checks that Polymarket's CLOB API answers. If it isn't responding:
 - Skip the trade immediately
 - Increment failure counter
 - After 3 consecutive failures, halt all trading and send a Telegram alert
-- Every new 5-minute window, probe `get_ok()` again — auto-resume when healthy
+- Every new 5-minute window, check again — auto-resume when healthy
 
 This prevents trading on stale/frozen market prices during API outages.
 
@@ -59,16 +59,13 @@ This prevents trading on stale/frozen market prices during API outages.
 
 Configurable via `DAILY_LOSS_LIMIT` in `.env` (default: $30). Compares session P&L (current balance vs session start) before every trade. If breached, all trading stops for the session with a Telegram alert. Protects against correlated loss streaks.
 
-### Balance-verified everything
+### Orders and money
 
-- **Buys**: Snapshot USDC before order, verify balance drop after. Ghost fills (order succeeds on-chain despite API exception) are caught via balance change.
-- **Sells**: Balance-verified with partial fill tracking.
-- **Window sync**: Real USDC balance queried at every window boundary, overwrites internal tracking. Drift > $0.50 is logged.
-- **Pending buy safety net**: If a buy can't be verified within 14s, details are saved. Next window boundary detects the fill via balance drop and retroactively tracks the position.
-
-### Minimum notional guard
-
-Polymarket rejects sells below $5 notional. The bot checks before attempting — if remaining shares × price < $5, it holds to resolution instead of hitting the error. Winning shares auto-resolve at $1.00.
+- **Safe only**: live trading starts only if Polymarket's SDK recognises `SAFE_ADDRESS` as this key's Safe and the CLOB V2 trading approvals are in place (`preflight.py` checks everything first).
+- **Fill-and-kill buys**: each buy fills immediately at or below the highest price that still leaves `MIN_EDGE` (never above $0.90); anything unfilled is cancelled, so nothing rests on the book. The order response says what filled. If a request fails after possibly reaching the exchange, the bot checks its token balance once to find out.
+- **Results from Polymarket**: every trade is booked from the market's own resolution, not from Binance prices or balance changes.
+- **Winnings**: redeemed automatically when a builder API key is set (`preflight.py --create-builder-key`); otherwise claim them in the Polymarket UI.
+- **Window sync**: at every window boundary the bankroll is set to the real pUSD balance plus redeemable winnings plus stakes awaiting a result. Drift > $0.50 is logged.
 
 ## Quick start
 
@@ -146,17 +143,17 @@ The bot logs three CSV files in `LOG_DIR/` for post-session analysis:
 
 These are architectural decisions made from live trading data, not theory:
 
-- **Two-book architecture**: Polymarket has a raw token book (illiquid, wide spreads) and a complement engine book (tight spreads, real volume). All orders must route through the complement engine — the raw book is effectively unusable.
+- **Two-book architecture** (pre-V2; the public `/book` now shows the merged book): Polymarket had a raw token book (illiquid, wide spreads) and a complement engine book (tight spreads, real volume). All orders must route through the complement engine — the raw book is effectively unusable.
 - **Ghost orders are real fills**: Network exceptions on buys don't mean the order failed. On-chain fills can occur silently. Always verify via balance change, never trust the API response alone.
-- **Float precision kills orders**: `py-clob-client` internally computes `shares × (1 - price)` using float math. `1.0 - 0.71 = 0.29000000000000004` in IEEE 754. The bot uses `create_order` with explicit integer shares to avoid this.
+- **Float precision kills orders** (old v1 SDK; the unified SDK handles rounding): `py-clob-client` internally computes `shares × (1 - price)` using float math. `1.0 - 0.71 = 0.29000000000000004` in IEEE 754. The bot uses `create_order` with explicit integer shares to avoid this.
 - **Stops destroy value on 5-min windows**: Prob-stop fired 5 times in testing. 4 of 5 stopped trades won at resolution. Cost: $35.45. BTC micro-bounces trigger panic sells that the 5-minute trend ultimately reverses.
 - **Model calibration matters more than strategy complexity**: Doubling the vol parameter from 0.08 to 0.12 (based on 15 trades of calibration data) turned a -35% ROC strategy into a +55% ROC strategy. Same code, different constant.
 
 ## Known limitations
 
-- **Ghost fills during outages**: When the CLOB confirmation pipeline is down, orders can still execute on-chain. The `get_ok()` circuit breaker prevents *new* orders, but can't recall orders already submitted.
-- **Tor latency**: Routing through Tor adds 200-500ms per API call. The total buy flow is 8-15 seconds. This is acceptable for 5-minute windows but would be a problem for faster markets.
-- **Stranded shares**: Winning positions below $5 notional can't be sold via the API. They auto-resolve on Polymarket but the USDC may take time to appear.
+- **Ghost fills during outages**: When the CLOB is struggling, an order can still execute even though the request errors. The bot checks its token balance after such errors, and the health-check circuit breaker stops *new* orders.
+- **Tor latency**: Routing through Tor adds roughly 1-3 seconds per API call. This is acceptable for 5-minute windows but would be a problem for faster markets.
+- **Winnings need redeeming**: resolved winning shares pay out only when redeemed. Without a builder API key the bot leaves them for you to claim in the Polymarket UI (it still counts them in its bankroll).
 
 ## Risk warning
 
