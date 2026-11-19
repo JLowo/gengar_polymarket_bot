@@ -106,6 +106,7 @@ class PolyBot:
         self._trade_cost: float = 0.0
         self._trade_shares: float = 0.0
         self._trade_token_id: str = ""
+        self._trade_id: int = 0  # tracker trade_id of the current trade
 
         # Exit state
         self._exited: bool = False
@@ -479,6 +480,7 @@ class PolyBot:
                                 exit_revenue=pp["exit_revenue"],
                                 resolution_method="phantom_resolved",
                                 claim_result="phantom_resolved",
+                                trade_id=pp.get("trade_id", 0),
                             )
                         else:
                             # Balance still hasn't moved — genuine loss
@@ -498,6 +500,7 @@ class PolyBot:
                                 exit_revenue=pp["exit_revenue"],
                                 resolution_method="phantom_confirmed",
                                 claim_result="phantom_confirmed",
+                                trade_id=pp.get("trade_id", 0),
                             )
                         self._pending_phantom = {}
                 else:
@@ -801,7 +804,7 @@ class PolyBot:
                 actual_edge=sig.true_prob - result.price,
                 fill_price=result.price,
             )
-            self.tracker.log_trade_entry(
+            self._trade_id = self.tracker.log_trade_entry(
                 window_ts=self._current_window,
                 side=sig.side,
                 entry_price=result.price,
@@ -1025,6 +1028,7 @@ class PolyBot:
                     "token_id": self._trade_token_id,
                     "window_ts": self._current_window,
                     "opening_price": self._opening_price,
+                    "trade_id": self._trade_id,
                 }
                 return
 
