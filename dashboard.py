@@ -10,11 +10,23 @@ import csv
 import json
 import os
 import sys
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from market import get_market_outcome, market_slug
+
 LOG_DIR = "logs"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8050
+
+# Polymarket results of near-miss windows (see window_outcomes). The dashboard
+# doesn't read .env, so a 15-minute bot needs MARKET_PERIOD=15 set when starting it.
+MARKET_PERIOD = int(os.getenv("MARKET_PERIOD", "5"))
+OUTCOMES_CACHE = os.path.join(LOG_DIR, "outcomes.json")
+LOOKUP_RETRY_SECS = 60     # wait before asking Gamma again about an unresolved window
+MAX_LOOKUPS = 25           # per request, so a long history can't stall a page load
+DEFAULT_STAKE = 5.0        # MIN_BET, when a signal row has no Kelly size
+_lookup_failed: dict = {}  # slug -> time of the last unresolved/failed lookup
 
 # ── CSV loading ────────────────────────────────────────────────────
 
@@ -43,37 +55,147 @@ def get_all_trades():
     trades.sort(key=lambda r: float(r.get("timestamp", 0)))
     return trades
 
-def get_skipped():
-    """Signals the bot evaluated but didn't trade.
+def _num(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    Uses skipped.csv if one exists; otherwise derives the rows from
-    signals.csv (every non-traded row, with its skip reason). The bot doesn't
-    yet record whether a skipped signal would have won, so would_have_won is
-    left blank there and the charts show it as "not logged".
+def _version(row):
+    v = str(row.get("version") or "15")
+    return v if v.startswith("v") else f"v{v}"
+
+def _load_outcomes():
+    try:
+        with open(OUTCOMES_CACHE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _save_outcomes(cache):
+    tmp = OUTCOMES_CACHE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(cache, f, indent=1, sort_keys=True)
+        os.replace(tmp, OUTCOMES_CACHE)
+    except OSError as e:
+        print(f"  Couldn't save {OUTCOMES_CACHE}: {e}")
+
+def window_outcomes(window_ts_list):
+    """Polymarket's payout per share for finished windows, keyed by market
+    slug: {"btc-updown-5m-…": {"UP": 1.0, "DOWN": 0.0}}.
+
+    Read from Gamma, the same source the bot books its trades from. Resolved
+    results are final, so they're saved in logs/outcomes.json and never
+    fetched twice. Windows not resolved yet (or Gamma unreachable) are left
+    out and asked about again after LOOKUP_RETRY_SECS.
+    """
+    cache = _load_outcomes()
+    now = time.time()
+    changed = False
+    lookups = 0
+    for w in sorted({int(_num(w)) for w in window_ts_list if _num(w) > 0}):
+        slug = market_slug(MARKET_PERIOD, w)
+        if slug in cache:
+            continue
+        if now < w + MARKET_PERIOD * 60 or now - _lookup_failed.get(slug, 0) < LOOKUP_RETRY_SECS:
+            continue
+        if lookups >= MAX_LOOKUPS:
+            break
+        lookups += 1
+        outcome = get_market_outcome(w, MARKET_PERIOD)
+        if not outcome or not outcome["resolved"]:
+            _lookup_failed[slug] = now
+            continue
+        cache[slug] = outcome["prices"]
+        changed = True
+    if changed:
+        _save_outcomes(cache)
+    return cache
+
+def get_skipped():
+    """Windows the bot didn't trade, one row per window, from signals.csv:
+
+    - kind "near_miss": the strategy gave a signal and the bot tried to buy
+      but didn't. Reason "edge_gone_at_market" (the price it checked had
+      moved too far) or "attempt_unlogged" (the attempt failed without
+      logging why). Each gets Polymarket's result and what the buy would have
+      made at the price the bot would have paid (the book price it checked,
+      else the price it saw), before fees.
+    - kind "quiet": no signal all window. The bot logs these at the window's
+      last second, when the market has already settled, so their logged skip
+      reason says nothing about the entry window and isn't used.
+
+    A legacy skipped.csv (older versions, with would_have_won) is used as is.
     """
     path = os.path.join(LOG_DIR, "skipped.csv")
     if os.path.exists(path):
-        return load_csv(path)
-    rows = load_csv(os.path.join(LOG_DIR, "signals.csv"))
-    # A window can log a specific skip (e.g. skipped_edge_gone) and then a
-    # generic end-of-window "no_signal" row; count each window once, keeping
-    # the specific reason. Windows that traded aren't skipped at all.
-    traded = {r.get("window_ts") for r in rows if r.get("action") == "traded"}
-    specific = {r.get("window_ts") for r in rows if r.get("action") not in ("traded", "no_signal")}
-    skipped = []
-    for row in rows:
-        w, action = row.get("window_ts"), row.get("action")
-        if w in traded or action == "traded" or (action == "no_signal" and w in specific):
+        return [{**row, "kind": "near_miss"} for row in load_csv(path)]
+
+    by_window = {}
+    for row in load_csv(os.path.join(LOG_DIR, "signals.csv")):
+        by_window.setdefault(row.get("window_ts", ""), []).append(row)
+
+    picks = []
+    for rows in by_window.values():
+        if any(r.get("action") == "traded" for r in rows):
             continue
-        v = row.get("version") or "15"
-        skipped.append({
-            "reason": row.get("skip_reason") or row.get("action") or "unknown",
-            "version": v if str(v).startswith("v") else f"v{v}",
+        # A specific skip (e.g. skipped_edge_gone) is followed by the generic
+        # end-of-window "no_signal" row for the same window: keep the specific one
+        specific = [r for r in rows if r.get("action") != "no_signal"]
+        if specific:
+            r = specific[0]
+            picks.append(("near_miss", r, r.get("skip_reason") or r.get("action") or "unknown"))
+        elif rows[-1].get("side"):
+            # The end-of-window row carries a signal only if the bot acted on
+            # it (after an attempt the window isn't evaluated again)
+            picks.append(("near_miss", rows[-1], "attempt_unlogged"))
+        else:
+            picks.append(("quiet", rows[-1], "no_signal"))
+
+    outcomes = window_outcomes([r.get("window_ts") for kind, r, _ in picks if kind == "near_miss"])
+
+    skipped = []
+    for kind, r, reason in picks:
+        item = {
+            "kind": kind,
+            "reason": reason,
+            "version": _version(r),
+            "window_ts": r.get("window_ts", ""),
+            "window_time": r.get("window_time", ""),
+            "side": r.get("side", ""),
             "would_have_won": "",
-            "window_time": row.get("window_time", ""),
-            "side": row.get("side", ""),
-        })
+        }
+        if kind == "near_miss":
+            side = r.get("side", "")
+            seen = _num(r.get("up_price") if side == "UP" else r.get("down_price"))
+            checked = _num(r.get("actual_price"))
+            price = checked if checked > 0 else seen
+            stake = _num(r.get("kelly_size")) or DEFAULT_STAKE
+            item.update({
+                "prob": _num(r.get("true_prob")),
+                "btc_delta_pct": _num(r.get("btc_delta_pct")),
+                "seconds_remaining": _num(r.get("seconds_remaining")),
+                "seen_price": seen,
+                "price": price,
+                "price_checked": checked > 0,
+                "stake": round(stake, 2),
+            })
+            prices = outcomes.get(market_slug(MARKET_PERIOD, int(_num(r.get("window_ts")))))
+            if prices and side in prices and 0 < price < 1:
+                payout = float(prices[side])
+                item["payout"] = payout
+                item["would_have_won"] = ("True" if payout > 0.5 else
+                                          "False" if payout < 0.5 else "Split")
+                item["pnl_if_taken"] = round(stake / price * payout - stake, 2)
+        skipped.append(item)
+    skipped.sort(key=lambda s: _num(s["window_ts"]))
     return skipped
+
+def get_sessions():
+    """sessions.csv, most recent first. A session is written when the bot stops."""
+    return list(reversed(load_csv(os.path.join(LOG_DIR, "sessions.csv"))))
 
 def get_hold_ticks():
     return load_csv(os.path.join(LOG_DIR, "hold_ticks.csv"))
@@ -90,6 +212,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response(get_skipped())
         elif self.path == "/api/hold_ticks":
             self._json_response(get_hold_ticks())
+        elif self.path == "/api/sessions":
+            self._json_response(get_sessions())
         elif self.path == "/" or self.path == "/index.html":
             self._html_response(DASHBOARD_HTML)
         else:
@@ -171,6 +295,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   #trade-detail .detail-chart.full { grid-column: 1 / -1; }
   #trade-detail .detail-chart h5 { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
   .no-ticks { color: #666; font-size: 13px; padding: 20px; text-align: center; }
+  .header-right { display: flex; gap: 14px; align-items: center; font-size: 12px; color: #666; }
+  .header-right label { display: flex; gap: 6px; align-items: center; cursor: pointer; color: #888; }
+  .chart-box h3 .note { font-size: 11px; color: #666; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .empty { color: #666; font-size: 13px; padding: 12px 0; }
+  .muted { color: #666; }
+  .table-wrap { overflow-x: auto; }
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } #trade-detail .detail-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -178,7 +308,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <div class="header">
   <h1><span>PolyBot</span> Dashboard</h1>
-  <button class="refresh-btn" onclick="location.reload()">Refresh</button>
+  <div class="header-right">
+    <span id="updated"></span>
+    <label><input type="checkbox" id="autoRefresh" onchange="setAutoRefresh(this.checked)"> Auto-refresh (30s)</label>
+    <button class="refresh-btn" onclick="refresh(true)">Refresh</button>
+  </div>
 </div>
 
 <div class="filter-bar" id="filter-bar">
@@ -192,9 +326,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="chart-box"><h3>Win Rate by Version</h3><canvas id="winRateChart"></canvas></div>
   <div class="chart-box"><h3>Total P&L by Version</h3><canvas id="pnlChart"></canvas></div>
   <div class="chart-box full"><h3>Per-Trade P&L Waterfall</h3><canvas id="waterfallChart"></canvas></div>
-  <div class="chart-box"><h3>Skipped Signals by Reason</h3><canvas id="skippedBarChart"></canvas></div>
-  <div class="chart-box"><h3>Skipped: Would-Have-Won Rate</h3><canvas id="skippedPieChart"></canvas></div>
-  <div class="chart-box full"><h3>Recent Trades <span style="font-size:11px;color:#666;font-weight:400;text-transform:none;letter-spacing:0">(click a row to see hold trajectory)</span></h3><div id="trades-table"></div><div id="trade-detail"><h4 id="detail-title"></h4><div class="detail-sub" id="detail-sub"></div><div class="detail-grid" id="detail-charts"></div></div></div>
+  <div class="chart-box full"><h3>Edge: Seen vs At Fill <span class="note" id="edge-note"></span></h3><canvas id="edgeChart"></canvas></div>
+  <div class="chart-box"><h3>Near Misses by Reason</h3><canvas id="skippedBarChart"></canvas><div class="empty" id="skipped-bar-empty"></div></div>
+  <div class="chart-box"><h3>Near Misses: Would-Have-Won Rate</h3><canvas id="skippedPieChart"></canvas><div class="empty" id="skipped-pie-empty"></div></div>
+  <div class="chart-box full"><h3>Near Misses <span class="note">(signals the bot tried but didn't buy, with Polymarket's result; P&L at the price it would have paid, before fees)</span></h3><div class="table-wrap" id="near-miss-table"></div></div>
+  <div class="chart-box full"><h3>Recent Trades <span class="note">(click a row to see hold trajectory)</span></h3><div class="table-wrap" id="trades-table"></div><div id="trade-detail"><h4 id="detail-title"></h4><div class="detail-sub" id="detail-sub"></div><div class="detail-grid" id="detail-charts"></div></div></div>
+  <div class="chart-box full"><h3>Sessions <span class="note">(all versions; a session appears when the bot stops)</span></h3><div class="table-wrap" id="sessions-table"></div></div>
 </div>
 
 <script>
@@ -218,18 +355,38 @@ Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, sans-serif';
 let ALL_TRADES = [];
 let ALL_SKIPPED = [];
 let ALL_HOLD_TICKS = [];
+let ALL_SESSIONS = [];
 let ACTIVE_FILTER = 'all';
 let CHART_INSTANCES = {};
 let DETAIL_CHARTS = {};
+let LAST_DATA_KEY = '';
+let AUTO_TIMER = null;
+const AUTO_REFRESH_MS = 30000;
+
+// CSV values go into innerHTML, so escape them
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+const money = (x, sign = true) => `${x < 0 ? '-' : sign ? '+' : ''}$${Math.abs(x).toFixed(2)}`;
+const cents = p => `${Math.round(p * 100)}¢`;
 
 async function loadData() {
-  const [trades, skipped, holdTicks] = await Promise.all([
-    fetch('/api/trades').then(r => r.json()),
-    fetch('/api/skipped').then(r => r.json()),
-    fetch('/api/hold_ticks').then(r => r.json()),
+  const get = url => fetch(url).then(r => { if (!r.ok) throw new Error(url); return r.json(); });
+  const [trades, skipped, holdTicks, sessions] = await Promise.all([
+    get('/api/trades'), get('/api/skipped'), get('/api/hold_ticks'), get('/api/sessions'),
   ]);
-  return { trades, skipped, holdTicks };
+  return { trades, skipped, holdTicks, sessions };
 }
+
+// Near misses (the bot tried but didn't buy) vs quiet windows (no signal at all)
+const nearMisses = skipped => skipped.filter(s => s.kind !== 'quiet');
+const quietWindows = skipped => skipped.filter(s => s.kind === 'quiet');
+
+const REASON_LABELS = {
+  edge_gone_at_market: 'price moved too far',
+  attempt_unlogged: 'attempt failed (no reason logged)',
+};
+const reasonLabel = r => REASON_LABELS[r] || String(r || 'unknown').replace(/_/g, ' ');
 
 function groupByVersion(trades) {
   const groups = {};
@@ -251,9 +408,11 @@ function filterSkipped(skipped, version) {
   return skipped.filter(s => s.version === version);
 }
 
-function buildFilterButtons(trades) {
-  const versions = [...new Set(trades.map(t => t.version))];
+function buildFilterButtons(trades, skipped) {
+  const versions = [...new Set([...trades.map(t => t.version), ...nearMisses(skipped).map(s => s.version)])];
   const bar = document.getElementById('filter-bar');
+  // Rebuilt on every data refresh, so a new version gets its button
+  bar.innerHTML = '<span>Filter:</span><button class="filter-btn" data-v="all" onclick="setFilter(\'all\')">All</button>';
   versions.forEach(v => {
     const btn = document.createElement('button');
     btn.className = 'filter-btn';
@@ -262,6 +421,7 @@ function buildFilterButtons(trades) {
     btn.onclick = () => setFilter(v);
     bar.appendChild(btn);
   });
+  return versions;
 }
 
 function applyFilterColors() {
@@ -305,8 +465,14 @@ function renderStats(trades, skipped) {
   const losses = totalTrades - wins;
   const pnl = trades.reduce((s, t) => s + parseFloat(t.profit || 0), 0);
   const wr = totalTrades > 0 ? (wins / totalTrades * 100) : 0;
-  const skippedWon = skipped.filter(s => s.would_have_won === 'True').length;
-  const skippedKnown = skipped.filter(s => s.would_have_won === 'True' || s.would_have_won === 'False').length;
+  const misses = nearMisses(skipped);
+  const quiet = quietWindows(skipped).length;
+  const skippedWon = misses.filter(s => s.would_have_won === 'True').length;
+  const skippedKnown = misses.filter(s => s.would_have_won === 'True' || s.would_have_won === 'False').length;
+  const priced = misses.filter(s => s.pnl_if_taken !== undefined);
+  const missedPnl = priced.reduce((s, m) => s + m.pnl_if_taken, 0);
+  const missSub = skippedKnown ? `${skippedWon} of ${skippedKnown} would have won` : misses.length ? 'results pending' : 'none';
+  const missPnlSub = priced.length ? `<div class="sub ${missedPnl >= 0 ? 'won' : 'lost'}">${money(missedPnl)} if taken</div>` : '';
 
   // Profit factor = gross wins / gross losses
   const grossWins = trades.filter(t => parseFloat(t.profit || 0) > 0).reduce((s, t) => s + parseFloat(t.profit), 0);
@@ -344,7 +510,8 @@ function renderStats(trades, skipped) {
     <div class="stat-card"><div class="label">Expectancy</div><div class="value ${expectancy >= 0 ? 'green' : 'red'}">$${expectancy >= 0 ? '+' : ''}${expectancy.toFixed(2)}</div><div class="sub">per trade</div></div>
     <div class="stat-card"><div class="label">Max Drawdown</div><div class="value red">$${maxDD.toFixed(2)}</div></div>
     <div class="stat-card"><div class="label">ROI</div><div class="value ${roi >= 0 ? 'green' : 'red'}">${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%</div><div class="sub">on $${totalDeployed.toFixed(0)} deployed</div></div>
-    <div class="stat-card"><div class="label">Skipped</div><div class="value">${skipped.length}</div><div class="sub">${skippedKnown ? `${skippedWon} of ${skippedKnown} would have won` : 'outcome not logged'}</div></div>
+    <div class="stat-card"><div class="label">Near Misses</div><div class="value">${misses.length}</div><div class="sub">${missSub}</div>${missPnlSub}</div>
+    <div class="stat-card"><div class="label">Quiet Windows</div><div class="value">${quiet}</div><div class="sub">no signal all window</div></div>
   `;
 }
 
@@ -490,24 +657,28 @@ function renderWaterfall(trades) {
 }
 
 function renderSkippedBar(skipped) {
-  if (!skipped.length) return;
+  const misses = nearMisses(skipped);
+  const canvas = document.getElementById('skippedBarChart');
+  canvas.style.display = misses.length ? '' : 'none';
+  document.getElementById('skipped-bar-empty').textContent = misses.length ? '' : 'No near misses for this filter.';
+  if (!misses.length) return;
   const reasons = {};
-  skipped.forEach(s => {
+  misses.forEach(s => {
     const r = s.reason || 'unknown';
     if (!reasons[r]) reasons[r] = { won: 0, lost: 0, unknown: 0 };
     if (s.would_have_won === 'True') reasons[r].won++;
     else if (s.would_have_won === 'False') reasons[r].lost++;
     else reasons[r].unknown++;
   });
-  const labels = Object.keys(reasons).map(r => r.replace(/_/g, ' '));
-  CHART_INSTANCES.skippedBar = new Chart(document.getElementById('skippedBarChart'), {
+  const labels = Object.keys(reasons).map(reasonLabel);
+  CHART_INSTANCES.skippedBar = new Chart(canvas, {
     type: 'bar',
     data: {
       labels,
       datasets: [
         { label: 'Would Have Won', data: Object.values(reasons).map(v => v.won), backgroundColor: GREEN + 'cc', borderColor: GREEN, borderWidth: 1 },
         { label: 'Would Have Lost', data: Object.values(reasons).map(v => v.lost), backgroundColor: RED + 'cc', borderColor: RED, borderWidth: 1 },
-        { label: 'Outcome Not Logged', data: Object.values(reasons).map(v => v.unknown), backgroundColor: '#888888cc', borderColor: '#888888', borderWidth: 1 },
+        { label: 'Result Pending / Split', data: Object.values(reasons).map(v => v.unknown), backgroundColor: '#888888cc', borderColor: '#888888', borderWidth: 1 },
       ]
     },
     options: { plugins: { legend: { position: 'top' } }, scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } } }
@@ -515,11 +686,15 @@ function renderSkippedBar(skipped) {
 }
 
 function renderSkippedPie(skipped) {
-  if (!skipped.length) return;
-  const won = skipped.filter(s => s.would_have_won === 'True').length;
-  const lost = skipped.filter(s => s.would_have_won === 'False').length;
-  if (!won && !lost) return;   // outcomes not logged: don't draw a fake 0%
-  CHART_INSTANCES.skippedPie = new Chart(document.getElementById('skippedPieChart'), {
+  const misses = nearMisses(skipped);
+  const won = misses.filter(s => s.would_have_won === 'True').length;
+  const lost = misses.filter(s => s.would_have_won === 'False').length;
+  const canvas = document.getElementById('skippedPieChart');
+  canvas.style.display = (won || lost) ? '' : 'none';
+  document.getElementById('skipped-pie-empty').textContent =
+    (won || lost) ? '' : misses.length ? 'Results not in yet.' : 'No near misses for this filter.';
+  if (!won && !lost) return;   // no results yet: don't draw a fake 0%
+  CHART_INSTANCES.skippedPie = new Chart(canvas, {
     type: 'doughnut',
     data: {
       labels: [`Would Have Won (${won})`, `Would Have Lost (${lost})`],
@@ -527,6 +702,100 @@ function renderSkippedPie(skipped) {
     },
     options: { plugins: { legend: { position: 'bottom' } } }
   });
+}
+
+function renderEdge(trades) {
+  // edge_at_entry is the model probability minus the price the bot SAW (its
+  // cached book price, up to 5s old); the fill shows the price it really paid
+  const rows = trades.map((t, i) => ({
+    n: i + 1, t,
+    prob: parseFloat(t.prob_at_entry), edge: parseFloat(t.edge_at_entry), fill: parseFloat(t.entry_price),
+  })).filter(r => [r.prob, r.edge, r.fill].every(Number.isFinite) && r.prob > 0 && r.fill > 0).slice(-50);
+  const note = document.getElementById('edge-note');
+  if (!rows.length) { note.textContent = '(no trades with edge data)'; return; }
+  const seen = rows.map(r => r.edge);
+  const atFill = rows.map(r => r.prob - r.fill);
+  const avg = a => a.reduce((s, x) => s + x, 0) / a.length;
+  const paidMore = rows.filter(r => r.fill > r.prob - r.edge + 0.005).length;
+  note.textContent = `(avg ${avg(seen).toFixed(3)} seen vs ${avg(atFill).toFixed(3)} at fill; paid more than the price it saw on ${paidMore} of ${rows.length} trades)`;
+  CHART_INSTANCES.edge = new Chart(document.getElementById('edgeChart'), {
+    type: 'bar',
+    data: {
+      labels: rows.map(r => r.n),
+      datasets: [
+        { label: 'Edge the bot saw', data: seen, backgroundColor: BLUE + 'cc', borderColor: BLUE, borderWidth: 1 },
+        { label: 'Edge at fill', data: atFill, backgroundColor: GOLD + 'cc', borderColor: GOLD, borderWidth: 1 },
+      ]
+    },
+    options: {
+      plugins: {
+        legend: { position: 'top' },
+        tooltip: { callbacks: {
+          title: ctx => { const r = rows[ctx[0].dataIndex]; return `Trade #${r.n} (${r.t.version}) ${r.t.window_time || ''} ${r.t.side}`; },
+          afterBody: ctx => {
+            const r = rows[ctx[0].dataIndex];
+            return [`Model: ${(r.prob * 100).toFixed(0)}%`, `Saw ${cents(r.prob - r.edge)}, paid ${cents(r.fill)}`, r.t.won_resolution === 'True' ? 'WIN' : 'LOSS'];
+          }
+        }}
+      },
+      scales: { x: { title: { display: true, text: 'Trade # (chronological)' } }, y: { title: { display: true, text: 'Edge (prob − price)' } } }
+    }
+  });
+}
+
+function renderNearMissTable(skipped) {
+  const misses = nearMisses(skipped).slice(-30).reverse();
+  const box = document.getElementById('near-miss-table');
+  if (!misses.length) { box.innerHTML = '<div class="empty">No near misses for this filter.</div>'; return; }
+  let html = '<table><thead><tr><th>Time</th><th>Ver</th><th>Side</th><th>Why Skipped</th><th>Model</th><th>BTC Move</th><th>Time Left</th><th>Price Seen</th><th>Would Have Paid</th><th>Result</th><th>P&L If Taken</th></tr></thead><tbody>';
+  misses.forEach(m => {
+    const vc = vColor(m.version);
+    const result = m.would_have_won === 'True' ? '<span class="won">WIN</span>'
+      : m.would_have_won === 'False' ? '<span class="lost">LOSS</span>'
+      : m.would_have_won === 'Split' ? 'SPLIT' : '<span class="muted">pending</span>';
+    const paid = m.price > 0 ? (m.price_checked ? cents(m.price) : `<span class="muted" title="The bot didn't check the book price, so this is the price it saw">~${cents(m.price)}</span>`) : '';
+    const pnl = m.pnl_if_taken !== undefined ? `<span class="${m.pnl_if_taken >= 0 ? 'won' : 'lost'}">${money(m.pnl_if_taken)}</span> <span class="muted">on $${m.stake.toFixed(2)}</span>` : '';
+    const d = m.btc_delta_pct || 0;
+    html += `<tr>
+      <td>${esc(m.window_time)}</td>
+      <td><span class="version-badge" style="background:${vc}33;color:${vc}">${esc(m.version)}</span></td>
+      <td>${esc(m.side)}</td>
+      <td>${esc(reasonLabel(m.reason))}</td>
+      <td>${m.prob ? (m.prob * 100).toFixed(0) + '%' : ''}</td>
+      <td><span class="${d >= 0 ? 'won' : 'lost'}">${d >= 0 ? '+' : ''}${d.toFixed(3)}%</span></td>
+      <td>${m.seconds_remaining ? 'T-' + m.seconds_remaining.toFixed(0) + 's' : ''}</td>
+      <td>${m.seen_price > 0 ? cents(m.seen_price) : ''}</td>
+      <td>${paid}</td>
+      <td>${result}</td>
+      <td>${pnl}</td>
+    </tr>`;
+  });
+  box.innerHTML = html + '</tbody></table>';
+}
+
+function renderSessions(sessions) {
+  const box = document.getElementById('sessions-table');
+  if (!sessions.length) { box.innerHTML = '<div class="empty">No finished sessions yet.</div>'; return; }
+  const when = s => new Date(String(s || '').replace(' ', 'T'));
+  let html = '<table><thead><tr><th>Started</th><th>Length</th><th>Balance</th><th>Real P&L</th><th>Tracked P&L</th><th>Drift</th><th>Trades</th><th>W / L</th><th>Win Rate</th></tr></thead><tbody>';
+  sessions.forEach(s => {
+    const mins = (when(s.end_time) - when(s.start_time)) / 60000;
+    const length = Number.isFinite(mins) ? (mins >= 60 ? `${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m` : `${Math.round(mins)}m`) : '';
+    const real = parseFloat(s.real_pnl || 0), tracked = parseFloat(s.tracked_pnl || 0), drift = parseFloat(s.pnl_drift || 0);
+    const trades = parseInt(s.trades || 0);
+    html += `<tr>
+      <td>${esc(String(s.start_time || '').slice(0, 16))}</td>
+      <td>${length}</td>
+      <td>$${parseFloat(s.start_balance || 0).toFixed(2)} → $${parseFloat(s.end_balance || 0).toFixed(2)}</td>
+      <td class="${real >= 0 ? 'won' : 'lost'}" style="font-weight:600">${money(real)}</td>
+      <td>${money(tracked)}</td>
+      <td class="${Math.abs(drift) >= 0.5 ? 'lost' : 'muted'}" title="Real minus tracked P&L">${money(drift)}</td>
+      <td>${trades}</td>
+      <td>${esc(s.wins || 0)} / ${esc(s.losses || 0)}</td>
+      <td>${trades ? parseFloat(s.win_rate || 0).toFixed(0) + '%' : ''}</td>
+    </tr>`;
+  });
+  box.innerHTML = html + '</tbody></table>';
 }
 
 function renderTradesTable(trades) {
@@ -578,7 +847,7 @@ function renderTradesTable(trades) {
   document.getElementById('trade-detail').classList.remove('visible');
 }
 
-function showTradeDetail(row) {
+function showTradeDetail(row, scroll = true) {
   // Highlight selected row
   document.querySelectorAll('tr.clickable').forEach(r => r.classList.remove('selected'));
   row.classList.add('selected');
@@ -599,9 +868,9 @@ function showTradeDetail(row) {
   const cells = row.querySelectorAll('td');
   const time = cells[0].textContent;
   const side = cells[2].textContent;
-  const entry = cells[3].textContent;
-  const result = cells[6].textContent;
-  const profit = cells[7].textContent;
+  const entry = cells[5].textContent;
+  const result = cells[8].textContent;
+  const profit = cells[9].textContent;
 
   document.getElementById('detail-title').textContent = `${side} ${entry} @ ${time}`;
   document.getElementById('detail-sub').textContent = `${result} ${profit} | ${ticks.length} ticks recorded`;
@@ -613,7 +882,7 @@ function showTradeDetail(row) {
   if (!ticks.length) {
     chartsDiv.innerHTML = '<div class="no-ticks">No hold tick data for this trade (pre-v16 or pending buy)</div>';
     panel.classList.add('visible');
-    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    if (scroll) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     return;
   }
 
@@ -680,7 +949,7 @@ function showTradeDetail(row) {
   });
 
   panel.classList.add('visible');
-  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  if (scroll) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 function renderAll(trades, skipped) {
@@ -689,19 +958,56 @@ function renderAll(trades, skipped) {
   renderWinRate(trades);
   renderPnL(trades);
   renderWaterfall(trades);
+  renderEdge(trades);
   renderSkippedBar(skipped);
   renderSkippedPie(skipped);
+  renderNearMissTable(skipped);
   renderTradesTable(trades);
+  renderSessions(ALL_SESSIONS);
 }
 
-async function init() {
-  const { trades, skipped, holdTicks } = await loadData();
-  ALL_TRADES = trades;
-  ALL_SKIPPED = skipped;
-  ALL_HOLD_TICKS = holdTicks;
-  buildFilterButtons(trades);
-  applyFilterColors();
-  renderAll(trades, skipped);
+// Fetch everything; re-render only if something changed (unless forced), keeping
+// the version filter and any open trade detail
+async function refresh(force) {
+  const updated = document.getElementById('updated');
+  let data;
+  try {
+    data = await loadData();
+  } catch (e) {
+    updated.textContent = "Couldn't reach the dashboard server";
+    return;
+  }
+  updated.textContent = 'Updated ' + new Date().toLocaleTimeString();
+  const key = JSON.stringify(data);
+  if (!force && key === LAST_DATA_KEY) return;
+  LAST_DATA_KEY = key;
+  ALL_TRADES = data.trades;
+  ALL_SKIPPED = data.skipped;
+  ALL_HOLD_TICKS = data.holdTicks;
+  ALL_SESSIONS = data.sessions;
+  const openRow = document.getElementById('trade-detail').classList.contains('visible')
+    ? document.querySelector('tr.clickable.selected') : null;
+  const reopen = openRow && { w: openRow.dataset.windowTs, id: openRow.dataset.tradeId };
+  const versions = buildFilterButtons(ALL_TRADES, ALL_SKIPPED);
+  setFilter(versions.includes(ACTIVE_FILTER) ? ACTIVE_FILTER : 'all');
+  if (reopen) {
+    const row = [...document.querySelectorAll('tr.clickable')].find(r => r.dataset.windowTs === reopen.w && r.dataset.tradeId === reopen.id);
+    if (row) showTradeDetail(row, false);
+  }
+}
+
+function setAutoRefresh(on) {
+  clearInterval(AUTO_TIMER);
+  AUTO_TIMER = on ? setInterval(() => refresh(false), AUTO_REFRESH_MS) : null;
+  try { localStorage.setItem('autoRefresh', on ? '1' : '0'); } catch (e) {}
+}
+
+function init() {
+  let auto = true;
+  try { auto = localStorage.getItem('autoRefresh') !== '0'; } catch (e) {}
+  document.getElementById('autoRefresh').checked = auto;
+  setAutoRefresh(auto);
+  refresh(true);
 }
 
 init();

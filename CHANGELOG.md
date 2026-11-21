@@ -4,6 +4,18 @@ Standard sections: **Strategy** (parameter/model/filter changes), **Bug fixes** 
 
 ---
 
+## Unreleased
+
+### Dashboard
+- **Near misses vs quiet windows**: "Skipped" counted every window without a trade. It now separates near misses (the bot tried to buy but didn't) from quiet windows (no signal at all, whose logged reason is from the window's last second and isn't shown).
+- **Would-have-won for near misses**: Polymarket's result for each near-miss window (Gamma, cached in `logs/outcomes.json`) and the P&L if taken at the price the bot would have paid, before fees, in a new table and in the stat card and charts.
+- **Edge: Seen vs At Fill** chart: the edge the bot saw at its cached price next to the edge at the fill price.
+- **Sessions table** from `sessions.csv`: real vs tracked P&L, drift, trades, win rate.
+- **Auto-refresh** every 30s (can be switched off), redrawing only when the logs change and keeping the filter and open trade detail. New `/api/sessions` route.
+- Trade detail title showed the BTC open price instead of the entry price.
+
+---
+
 ## 2026.11.21 — Fixes from the first live session
 
 ### Bug fixes
