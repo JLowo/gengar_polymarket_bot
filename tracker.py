@@ -301,6 +301,14 @@ class Tracker:
         self._active_trade_id = self._trade_counter
         return self._trade_counter
 
+    def add_fee(self, trade_id: int, fee: float):
+        """Add Polymarket's trading fee (measured after the buy) to a trade's
+        entry_cost, so trades.csv shows what left the wallet. entry_price stays
+        the fill price, so the fee is about entry_cost - entry_shares × entry_price."""
+        t = self._open_trades.get(trade_id)
+        if t:
+            t.entry_cost = round(t.entry_cost + fee, 2)
+
     def update_hold_stats(self, prob: float, sell_price: float):
         """Call on each position check tick to track hold-period extremes."""
         t = self._open_trades.get(self._active_trade_id)

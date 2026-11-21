@@ -70,6 +70,15 @@ PRICE_FETCH_CUTOFF = 15            # seconds before close
 STARTUP_LOOKUP_TRIES = 3
 # Fewer shares than this left of a booked win means it has been redeemed
 HELD_DUST = 0.01
+# Polymarket charges its trading fee on top of the fill, and the order
+# response doesn't say how much. It's measured from the pUSD change: read
+# every FEE_CHECK_INTERVAL until the buy shows up, for up to FEE_CHECK_FOR.
+# A change bigger than the fill + FEE_MAX_SHARE of it isn't the buy alone.
+FEE_CHECK_INTERVAL = 3             # seconds
+FEE_CHECK_FOR = 60                 # seconds
+FEE_MAX_SHARE = 0.05
+# Don't send an order this close to the window end (slow API calls before it)
+LATE_ORDER_GUARD = 5               # seconds
 
 
 def dry_run_from_env(value) -> tuple:
@@ -147,6 +156,7 @@ class PolyBot:
         self._unredeemed: dict = {}
         self._session_cids: set = set()        # markets traded this session
         self._last_pusd: float = 0.0           # pUSD at the last full balance read
+        self._fee_watch: dict = {}             # last live buy whose fee isn't measured yet
 
         # Exit state
         self._exited: bool = False
@@ -292,6 +302,7 @@ class PolyBot:
             try:
                 self._tick()
                 self._check_hourly_summary()
+                self._check_fee()
                 self._check_pending_resolutions()
             except Exception as e:
                 print(f"[error] {e}")
@@ -530,6 +541,9 @@ class PolyBot:
                     print("  ⚠️  Couldn't read balances or positions: bankroll sync and "
                           "redemptions skipped this window")
                 else:
+                    # Settle a pending fee from this same pUSD reading first, so
+                    # the fee isn't taken off again after the sync includes it
+                    self._check_fee(pusd=self._last_pusd)
                     drift = abs(real_bal - self.stats.bankroll)
                     if drift > 0.50:
                         print(f"  🔄 Balance sync: ${self.stats.bankroll:.2f} → "
@@ -658,12 +672,14 @@ class PolyBot:
             print(f"  🔌 CLOB HALTED — skipping trade ({self._consecutive_buy_failures} consecutive failures)")
             return
 
+        # Live: reading pUSD is an authenticated CLOB call, so it doubles as the
+        # health check, and it's the "before" figure for measuring the fee.
+        pusd_before = None
         if not self.dry_run and self.executor._initialized:
-            try:
-                self.executor.health_check()
-            except Exception as e:
+            pusd_before = self.executor.read_balance()
+            if pusd_before is None:
                 self._consecutive_buy_failures += 1
-                print(f"  🔌 CLOB health check failed: {e}")
+                print(f"  🔌 CLOB health check failed (couldn't read the pUSD balance)")
                 if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
                     self._clob_halted = True
                     msg = (f"🔌 CLOB HALTED after {self._consecutive_buy_failures} "
@@ -736,6 +752,11 @@ class PolyBot:
 
                 hint_price = actual_price
 
+        # Slow API calls above can eat the time left; never order into the close
+        if self._current_window + PERIOD_SECONDS[self.period] - time.time() < LATE_ORDER_GUARD:
+            print(f"  ⏱  Too close to the window end after slow API calls — skipping")
+            return
+
         # Never pay more than leaves MIN_EDGE (executor also caps at MAX_BUY_PRICE)
         max_price = sig.true_prob - self.strategy_config.min_edge
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount,
@@ -788,6 +809,9 @@ class PolyBot:
                 entry_seconds_remaining=seconds_remaining,
                 version=BOT_VERSION,
             )
+            if pusd_before is not None and not result.cost_estimated:
+                self._fee_watch = {"trade_id": self._trade_id, "before": pusd_before,
+                                   "spent": result.amount_usd, "since": time.time(), "last": 0.0}
 
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
@@ -899,10 +923,12 @@ class PolyBot:
         still_waiting = []
         for p in self._pending_resolutions:
             outcome = get_market_outcome(p["window_ts"], self.period)
-            if outcome and outcome["resolved"]:
+            # (a trade whose fee is still being measured waits for it, ≤ FEE_CHECK_FOR)
+            if (outcome and outcome["resolved"]
+                    and self._fee_watch.get("trade_id") != p["trade_id"]):
                 self._book_market_resolution(p, outcome["prices"])
                 continue
-            if outcome:
+            if outcome and not outcome["resolved"]:
                 self._note_early_result(p, outcome["prices"][p["side"]])
             if now - p["since"] > RESOLUTION_GIVE_UP_AFTER:
                 t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
@@ -964,6 +990,51 @@ class PolyBot:
             btc_delta=uf["delta"], seconds_remaining=uf["seconds_remaining"],
             version=BOT_VERSION,
         )
+
+    def _check_fee(self, force: bool = False, pusd: float = None):
+        """Measure Polymarket's fee on the last live buy from the real pUSD
+        change: pUSD before the order − pUSD now − what the fill cost. The fee
+        isn't in the order response. Read every FEE_CHECK_INTERVAL (outside the
+        window boundary) until the buy shows up; give up after FEE_CHECK_FOR, or
+        when force is set (shutdown), if the change isn't the buy alone (e.g. a
+        redemption landed in between). pusd: use this reading instead of a new one."""
+        w = self._fee_watch
+        if not w:
+            return
+        now = time.time()
+        if pusd is None and not force:
+            period = PERIOD_SECONDS[self.period]
+            into_window = now % period
+            if (now - w["last"] < FEE_CHECK_INTERVAL
+                    or into_window < 2 or period - into_window < 10):
+                return
+        w["last"] = now
+        balance = pusd if pusd is not None else self.executor.read_balance()
+        if balance is not None:
+            fee = w["before"] - balance - w["spent"]
+            if 0.001 <= fee <= FEE_MAX_SHARE * w["spent"]:
+                self._fee_watch = {}
+                self._apply_fee(w["trade_id"], fee, w["spent"])
+                return
+        if force or now - w["since"] > FEE_CHECK_FOR:
+            self._fee_watch = {}
+            print(f"  ⚠️  Couldn't measure the fee on trade {w['trade_id']}: pUSD didn't change "
+                  f"by the buy alone. trades.csv shows its cost without the fee.")
+
+    def _apply_fee(self, trade_id: int, fee: float, spent: float):
+        """Add a measured fee to the trade's cost (open or awaiting its result),
+        so its profit and trades.csv entry_cost match what left the wallet."""
+        # Waiting list first: at the window boundary a trade is already queued
+        # there while _traded still names it
+        waiting = [p for p in self._pending_resolutions if p["trade_id"] == trade_id]
+        if waiting:
+            waiting[0]["cost"] += fee
+        elif self._traded and self._trade_id == trade_id:
+            self._trade_cost += fee
+        self.stats.bankroll -= fee
+        self.tracker.add_fee(trade_id, fee)
+        print(f"  💸 Polymarket fee ${fee:.3f} on the ${spent:.2f} buy "
+              f"(measured from pUSD): cost ${spent + fee:.2f}")
 
     def _tracked_marks(self) -> dict:
         """token_id -> value per share of every position the bot tracks: the
@@ -1112,6 +1183,7 @@ class PolyBot:
         # Tor (live) keeps running until this process exits, so these still work
         if self.executor._initialized:
             self.executor.cancel_all()
+            self._check_fee(force=True)
 
         # Final real money sync
         synced = self.dry_run

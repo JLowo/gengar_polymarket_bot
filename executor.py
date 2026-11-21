@@ -84,6 +84,7 @@ class OrderResult:
     token_id: str = ""
     error: str = ""
     dry_run: bool = True
+    cost_estimated: bool = False   # fill not reported by the order response: cost guessed
 
 
 def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
@@ -336,8 +337,9 @@ class Executor:
                                side="BUY", token_id=tok, error=f"{resp.code}: {resp.message}")
 
         spent, shares = float(resp.making_amount), float(resp.taking_amount)
+        estimated = False
         if resp.status != "matched" or shares <= 0:
-            spent, shares = self._settle(resp.order_id, token_id, est, spent, shares)
+            spent, shares, estimated = self._settle(resp.order_id, token_id, est, spent, shares)
         if shares > 0 and spent > shares:   # BUY: shares cost < $1 each, so shares > spent
             print(f"  ⚠️  Fill amounts look swapped (making {spent}, taking {shares}); swapping")
             spent, shares = shares, spent
@@ -346,12 +348,13 @@ class Executor:
                                side="BUY", token_id=tok, error="FAK order filled nothing")
         return OrderResult(success=True, order_id=resp.order_id, status=FILLED, side="BUY",
                            price=spent / shares, amount_usd=spent, shares=shares,
-                           token_id=tok, dry_run=False)
+                           token_id=tok, dry_run=False, cost_estimated=estimated)
 
     def _settle(self, order_id: str, token_id: str, est: float,
                 spent: float, shares: float) -> tuple:
         """For a 'delayed' (or unreported) match, ask the exchange what filled.
-        Cost is estimated at `est`, the book price seen before ordering."""
+        Returns (spent, shares, estimated): a fill found this way is costed at
+        `est`, the book price seen before ordering."""
         for _ in range(DELAYED_CHECKS):
             time.sleep(DELAYED_CHECK_INTERVAL)
             try:
@@ -360,15 +363,15 @@ class Executor:
                 break   # no longer an open order: fall back to the token balance
             matched = float(order.size_matched)
             if matched > 0:
-                return matched * est, matched
+                return matched * est, matched, True
             if order.status not in ("delayed", "live"):
                 break
         held = self.token_balance(token_id)
         if held is not None and held > shares:
             print(f"  ⚠️  Fill read from token balance: {held:.2f} shares "
                   f"(cost estimated at ${est:.2f}/share)")
-            return held * est, held
-        return spent, shares
+            return held * est, held, True
+        return spent, shares, False
 
     def _after_uncertain_buy(self, token_id: str, est: float, err: Exception) -> OrderResult:
         """The request failed in a way where the order may still have reached
@@ -393,7 +396,8 @@ class Executor:
                   f"(cost estimated at ${est:.2f}/share)")
             return OrderResult(success=True, status=FILLED, side="BUY", price=est,
                                amount_usd=held * est, shares=held, token_id=tok,
-                               dry_run=False, error=f"filled despite error: {err}")
+                               dry_run=False, error=f"filled despite error: {err}",
+                               cost_estimated=True)
         return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok,
                            error=f"network: {type(err).__name__}: {err}")
 
