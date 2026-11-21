@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from market import (get_current_market, current_window_ts, get_resolution_payouts,
+from market import (get_current_market, current_window_ts, get_market_outcome,
                     get_book_price, PERIOD_SECONDS)
 from price_feed import BinancePriceFeed
 from strategy import evaluate, estimate_true_probability, get_skip_reason, StrategyConfig, TradingStats
@@ -58,6 +58,10 @@ OPEN_PRICE_MAX_LAG = 5  # seconds
 # are booked from Polymarket's own resolution (Gamma), checked this often.
 RESOLUTION_POLL_INTERVAL = 10      # seconds
 RESOLUTION_GIVE_UP_AFTER = 3600    # stop waiting (and alert) after an hour
+# Until then, a finished window's market price this decisive (or 1 minus it)
+# shows the likely result: the trade is valued at that price for the bankroll
+# and loss limit, but still booked only from Polymarket's resolution.
+EARLY_RESULT_MIN = 0.95
 # No price fetches this close to the window end, so a slow request can't delay
 # the boundary tick past OPEN_PRICE_MAX_LAG and make the next window "partial".
 PRICE_FETCH_CUTOFF = 15            # seconds before close
@@ -894,21 +898,40 @@ class PolyBot:
 
         still_waiting = []
         for p in self._pending_resolutions:
-            payouts = get_resolution_payouts(p["window_ts"], self.period)
-            if payouts is None:
-                if now - p["since"] > RESOLUTION_GIVE_UP_AFTER:
-                    t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
-                    msg = (f"No Polymarket result for the {t} window after "
-                           f"{RESOLUTION_GIVE_UP_AFTER // 60} min — trade {p['trade_id']} "
-                           f"({p['side']}, ${p['cost']:.2f}) NOT booked; check it manually")
-                    print(f"  ⚠️  {msg}")
-                    self.telegram.error_alert(msg)
-                    self.tracker.log_trade_unresolved("unresolved_timeout", trade_id=p["trade_id"])
-                else:
-                    still_waiting.append(p)
+            outcome = get_market_outcome(p["window_ts"], self.period)
+            if outcome and outcome["resolved"]:
+                self._book_market_resolution(p, outcome["prices"])
                 continue
-            self._book_market_resolution(p, payouts)
+            if outcome:
+                self._note_early_result(p, outcome["prices"][p["side"]])
+            if now - p["since"] > RESOLUTION_GIVE_UP_AFTER:
+                t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
+                msg = (f"No Polymarket result for the {t} window after "
+                       f"{RESOLUTION_GIVE_UP_AFTER // 60} min — trade {p['trade_id']} "
+                       f"({p['side']}, ${p['cost']:.2f}) NOT booked; check it manually")
+                print(f"  ⚠️  {msg}")
+                self.telegram.error_alert(msg)
+                self.tracker.log_trade_unresolved("unresolved_timeout", trade_id=p["trade_id"])
+            else:
+                still_waiting.append(p)
         self._pending_resolutions = still_waiting
+
+    def _note_early_result(self, p: dict, price: float):
+        """A finished window's market price shows the likely result well before
+        Polymarket resolves it. Once it's decisive, value the trade at that
+        price, so the bankroll and daily loss limit see a likely loss straight
+        away, and say so once. Booking still waits for the resolution."""
+        if 1.0 - EARLY_RESULT_MIN < price < EARLY_RESULT_MIN:
+            return
+        self.stats.bankroll += p["shares"] * (price - p["mark"])
+        p["mark"] = price
+        likely = "WIN" if price >= EARLY_RESULT_MIN else "LOSS"
+        if p.get("likely") != likely:
+            p["likely"] = likely
+            t = time.strftime("%H:%M", time.localtime(p["window_ts"]))
+            print(f"  🔮 Likely {likely}: {p['side']} in the {t} window is at ${price:.3f} "
+                  f"after the close (≈ ${p['shares'] * price - p['cost']:+.2f}); "
+                  f"booked when Polymarket resolves it | Bank: ${self.stats.bankroll:.2f}")
 
     def _recheck_unknown_fill(self):
         """A buy failed in a way where the fill couldn't be checked. Look at the
