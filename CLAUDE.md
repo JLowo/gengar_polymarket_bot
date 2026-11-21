@@ -18,7 +18,9 @@ strategy.py         → Brownian motion probability + Kelly criterion (recalibra
 executor.py         → Polymarket CLOB order execution (balance-verified, create_order path)
 market.py           → Market discovery via Gamma API
 price_feed.py       → Binance WebSocket for real-time BTC
-tracker.py          → Quant analytics logger (signals.csv, trades.csv, executions.csv)
+tracker.py          → Quant analytics logger (signals.csv, trades.csv, sessions.csv, hold_ticks.csv)
+session_log.py      → Copies the terminal output to logs/bot_<date>_<time>.log
+dashboard.py        → Local web dashboard over the logs (python dashboard.py)
 telegram_notifier.py → Mobile alerts + hourly summaries
 proxy.py            → Tor proxy for CLOB API geo-restrictions
 ```
@@ -95,7 +97,7 @@ Every trade (dry run and live) is booked from Polymarket's own resolution (Gamma
 
 Bankroll model: each position is carried at shares × a per-share mark (fill price, then the early price, then the payout), so a buy doesn't move the bankroll and the result moves it by payout − shares × mark. Each new window, live bankroll = pUSD + every tracked position (open, waiting, booked but unredeemed wins) at the shares the Safe still holds × its mark + redeemable winnings in markets not traded this session (Data API); drift > $0.50 is logged. Reading shares means a win counts once however it's redeemed (by the bot, or by Polymarket's auto-redeem if it's enabled). Any unreadable part → that sync is skipped (never counted as $0); start-up refuses to go live if it can't read them.
 
-Fees: Polymarket's V2 fee isn't in the order response and the market's published rate doesn't reproduce it, so it's measured from the pUSD change after each fill (`_check_fee`) and added to the trade's cost (`trades.csv` entry_cost/profit). Winnings are redeemed via `redeem_positions` when a builder API key is in `.env`, otherwise claimed in the UI.
+Fees: Polymarket's V2 fee isn't in the order response and the market's published rate doesn't reproduce it, so it's measured from the pUSD change after each fill (`_check_fee`) and added to the trade's cost (`trades.csv` fee column, included in entry_cost/profit). Winnings are redeemed via `redeem_positions` when a builder API key is in `.env`, otherwise claimed in the UI.
 
 ---
 
@@ -226,6 +228,13 @@ LOG_DIR=logs
 - **Complete replacement files** — deliver full files, not diffs or partial edits (unless explicitly requested)
 - **Forensic debugging** — cross-reference bot terminal logs against Polymarket CSV transaction history trade-by-trade
 - **Iterates rapidly** through versioned rewrites when architectural issues are discovered
+
+### Bot logs (logs/, gitignored)
+
+- `bot_<date>_<time>.log`: the terminal output of each run, timestamped (session_log.py). Start here for forensic debugging.
+- `signals.csv`: one row per window. `traded`; an attempt that didn't buy (`skipped_edge_gone`, `skipped_halted`, `skipped_health_check`, `skipped_loss_limit`, `skipped_no_market`, `skipped_too_late`, `buy_failed` with the executor's reason, e.g. `no_fill`); or `no_signal`, the window's closest call (the entry-window moment that passed most of evaluate()'s checks) with the check it failed. `vol` is the realized vol the model used; rows without it predate these rules.
+- `trades.csv` (`fee`, `vol_at_entry`), `sessions.csv` (`fees`), `hold_ticks.csv`.
+- Adding columns to a schema updates the CSV in place (`Tracker._ensure_headers`); add new columns at the end.
 
 ### Polymarket CSV export
 

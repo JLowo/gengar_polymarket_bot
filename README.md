@@ -135,11 +135,15 @@ python bot.py
 
 ## Tracker output
 
-The bot logs three CSV files in `LOG_DIR/` for post-session analysis:
+The bot logs these files in `LOG_DIR/` for post-session analysis:
 
-- **signals.csv** — every signal evaluated (traded or skipped), with model probability, market price, edge, Kelly size, and reason for action
-- **trades.csv** — full trade lifecycle: entry, hold-period extremes (min/max prob and sell price), exit, resolution outcome, and `profit_if_held` counterfactual
-- **executions.csv** — every CLOB API call with latency
+- **signals.csv** — one row per window: the trade, every attempt that didn't buy with what stopped it (price moved, no fill, loss limit...), or, for a window with no signal, its closest call and the check that failed. With model probability, market price, edge, Kelly size and the realized vol the model used
+- **trades.csv** — full trade lifecycle: entry, hold-period extremes (min/max prob and sell price), exit, resolution outcome, `profit_if_held` counterfactual, the measured fee and the vol at entry
+- **sessions.csv** — one row per run: real vs tracked P&L, drift, fees, trades
+- **bot_<date>_<time>.log** — everything the bot printed that run, with timestamps (the terminal output, kept after the tmux window closes)
+- **executions.csv** — every CLOB API call with latency (only with `LOG_EXECUTIONS=true`)
+
+When a new version adds columns to a CSV, the existing file gets them in place (older rows left blank). Other header changes move the old file to `*_pre_schema_change*.csv`; an earlier archive is never overwritten.
 
 ## Lessons learned
 

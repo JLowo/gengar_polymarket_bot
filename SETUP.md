@@ -258,13 +258,17 @@ When dry-run looks healthy for a session or two:
 
 ## Understanding the logs
 
-The bot creates a `logs/` directory with three CSV files:
+The bot creates a `logs/` directory with these files:
 
 | File | Contents |
 |------|----------|
-| `signals.csv` | Every market evaluation — price, probability, edge, decision |
-| `trades.csv` | Every trade taken — entry, exit, P&L |
-| `executions.csv` | Raw order details — order IDs, fills, balances |
+| `signals.csv` | One row per window — the trade, an attempt that didn't buy and why, or a quiet window's closest call and the check it failed |
+| `trades.csv` | Every trade taken — entry, exit, P&L, fee |
+| `sessions.csv` | One row per run — real vs tracked P&L, drift, fees |
+| `bot_<date>_<time>.log` | Everything the bot printed that run, with timestamps |
+| `executions.csv` | Raw order details — only with `LOG_EXECUTIONS=true` |
+
+The `.log` files are the terminal output, so you can still read a session after closing tmux. They are kept until you delete them (roughly 150 KB per few-hour session).
 
 These are your primary audit trail. After each session, compare `trades.csv` against your Polymarket transaction CSV (exported from the UI) to verify P&L tracking is accurate.
 
