@@ -532,29 +532,59 @@ class Tracker:
             "avg_entry_price": round(avg_entry_price, 4),
             "avg_edge": round(avg_edge, 4),
             "avg_delta": round(avg_delta, 4),
+            "fees": round(fees, 2),
         }
         self._append_row(self._session_path, row, SESSION_FIELDS)
 
     # ── Internal ────────────────────────────────────────────────────
 
     def _ensure_headers(self, path: str, fields: list):
-        if not os.path.exists(path):
-            with open(path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
-                writer.writeheader()
+        """Create the CSV with this header, or bring an existing file up to it.
+
+        If the schema only gained columns, the file is rewritten in place with
+        the new header and its rows kept (blank in the new columns), so the
+        history stays in the file the dashboard reads. Any other change
+        archives the old file under a name not yet taken (an earlier archive
+        is never overwritten) and starts a new one.
+        """
+        existing_header = None
+        if os.path.exists(path):
+            with open(path, "r", newline="") as f:
+                existing_header = next(csv.reader(f), None)
+        if existing_header == fields:
+            return
+        if not existing_header:   # new or empty file
+            self._write_csv(path, fields, [])
             return
 
-        # Check if existing header matches current schema — if not, archive and recreate
-        with open(path, "r", newline="") as f:
-            reader = csv.reader(f)
-            existing_header = next(reader, None)
-        if existing_header and existing_header != fields:
-            archive = path.replace(".csv", "_pre_schema_change.csv")
-            os.rename(path, archive)
-            print(f"[tracker] Schema changed — archived {path} → {archive}")
-            with open(path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
-                writer.writeheader()
+        if set(existing_header) <= set(fields):
+            with open(path, "r", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self._write_csv(path, fields, rows)
+            added = [c for c in fields if c not in existing_header]
+            if added:
+                print(f"[tracker] Added column(s) {', '.join(added)} to {path}")
+            return
+
+        stem = path[:-len(".csv")] if path.endswith(".csv") else path
+        archive, n = f"{stem}_pre_schema_change.csv", 2
+        while os.path.exists(archive):
+            archive, n = f"{stem}_pre_schema_change_{n}.csv", n + 1
+        os.rename(path, archive)
+        print(f"[tracker] Schema changed — archived {path} → {archive}")
+        self._write_csv(path, fields, [])
+
+    @staticmethod
+    def _write_csv(path: str, fields: list, rows: list):
+        """Write header + rows to a temp file, then swap it in, so a crash
+        mid-write can't leave a half-written log."""
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k) or "" for k in fields})
+        os.replace(tmp, path)
 
     def _append_row(self, path: str, row: dict, fields: list):
         # Only write fields that exist in the schema
