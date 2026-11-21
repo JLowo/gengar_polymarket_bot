@@ -40,9 +40,14 @@ How to read each metric and chart to decide which filter settings produce the be
 - **Formula**: `profit_factor = sum(profits on wins) / |sum(profits on losses)|`
 - **Decision rule**: Compare profit factor across versions. Higher = more efficient edge.
 
-### Skipped
-- **What**: Signals that passed the strategy model but were blocked by pre-trade checks (edge_gone, slippage, btc_reversed), with count of how many would have won.
-- **Why it matters**: If most skipped signals would have won, your pre-trade filters may be too aggressive — you're leaving money on the table. If most would have lost, the filters are saving you money. Track the would-have-won rate over time to calibrate.
+### Near Misses
+- **What**: Windows where the strategy gave a signal and the bot tried to buy but didn't, with how many would have won and what they'd have made in total if taken (at the price the bot would have paid, before fees).
+- **Reasons**: *price moved too far* (`edge_gone_at_market`: the book price the bot checked left less than MIN_EDGE) and *attempt failed (no reason logged)* (the buy didn't happen and the bot didn't record why, e.g. no fill or a failed balance read).
+- **Results**: Polymarket's own resolution, looked up on Gamma when the dashboard loads and saved in `logs/outcomes.json`, so each window is only fetched once. A window not resolved yet shows as *pending*.
+- **Why it matters**: If most near misses would have won *and* the P&L if taken is positive, the pre-trade check may be too strict. Look at the P&L, not just the win count: near misses are usually at high prices (80–90¢), where one loss wipes out several wins.
+
+### Quiet Windows
+- **What**: Windows with no signal at all. The bot logs these at the window's last second, when the market has already settled, so their logged skip reason (usually "price out of range") says nothing about the entry window and isn't shown.
 
 ---
 
@@ -90,20 +95,34 @@ How to read each metric and chart to decide which filter settings produce the be
   - Red bar >> green bar (dangerous — need very high WR to survive)
   - Profit factor in tooltip: >2.0 is strong, >3.0 is excellent
 
-### Skipped Signals by Reason
-- **What**: Bar chart showing count of would-have-won vs would-have-lost for each skip reason (edge_gone, slippage, btc_reversed).
-- **Why it matters**: Tells you which filters are helping and which are costing money.
-  - **edge_gone**: If mostly would-have-won → the market is repricing correctly but BTC continues trending. Your edge_gone check might be too strict, or you need faster execution.
-  - **slippage**: If mostly would-have-won → your slippage threshold (0.09) might be too tight. If mixed → it's working as intended.
-  - **btc_reversed**: Should mostly be would-have-lost. If it's blocking wins, the BTC direction re-check is too sensitive.
+### Edge: Seen vs At Fill
+- **What**: For each trade, the edge the bot saw when it decided (model probability − its cached book price, up to 5s old) next to the edge it actually got (probability − fill price). The title shows both averages and how often the fill was dearer than the price seen.
+- **Why it matters**: The logged edge (`edge_at_entry`, and `avg_edge` in sessions.csv) uses the price the bot saw, so it overstates the edge whenever the market moved first. A big, consistent gap means the bot's prices are too stale to compete with the market's repricing: faster prices would help more than a different MIN_EDGE.
 
-### Skipped: Would-Have-Won Rate (Pie)
-- **What**: Doughnut chart showing overall ratio of skipped signals that would have won vs lost.
-- **Why it matters**: Quick gut check. If >70% of skips would have won, you're being too cautious — loosening filters would capture profitable trades. If <50% would have won, your filters are saving you money. Target: ~50-60% would-have-won rate means your filters are optimally calibrated (blocking the bad while letting most good through).
+### Near Misses by Reason
+- **What**: Bar chart of near misses per reason, split into would have won / would have lost / pending.
+- **Why it matters**: Tells you which check is helping and which is costing money.
+  - **price moved too far**: If mostly would-have-won *and* positive P&L if taken → the check may be too strict, or the bot needs faster execution. If the P&L if taken is negative even with mostly wins, the check is doing its job (those entries were too expensive).
+  - **attempt failed (no reason logged)**: Should be rare. Check the bot's terminal output for that window.
+
+### Near Misses: Would-Have-Won Rate (Pie)
+- **What**: Doughnut chart of near misses that would have won vs lost (pending ones left out).
+- **Why it matters**: Quick gut check, but read it next to the P&L if taken: at 85¢ you need about 6 wins per loss to break even.
+
+### Near Misses Table
+- **What**: The last 30 near misses: model probability, BTC move, time left, the price the bot saw, the price it would have paid (the book price it checked; "~" means it didn't get that far, so this is the price it saw), Polymarket's result and the P&L if taken on the stake it had sized.
 
 ### Recent Trades Table
 - **What**: Last 20 trades with time, version, side, entry price, edge %, cost, shares, result, profit, and return %.
 - **Why it matters**: Quick scan for patterns. Look at the Edge % column alongside Result — do all your losses have low edge? That confirms the min_edge filter thesis. Also useful for spotting entry price patterns (are you buying too expensive on losses?).
+
+### Sessions Table
+- **What**: One row per bot run from `sessions.csv` (written when the bot stops, so a running session isn't there yet): length, balance at start and end, real P&L (from the wallet), tracked P&L (the bot's own sum of trades), the drift between them, trades and win rate. Not affected by the version filter.
+- **Why it matters**: Drift should be within a few cents. A drift of $0.50 or more (shown red) means the bot's bookkeeping and the wallet disagree: compare that session's trades against Polymarket's history.
+
+## Refreshing
+
+The page re-reads the logs every 30 seconds while **Auto-refresh** is ticked (remembered per browser) and redraws only when something changed, keeping the version filter and any open trade detail. **Refresh** redraws straight away.
 
 ---
 
@@ -116,7 +135,7 @@ Use this checklist when deciding which filter settings to keep:
 3. **Win Rate** — Higher is better, but only matters relative to avg entry price.
 4. **Wins to Recover** — Lower is better. Below 2.0 means each loss only costs ~2 wins.
 5. **Edge scatter** — Losses should cluster at low edge (filterable), not spread randomly.
-6. **Skipped would-have-won rate** — 50-60% is the sweet spot. Much higher = too strict.
+6. **Near misses** — P&L if taken near zero or negative means the pre-trade check is earning its keep; clearly positive means it's too strict.
 7. **Trade volume** — More is better *if EV/Trade stays positive*. Don't sacrifice EV for volume.
 
 ### The Binary Market Rule
