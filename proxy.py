@@ -9,6 +9,7 @@ For Tor, call `ensure_tor()` to auto-generate a torrc that pins exit nodes
 to Polymarket-friendly countries and (re)start Tor with it.
 """
 
+import atexit
 import logging
 import os
 import shutil
@@ -148,6 +149,10 @@ def _wait_for_bootstrap(proc: subprocess.Popen, timeout: int = _BOOTSTRAP_TIMEOU
     def _reader():
         try:
             for raw in proc.stdout:  # type: ignore[union-attr]
+                # After bootstrap, keep reading and discarding Tor's log output:
+                # a pipe nobody reads fills up, and Tor stalls the next time it logs.
+                if done.is_set():
+                    continue
                 line = raw.decode(errors="replace").rstrip()
                 lines.append(line)
                 pct = _parse_bootstrap_pct(line)
@@ -155,7 +160,6 @@ def _wait_for_bootstrap(proc: subprocess.Popen, timeout: int = _BOOTSTRAP_TIMEOU
                     logger.info(f"Tor bootstrap: {pct}%")
                 if "Bootstrapped 100%" in line:
                     done.set()
-                    return
         finally:
             # Always signal done when stdout closes (process exited or EOF),
             # so the main thread doesn't wait the full timeout on early exit.
@@ -216,10 +220,14 @@ def ensure_tor(exit_countries: Optional[list[str]] = None) -> str:
             time.sleep(2)
 
         logger.info("Starting Tor — waiting for full bootstrap (this may take ~60s)...")
+        # Tor gets its own session (process group), so Ctrl+C in the terminal
+        # reaches only the bot. The bot still needs Tor while it shuts down
+        # (cancel orders, final balance); Tor is stopped when this process exits.
         proc = subprocess.Popen(
             [tor_bin, "-f", str(torrc)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # merge stderr into stdout
+            start_new_session=True,
         )
 
         try:
@@ -229,6 +237,7 @@ def ensure_tor(exit_countries: Optional[list[str]] = None) -> str:
             raise
 
         TOR_PID_FILE.write_text(str(proc.pid))
+        atexit.register(_stop_tor)
         logger.info(f"Tor ready (pid {proc.pid}) — circuits built, proxy active on port {TOR_SOCKS_PORT}")
 
     proxy_url = f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}"
