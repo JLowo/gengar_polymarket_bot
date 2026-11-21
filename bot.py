@@ -581,14 +581,14 @@ class PolyBot:
               f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
         print(f"{'─' * 55}")
 
-        # Circuit breaker auto-recovery: ping CLOB each new window
+        # Circuit breaker auto-recovery: each new window, the same check that
+        # tripped it (a pUSD read from the CLOB)
         if self._clob_halted and not self.dry_run and self.executor._initialized:
-            try:
-                self.executor.health_check()
+            if self.executor.read_balance() is not None:
                 self._clob_halted = False
                 self._consecutive_buy_failures = 0
                 print(f"  ✅ CLOB recovered (health check OK) — resuming trades")
-            except Exception:
+            else:
                 print(f"  🔌 CLOB health check still failing — staying halted")
 
     # ── Market prices (cached, complement engine) ───────────────────

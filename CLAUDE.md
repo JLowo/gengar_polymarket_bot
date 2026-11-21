@@ -71,7 +71,7 @@ All trades hold until the 5-minute window closes. No prob-stop, no price-stop, n
 
 ### 1. CLOB health check (circuit breaker)
 
-Before every live trade: `self.executor.read_balance()` — an authenticated pUSD read from the CLOB API, which doubles as the "before" figure for measuring the trade's fee. Recovery checks at window boundaries use `executor.health_check()`, a plain request to the CLOB API (the SDK has no `get_ok()`).
+Before every live trade: `self.executor.read_balance()` — an authenticated pUSD read from the CLOB API, which doubles as the "before" figure for measuring the trade's fee. The same read is the recovery check at each window boundary while halted. `executor.health_check()` (a plain request to the CLOB API; the SDK has no `get_ok()`) is used by `preflight.py`.
 - Fail (read returns None) → increment `_consecutive_buy_failures`, skip trade
 - 3 consecutive failures → `_clob_halted = True`, Telegram alert, stop all trading
 - Auto-recovery: each new 5-min window, check again. If OK, reset and resume.
@@ -234,7 +234,7 @@ Available from Polymarket UI. Columns: `marketName`, `action` (Buy/Sell/Redeem),
 ### Key API endpoints
 
 - CLOB API: `https://clob.polymarket.com`
-  - `GET /` → health check (`executor.health_check()`, used for circuit-breaker recovery)
+  - `GET /` → health check (`executor.health_check()`, used by preflight.py)
   - `GET /time` → server time
   - `POST /order` → place order (requires auth + Tor routing)
 - Gamma API: `https://gamma-api.polymarket.com`
