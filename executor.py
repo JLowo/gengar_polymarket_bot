@@ -255,8 +255,10 @@ class Executor:
         bids = [(float(lv.price), float(lv.size)) for lv in book.bids]
         return walk_book(asks, bids, side, amount)
 
-    def redeemable_winnings(self) -> list:
-        """[(condition_id, value_usd)] for resolved positions worth redeeming."""
+    def redeemable_winnings(self) -> Optional[list]:
+        """[(condition_id, value_usd)] for resolved positions worth redeeming,
+        or None if Polymarket's positions data couldn't be read (an unknown,
+        not "no winnings": callers skip that round instead of counting $0)."""
         if not self._initialized:
             return []
         try:
@@ -265,7 +267,7 @@ class Executor:
                     if p.redeemable and p.current_value > 0]
         except Exception as e:
             print(f"[executor] Position check failed: {type(e).__name__}: {e}")
-            return []
+            return None
 
     # ── Orders ───────────────────────────────────────────────────────
 

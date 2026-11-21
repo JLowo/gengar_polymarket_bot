@@ -62,6 +62,8 @@ PRICE_FETCH_CUTOFF = 15            # seconds before close
 # A booked live win counts as owed money until Polymarket's data lists it as
 # redeemable (that can lag); stop counting it after this long.
 AWAITING_PAYOUT_MAX = 1800         # seconds
+# Positions lookups at start-up (the Data API is often rate-limited through Tor)
+STARTUP_LOOKUP_TRIES = 3
 
 
 def dry_run_from_env(value) -> tuple:
@@ -225,7 +227,18 @@ class PolyBot:
                 print("\n❌ Failed to initialize. Check credentials.")
                 return
             balance = self.executor.get_balance()
-            winnings = self.executor.redeemable_winnings()
+            winnings = None
+            for attempt in range(STARTUP_LOOKUP_TRIES):
+                winnings = self.executor.redeemable_winnings()
+                if winnings is not None:
+                    break
+                time.sleep(2)
+            if winnings is None:
+                # Starting without them would understate the session's start and
+                # loosen the daily loss limit once they're counted.
+                print("\n❌ Couldn't read your Polymarket positions (Data API, often rate-limited "
+                      "through Tor). Try again in a minute: ./start.sh gets a fresh Tor circuit.")
+                return
             equity = self._live_equity(winnings)
             if equity <= 0:
                 print("\n❌ Couldn't read the pUSD balance. Check the connection and run preflight.py.")
@@ -507,7 +520,10 @@ class PolyBot:
             # redeem any winnings that have become redeemable
             if not self.dry_run and self.executor._initialized:
                 winnings = self.executor.redeemable_winnings()
-                real_bal = self._live_equity(winnings)
+                if winnings is None:
+                    print("  ⚠️  Couldn't read positions: bankroll sync and redemptions skipped "
+                          "this window")
+                real_bal = self._live_equity(winnings) if winnings is not None else 0.0
                 if real_bal > 0:
                     drift = abs(real_bal - self.stats.bankroll)
                     if drift > 0.50:
@@ -930,6 +946,8 @@ class PolyBot:
             return 0.0
         if winnings is None:
             winnings = self.executor.redeemable_winnings()
+            if winnings is None:
+                return 0.0
         pending = {str(p.get("condition_id", "")) for p in self._pending_resolutions}
         won = sum(v for cid, v in winnings if cid not in pending)
         stakes = sum(p["cost"] for p in self._pending_resolutions)
@@ -942,13 +960,10 @@ class PolyBot:
         owed = sum(v for v, _ in self._awaiting_payout.values())
         return balance + won + stakes + owed
 
-    def _redeem_winnings(self, winnings: list = None):
-        """Submit redemption for every resolved winning position (live only)."""
-        if self.dry_run or not self.executor._initialized:
-            return
-        if winnings is None:
-            winnings = self.executor.redeemable_winnings()
-        if not winnings:
+    def _redeem_winnings(self, winnings: list):
+        """Submit redemption for every resolved winning position (live only).
+        winnings is None when the positions lookup failed: nothing is done."""
+        if self.dry_run or not self.executor._initialized or not winnings:
             return
         if not self.executor.can_redeem:
             total = round(sum(v for _, v in winnings), 2)
