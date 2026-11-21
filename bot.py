@@ -19,8 +19,10 @@ Safety systems:
      CLOB V2 trading approvals in place (see executor.py, preflight.py).
   5. Results are booked from Polymarket's own resolution, and winnings
      are redeemed when a builder API key is configured.
-  6. Window-boundary sync: bankroll = pUSD + redeemable winnings + stakes
-     awaiting a result, so sizing and the loss limit use real money.
+  6. Window-boundary sync: bankroll = pUSD + every tracked position at the
+     shares the Safe still holds (so a win counts once, however it is
+     redeemed) + other redeemable winnings; sizing and the loss limit use
+     real money. A failed read skips the sync rather than counting $0.
 """
 
 import os
@@ -59,11 +61,11 @@ RESOLUTION_GIVE_UP_AFTER = 3600    # stop waiting (and alert) after an hour
 # No price fetches this close to the window end, so a slow request can't delay
 # the boundary tick past OPEN_PRICE_MAX_LAG and make the next window "partial".
 PRICE_FETCH_CUTOFF = 15            # seconds before close
-# A booked live win counts as owed money until Polymarket's data lists it as
-# redeemable (that can lag); stop counting it after this long.
-AWAITING_PAYOUT_MAX = 1800         # seconds
-# Positions lookups at start-up (the Data API is often rate-limited through Tor)
+# Balance and positions reads at start-up (the Data API is often rate-limited
+# through Tor)
 STARTUP_LOOKUP_TRIES = 3
+# Fewer shares than this left of a booked win means it has been redeemed
+HELD_DUST = 0.01
 
 
 def dry_run_from_env(value) -> tuple:
@@ -136,7 +138,11 @@ class PolyBot:
         self._trade_condition_id: str = ""
         self._claim_note_total: float = -1.0   # last "claim in the UI" total printed
         self._unknown_fill: dict = {}          # a buy whose fill couldn't be checked
-        self._awaiting_payout: dict = {}       # condition_id -> (payout, booked_at), live wins
+        # Live: booked wins (or split payouts) whose shares may still be in the
+        # Safe, token_id -> {"condition_id", "per_share"}; dropped once redeemed
+        self._unredeemed: dict = {}
+        self._session_cids: set = set()        # markets traded this session
+        self._last_pusd: float = 0.0           # pUSD at the last full balance read
 
         # Exit state
         self._exited: bool = False
@@ -226,29 +232,25 @@ class PolyBot:
             if not self.executor.initialize():
                 print("\n❌ Failed to initialize. Check credentials.")
                 return
-            balance = self.executor.get_balance()
-            winnings = None
+            equity, redeemable = None, []
             for attempt in range(STARTUP_LOOKUP_TRIES):
-                winnings = self.executor.redeemable_winnings()
-                if winnings is not None:
+                equity, redeemable = self._live_equity()
+                if equity is not None:
                     break
                 time.sleep(2)
-            if winnings is None:
-                # Starting without them would understate the session's start and
-                # loosen the daily loss limit once they're counted.
-                print("\n❌ Couldn't read your Polymarket positions (Data API, often rate-limited "
-                      "through Tor). Try again in a minute: ./start.sh gets a fresh Tor circuit.")
+            if equity is None:
+                # Starting from a guess (e.g. winnings left out) would understate the
+                # session's start and loosen the daily loss limit once they're counted.
+                print("\n❌ Couldn't read your pUSD balance or Polymarket positions (see above; the "
+                      "positions lookup is often rate-limited through Tor). Try again in a minute: "
+                      "./start.sh gets a fresh Tor circuit.")
                 return
-            equity = self._live_equity(winnings)
-            if equity <= 0:
-                print("\n❌ Couldn't read the pUSD balance. Check the connection and run preflight.py.")
-                return
-            print(f"  pUSD balance: ${balance:.2f} | with redeemable winnings: ${equity:.2f}")
+            print(f"  pUSD balance: ${self._last_pusd:.2f} | with redeemable winnings: ${equity:.2f}")
             self.stats.bankroll = equity
             self._session_start_balance = equity
             self._last_real_balance = equity
             self.tracker.set_session_balance(equity)
-            self._redeem_winnings(winnings)
+            self._redeem_winnings(redeemable)
         else:
             print("  [dry run — no wallet connection]")
             self._session_start_balance = self.stats.bankroll
@@ -519,19 +521,18 @@ class PolyBot:
             # Sync real money at window boundary (catches any drift), and
             # redeem any winnings that have become redeemable
             if not self.dry_run and self.executor._initialized:
-                winnings = self.executor.redeemable_winnings()
-                if winnings is None:
-                    print("  ⚠️  Couldn't read positions: bankroll sync and redemptions skipped "
-                          "this window")
-                real_bal = self._live_equity(winnings) if winnings is not None else 0.0
-                if real_bal > 0:
+                real_bal, redeemable = self._live_equity()
+                if real_bal is None:
+                    print("  ⚠️  Couldn't read balances or positions: bankroll sync and "
+                          "redemptions skipped this window")
+                else:
                     drift = abs(real_bal - self.stats.bankroll)
                     if drift > 0.50:
                         print(f"  🔄 Balance sync: ${self.stats.bankroll:.2f} → "
                               f"${real_bal:.2f} (drift ${drift:.2f})")
                     self.stats.bankroll = real_bal
                     self._last_real_balance = real_bal
-                self._redeem_winnings(winnings)
+                    self._redeem_winnings(redeemable)
 
         self._current_window = window_ts
         self._opening_price = 0.0
@@ -744,8 +745,10 @@ class PolyBot:
             self._trade_cost = result.amount_usd
             self._trade_shares = result.shares
             self._trade_token_id = token_id
+            self._session_cids.add(market.condition_id)
 
-            self.stats.bankroll -= result.amount_usd
+            # The bankroll counts the position at its fill price (its "mark"), so
+            # buying doesn't change it; the result moves it (see _book_market_resolution)
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
             self._session_entries.append((result.price, sig.edge, sig.btc_delta_pct))
 
@@ -863,6 +866,8 @@ class PolyBot:
             "trade_id": self._trade_id,
             "cost": original_cost,
             "shares": remaining_shares,
+            "token_id": self._trade_token_id,
+            "mark": self._trade_price,      # value per share counted in the bankroll
             "exit_revenue": self._exit_revenue,
             "opening_price": self._opening_price,
             "closing_price": btc_price,
@@ -927,7 +932,7 @@ class PolyBot:
         self._trade_side, self._trade_price = uf["side"], uf["price"]
         self._trade_cost, self._trade_shares = cost, held
         self._trade_token_id, self._trade_condition_id = uf["token_id"], uf["condition_id"]
-        self.stats.bankroll -= cost
+        self._session_cids.add(uf["condition_id"])
         self.stats.hourly.record_trade(uf["edge"], uf["delta"])
         self._session_entries.append((uf["price"], uf["edge"], uf["delta"]))
         self._trade_id = self.tracker.open_trade(
@@ -937,32 +942,56 @@ class PolyBot:
             version=BOT_VERSION,
         )
 
-    def _live_equity(self, winnings: list = None) -> float:
-        """Real money in live mode: pUSD + redeemable winnings + stakes still
-        awaiting a result (0.0 if the balance can't be read). Pass the
-        redeemable winnings if already fetched, to avoid a second lookup."""
+    def _tracked_marks(self) -> dict:
+        """token_id -> value per share of every position the bot tracks: the
+        open trade and trades awaiting a result at their mark, and booked wins
+        (or split payouts) not yet redeemed at their payout."""
+        marks = {}
+        if self._traded and self._trade_token_id:
+            marks[self._trade_token_id] = self._trade_price
+        for p in self._pending_resolutions:
+            marks[p["token_id"]] = p["mark"]
+        for tok, u in self._unredeemed.items():
+            marks[tok] = u["per_share"]
+        return marks
+
+    def _live_equity(self) -> tuple:
+        """(equity, redeemable) in live mode, or (None, []) if any part couldn't
+        be read, so the caller skips that sync instead of using a wrong figure.
+
+        equity = pUSD + each tracked position at the shares the Safe still holds
+                 × its value per share + redeemable winnings in markets the bot
+                 didn't trade this session (from Polymarket's positions data).
+        Reading the shares means a win counts exactly once, whether the bot,
+        Polymarket's auto-redeem or nobody has redeemed it yet, and Polymarket's
+        positions data can lag without making a win vanish or count twice.
+        redeemable = [(condition_id, value)] still to redeem.
+        """
+        # pUSD first: a redemption landing between the reads then undercounts
+        # once (shares gone, pUSD read before) instead of counting twice
         balance = self.executor.read_balance()
         if balance is None:
-            return 0.0
+            return None, []
+        marks = self._tracked_marks()
+        held = {}
+        for tok in marks:
+            shares = self.executor.token_balance(tok)
+            if shares is None:
+                return None, []
+            held[tok] = shares
+        winnings = self.executor.redeemable_winnings()
         if winnings is None:
-            winnings = self.executor.redeemable_winnings()
-            if winnings is None:
-                return 0.0
-        pending = {str(p.get("condition_id", "")) for p in self._pending_resolutions}
-        won = sum(v for cid, v in winnings if cid not in pending)
-        stakes = sum(p["cost"] for p in self._pending_resolutions)
-        # Wins already booked but not yet listed as redeemable (Polymarket's data
-        # can lag): count them until they show up there, or for AWAITING_PAYOUT_MAX
-        listed, now = {cid for cid, _ in winnings}, time.time()
-        for cid in list(self._awaiting_payout):
-            if cid in listed or now - self._awaiting_payout[cid][1] > AWAITING_PAYOUT_MAX:
-                del self._awaiting_payout[cid]
-        owed = sum(v for v, _ in self._awaiting_payout.values())
-        return balance + won + stakes + owed
+            return None, []
+        for tok in [t for t in self._unredeemed if held[t] < HELD_DUST]:
+            del self._unredeemed[tok]            # redeemed, by the bot or by Polymarket
+        other = [(cid, v) for cid, v in winnings if cid not in self._session_cids]
+        redeemable = [(u["condition_id"], held[tok] * u["per_share"])
+                      for tok, u in self._unredeemed.items()] + other
+        self._last_pusd = balance
+        return balance + sum(held[t] * marks[t] for t in marks) + sum(v for _, v in other), redeemable
 
     def _redeem_winnings(self, winnings: list):
-        """Submit redemption for every resolved winning position (live only).
-        winnings is None when the positions lookup failed: nothing is done."""
+        """Submit redemption for every resolved winning position (live only)."""
         if self.dry_run or not self.executor._initialized or not winnings:
             return
         if not self.executor.can_redeem:
@@ -984,17 +1013,16 @@ class PolyBot:
         winner = max(payouts, key=payouts.get) if max(payouts.values()) >= 0.99 else "SPLIT"
         payout = p["shares"] * per_share
         profit = p["exit_revenue"] + payout - p["cost"]
+        # The bankroll held this position at shares × mark; now it's worth its payout
+        self.stats.bankroll += payout - p["shares"] * p["mark"]
         if self.dry_run:
             if payout > 0:
-                # Paper payout, counted as unclaimed like the old dry-run path did.
-                self.stats.bankroll += payout
-                self._unclaimed_winnings += payout
-        else:
-            # Live bankroll is "equity" (see _live_equity): the stake is no longer
-            # awaiting a result, and any payout is owed until it is redeemable.
-            self.stats.bankroll += payout - p["cost"]
-            if payout > 0 and p.get("condition_id"):
-                self._awaiting_payout[p["condition_id"]] = (payout, time.time())
+                self._unclaimed_winnings += payout     # paper payout, shown as unclaimed
+        elif per_share > 0 and p.get("token_id"):
+            # Held until redeemed (by the bot or Polymarket's auto-redeem).
+            # _live_equity values it from the shares still in the Safe.
+            self._unredeemed[p["token_id"]] = {"condition_id": p["condition_id"],
+                                               "per_share": per_share}
         if profit > 0:
             self.stats.record_win(profit)
             self.telegram.win_alert(profit, self.stats.total_pnl)
@@ -1026,15 +1054,8 @@ class PolyBot:
             self._last_hour_check = current_hour
             h = self.stats.hourly.to_dict()
             o = self.stats.to_dict()
-
-            # Sync real balance for accuracy
-            if not self.dry_run and self.executor._initialized:
-                real_bal = self.executor.get_balance()
-                if real_bal > 0:
-                    self.stats.bankroll = real_bal
-                    self._last_real_balance = real_bal
-                    o["bankroll"] = real_bal
-
+            # (Live: the bankroll was synced to real equity at this window's start;
+            # pUSD alone would leave out positions and unredeemed winnings.)
             real_pnl = self.stats.bankroll - self._session_start_balance
 
             print(f"\n{'═' * 55}")
@@ -1065,15 +1086,18 @@ class PolyBot:
         print(f"\n\n🛑 Shutting down...")
         self._running = False
         self.price_feed.stop()
+        # Tor (live) keeps running until this process exits, so these still work
         if self.executor._initialized:
             self.executor.cancel_all()
 
         # Final real money sync
+        synced = self.dry_run
         if not self.dry_run and self.executor._initialized:
-            real_bal = self._live_equity()
-            if real_bal > 0:
+            real_bal, _ = self._live_equity()
+            if real_bal is not None:
                 self.stats.bankroll = real_bal
                 self._last_real_balance = real_bal
+                synced = True
 
         real_pnl = self.stats.bankroll - self._session_start_balance
         o = self.stats.to_dict()
@@ -1082,8 +1106,9 @@ class PolyBot:
               f"{o['wins']}W/{o['losses']}L | "
               f"WR: {o['win_rate']:.1f}%")
         print(f"  Tracked P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
-        print(f"  💰 Real P&L: ${real_pnl:+.2f} "
-              f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})")
+        print(f"  💰 {'Real' if synced else 'Estimated'} P&L: ${real_pnl:+.2f} "
+              f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})"
+              f"{'' if synced else ' — final balances unreadable, so from the bot tracking'}")
         if self._unclaimed_winnings > 0:
             print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
         # Trades without a result still get a trades.csv row (result left blank)
