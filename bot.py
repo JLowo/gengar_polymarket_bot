@@ -571,11 +571,14 @@ class PolyBot:
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
 
+        # Filled = this session's fills; W/L and P&L count booked results only,
+        # so the trades still waiting for Polymarket's result are shown too
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
         print(f"\n{'─' * 55}")
-        print(f"🕐 {t} | Trades: {self.stats.total_trades} | "
-              f"W/L: {self.stats.wins}/{self.stats.losses} | "
-              f"P&L: ${self.stats.total_pnl:+.2f}")
+        print(f"🕐 {t} | Trades: {len(self._session_entries)} filled | "
+              f"W/L: {self.stats.wins}/{self.stats.losses}, "
+              f"{len(self._pending_resolutions)} waiting | "
+              f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
         print(f"{'─' * 55}")
 
         # Circuit breaker auto-recovery: ping CLOB each new window
