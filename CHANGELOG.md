@@ -6,6 +6,17 @@ Standard sections: **Strategy** (parameter/model/filter changes), **Bug fixes** 
 
 ## Unreleased
 
+### Bug fixes
+- **A CSV schema change could delete an earlier archive**: the tracker renamed the old file to `*_pre_schema_change.csv`, overwriting one that already existed. Added columns are now filled in place (older rows blank); other header changes archive under a new name.
+- **A failed buy attempt could leave no reason**: every way an attempt can stop now logs a `signals.csv` row (`skipped_halted`, `skipped_health_check`, `skipped_loss_limit`, `skipped_no_market`, `skipped_too_late`, `buy_failed` with a reason such as `no_fill`). The executor returns that reason with each failed order. An "unknown fill" that turns out to have filled also gets a `traded` row.
+- **Quiet windows were logged at their last second**, when the market had settled, so the reason (usually "price out of range") said nothing about the entry window. The bot now logs the window's closest call: the entry-window moment that passed most checks, with the check it failed, at the vol in force then. No such row after an attempt, so no duplicate rows either.
+
+### Infrastructure
+- **Session log**: everything the bot prints is also saved to `logs/bot_<date>_<time>.log`, timestamped, so a session can be reviewed after tmux closes.
+- New columns: `signals.csv` `vol`; `trades.csv` `fee`, `vol_at_entry`; `sessions.csv` `fees`. The shutdown summary shows the session's fees.
+- `signals.csv` attempt rows now always carry the signal's price and edge in `market_price`/`edge`, and the checked book price in `actual_price`/`actual_edge` (edge-gone rows used to put the checked price in both).
+- `strategy.explain_entry()` gives evaluate()'s first failed check with its numbers; a test keeps the two in step.
+
 ### Dashboard
 - **Near misses vs quiet windows**: "Skipped" counted every window without a trade. It now separates near misses (the bot tried to buy but didn't) from quiet windows (no signal at all, whose logged reason is from the window's last second and isn't shown).
 - **Would-have-won for near misses**: Polymarket's result for each near-miss window (Gamma, cached in `logs/outcomes.json`) and the P&L if taken at the price the bot would have paid, before fees, in a new table and in the stat card and charts.
@@ -13,6 +24,8 @@ Standard sections: **Strategy** (parameter/model/filter changes), **Bug fixes** 
 - **Sessions table** from `sessions.csv`: real vs tracked P&L, drift, trades, win rate.
 - **Auto-refresh** every 30s (can be switched off), redrawing only when the logs change and keeping the filter and open trade detail. New `/api/sessions` route.
 - Trade detail title showed the BTC open price instead of the entry price.
+- Labels for the new attempt reasons; **Quiet Windows: Closest Call** chart; **Fees** card and fee columns in Recent Trades and Sessions. Numbered schema archives are read too.
+- A trade without a result (bot stopped with it open, or no resolution in time) counted as a loss in the stats and charts; it's now left out of them and shown as "NO RESULT" in Recent Trades.
 
 ---
 

@@ -39,15 +39,21 @@ SIGNAL_FIELDS = [
     "side", "true_prob", "market_price", "edge",
     "kelly_size",
     # What happened
-    "action",           # "traded", "skipped_edge_gone", "skipped_below_min",
-                        # "skipped_price_cap", "skipped_no_signal", etc.
-    "skip_reason",      # "delta_too_small", "prob_below_min", "edge_below_min",
-                        # "price_out_of_range", "edge_gone_at_market", or ""
+    "action",           # "traded"; an attempt that didn't buy: "skipped_edge_gone",
+                        # "skipped_halted", "skipped_health_check",
+                        # "skipped_loss_limit", "skipped_no_market",
+                        # "skipped_too_late", "buy_failed"; or "no_signal" (a
+                        # window with no signal: its closest call)
+    "skip_reason",      # why: "edge_gone_at_market"; for buy_failed "no_fill",
+                        # "price_cap", "rejected", "api_error", "unknown_fill";
+                        # for no_signal "delta_too_small", "price_out_of_range",
+                        # "prob_below_min", "edge_below_min"
     "actual_price",     # Real market price after preview (0 if not checked)
     "actual_edge",      # Edge at actual price
     "fill_price",       # What we actually paid (0 if not traded)
     "slippage",         # fill_price - market_price (0 if not traded)
     "version",          # BOT_VERSION that logged the row (dashboard filter)
+    "vol",              # realized 5-min vol the model used (blank on older rows)
 ]
 
 # ── Trade record ────────────────────────────────────────────────────
@@ -83,6 +89,11 @@ TRADE_FIELDS = [
     # Meta
     "version",
     "bankroll",                 # Portfolio balance after this trade resolves
+    # Added later (blank on older rows)
+    "fee",                      # Polymarket fee measured from pUSD (already in
+                                # entry_cost); blank if not measured (dry run, or
+                                # the pUSD change wasn't the buy alone)
+    "vol_at_entry",             # realized 5-min vol the model used at entry
 ]
 
 
@@ -115,6 +126,8 @@ class TradeRecord:
     min_sell_price_seen: float = 999.0
     # Meta
     version: str = ""
+    fee: Optional[float] = None     # None until measured (written blank)
+    vol_at_entry: float = 0.0
 
 
 # ── Execution record ────────────────────────────────────────────────
@@ -147,6 +160,7 @@ SESSION_FIELDS = [
     "pnl_drift",                # real_pnl - tracked_pnl
     "trades", "wins", "losses", "win_rate",
     "avg_entry_price", "avg_edge", "avg_delta",
+    "fees",                     # Polymarket fees measured this session (in the P&L already)
 ]
 
 
@@ -215,6 +229,7 @@ class Tracker:
         actual_price: float = 0.0,
         actual_edge: float = 0.0,
         fill_price: float = 0.0,
+        vol: float = 0.0,
     ):
         self._signals_total += 1
         if action == "traded":
@@ -255,6 +270,7 @@ class Tracker:
             "fill_price": round(fill_price, 4),
             "slippage": round(slippage, 4),
             "version": self.version,
+            "vol": round(vol, 4) if vol > 0 else "",
         }
         self._append_row(self._signal_path, row, SIGNAL_FIELDS)
 
@@ -275,6 +291,7 @@ class Tracker:
         entry_delta_pct: float = 0.0,
         entry_seconds_remaining: float = 0.0,
         version: str = "",
+        vol: float = 0.0,
     ) -> int:
         """Record a trade entry and make it the active trade. Returns its trade_id."""
         self._trade_counter += 1
@@ -297,17 +314,19 @@ class Tracker:
             max_prob_during_hold=round(prob, 4),
             min_prob_during_hold=round(prob, 4),
             version=version,
+            vol_at_entry=round(vol, 4),
         )
         self._active_trade_id = self._trade_counter
         return self._trade_counter
 
     def add_fee(self, trade_id: int, fee: float):
-        """Add Polymarket's trading fee (measured after the buy) to a trade's
-        entry_cost, so trades.csv shows what left the wallet. entry_price stays
-        the fill price, so the fee is about entry_cost - entry_shares × entry_price."""
+        """Record Polymarket's trading fee (measured after the buy): in the fee
+        column, and added to entry_cost so trades.csv shows what left the
+        wallet. entry_price stays the fill price."""
         t = self._open_trades.get(trade_id)
         if t:
             t.entry_cost = round(t.entry_cost + fee, 2)
+            t.fee = round((t.fee or 0.0) + fee, 4)
 
     def update_hold_stats(self, prob: float, sell_price: float):
         """Call on each position check tick to track hold-period extremes."""
@@ -423,6 +442,8 @@ class Tracker:
         row = asdict(t)
         if row["min_sell_price_seen"] >= 999:   # never saw a sell price
             row["min_sell_price_seen"] = 0.0
+        if not row["vol_at_entry"]:
+            row["vol_at_entry"] = ""
         row.update(extra)
         self._append_row(self._trade_path, row, TRADE_FIELDS)
 
@@ -514,6 +535,7 @@ class Tracker:
         avg_entry_price: float = 0.0,
         avg_edge: float = 0.0,
         avg_delta: float = 0.0,
+        fees: float = 0.0,
     ):
         real_pnl = end_balance - start_balance
         win_rate = (wins / trades * 100) if trades > 0 else 0.0
@@ -532,29 +554,59 @@ class Tracker:
             "avg_entry_price": round(avg_entry_price, 4),
             "avg_edge": round(avg_edge, 4),
             "avg_delta": round(avg_delta, 4),
+            "fees": round(fees, 2),
         }
         self._append_row(self._session_path, row, SESSION_FIELDS)
 
     # ── Internal ────────────────────────────────────────────────────
 
     def _ensure_headers(self, path: str, fields: list):
-        if not os.path.exists(path):
-            with open(path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
-                writer.writeheader()
+        """Create the CSV with this header, or bring an existing file up to it.
+
+        If the schema only gained columns, the file is rewritten in place with
+        the new header and its rows kept (blank in the new columns), so the
+        history stays in the file the dashboard reads. Any other change
+        archives the old file under a name not yet taken (an earlier archive
+        is never overwritten) and starts a new one.
+        """
+        existing_header = None
+        if os.path.exists(path):
+            with open(path, "r", newline="") as f:
+                existing_header = next(csv.reader(f), None)
+        if existing_header == fields:
+            return
+        if not existing_header:   # new or empty file
+            self._write_csv(path, fields, [])
             return
 
-        # Check if existing header matches current schema — if not, archive and recreate
-        with open(path, "r", newline="") as f:
-            reader = csv.reader(f)
-            existing_header = next(reader, None)
-        if existing_header and existing_header != fields:
-            archive = path.replace(".csv", "_pre_schema_change.csv")
-            os.rename(path, archive)
-            print(f"[tracker] Schema changed — archived {path} → {archive}")
-            with open(path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
-                writer.writeheader()
+        if set(existing_header) <= set(fields):
+            with open(path, "r", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self._write_csv(path, fields, rows)
+            added = [c for c in fields if c not in existing_header]
+            if added:
+                print(f"[tracker] Added column(s) {', '.join(added)} to {path}")
+            return
+
+        stem = path[:-len(".csv")] if path.endswith(".csv") else path
+        archive, n = f"{stem}_pre_schema_change.csv", 2
+        while os.path.exists(archive):
+            archive, n = f"{stem}_pre_schema_change_{n}.csv", n + 1
+        os.rename(path, archive)
+        print(f"[tracker] Schema changed — archived {path} → {archive}")
+        self._write_csv(path, fields, [])
+
+    @staticmethod
+    def _write_csv(path: str, fields: list, rows: list):
+        """Write header + rows to a temp file, then swap it in, so a crash
+        mid-write can't leave a half-written log."""
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k) or "" for k in fields})
+        os.replace(tmp, path)
 
     def _append_row(self, path: str, row: dict, fields: list):
         # Only write fields that exist in the schema

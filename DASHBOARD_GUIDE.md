@@ -42,12 +42,16 @@ How to read each metric and chart to decide which filter settings produce the be
 
 ### Near Misses
 - **What**: Windows where the strategy gave a signal and the bot tried to buy but didn't, with how many would have won and what they'd have made in total if taken (at the price the bot would have paid, before fees).
-- **Reasons**: *price moved too far* (`edge_gone_at_market`: the book price the bot checked left less than MIN_EDGE) and *attempt failed (no reason logged)* (the buy didn't happen and the bot didn't record why, e.g. no fill or a failed balance read).
+- **Reasons**: *price moved too far* (`edge_gone_at_market`: the book price the bot checked left less than MIN_EDGE); *order didn't fill*, *order rejected*, *API error*, *fill unknown* (the order went out but didn't buy); *balance check failed*, *trading halted*, *daily loss limit*, *market not found*, *too close to window end* (stopped before ordering). Older rows (before the vol column) only log *price moved too far*; anything else shows as *attempt failed (no reason logged)*.
 - **Results**: Polymarket's own resolution, looked up on Gamma when the dashboard loads and saved in `logs/outcomes.json`, so each window is only fetched once. A window not resolved yet shows as *pending*.
 - **Why it matters**: If most near misses would have won *and* the P&L if taken is positive, the pre-trade check may be too strict. Look at the P&L, not just the win count: near misses are usually at high prices (80–90¢), where one loss wipes out several wins.
 
 ### Quiet Windows
-- **What**: Windows with no signal at all. The bot logs these at the window's last second, when the market has already settled, so their logged skip reason (usually "price out of range") says nothing about the entry window and isn't shown.
+- **What**: Windows with no signal at all. The bot logs each one's *closest call*: the moment in the entry window that passed most of the strategy's checks, with the check that stopped it (see the Closest Call chart). Older rows were logged at the window's last second, when the market had already settled, so their reason isn't shown.
+
+### Fees
+- **What**: Polymarket fees measured on the trades in the filter (already included in their cost and profit), how many trades had their fee measured, and fees as a share of gross wins.
+- **Why it matters**: Fees come off every trade, win or lose. If they are a large share of gross wins, small-edge entries may not be worth taking.
 
 ---
 
@@ -103,7 +107,13 @@ How to read each metric and chart to decide which filter settings produce the be
 - **What**: Bar chart of near misses per reason, split into would have won / would have lost / pending.
 - **Why it matters**: Tells you which check is helping and which is costing money.
   - **price moved too far**: If mostly would-have-won *and* positive P&L if taken → the check may be too strict, or the bot needs faster execution. If the P&L if taken is negative even with mostly wins, the check is doing its job (those entries were too expensive).
-  - **attempt failed (no reason logged)**: Should be rare. Check the bot's terminal output for that window.
+  - **order didn't fill**: The order went out at no more than prob − MIN_EDGE but nothing was available at that price: the market had moved. Many of these that would have won point to slow execution.
+  - **balance check failed / API error / trading halted**: Connection problems (often Tor). Check that session's `logs/bot_*.log`.
+  - **attempt failed (no reason logged)**: Older rows only. Check the bot's terminal output for that window.
+
+### Quiet Windows: Closest Call
+- **What**: For each quiet window, the check that stopped its closest moment to a signal, in the order the strategy applies them: *BTC move too small* → *price out of range* → *probability below min* → *edge below min*.
+- **Why it matters**: Shows which filter is keeping the bot out. Mostly *BTC move too small* = calm market, nothing to do. Many *price out of range* = the market had already priced the move (above MAX_PRICE). Many *edge below min* = signals were close; MIN_EDGE decides them. Change a filter only with data on what those windows would have done.
 
 ### Near Misses: Would-Have-Won Rate (Pie)
 - **What**: Doughnut chart of near misses that would have won vs lost (pending ones left out).
@@ -113,11 +123,11 @@ How to read each metric and chart to decide which filter settings produce the be
 - **What**: The last 30 near misses: model probability, BTC move, time left, the price the bot saw, the price it would have paid (the book price it checked; "~" means it didn't get that far, so this is the price it saw), Polymarket's result and the P&L if taken on the stake it had sized.
 
 ### Recent Trades Table
-- **What**: Last 20 trades with time, version, side, entry price, edge %, cost, shares, result, profit, and return %.
+- **What**: Last 20 trades with time, version, side, BTC move, entry price, cost (including the fee), the fee itself (blank when not measured), shares, result, profit, return % and the portfolio after the trade.
 - **Why it matters**: Quick scan for patterns. Look at the Edge % column alongside Result — do all your losses have low edge? That confirms the min_edge filter thesis. Also useful for spotting entry price patterns (are you buying too expensive on losses?).
 
 ### Sessions Table
-- **What**: One row per bot run from `sessions.csv` (written when the bot stops, so a running session isn't there yet): length, balance at start and end, real P&L (from the wallet), tracked P&L (the bot's own sum of trades), the drift between them, trades and win rate. Not affected by the version filter.
+- **What**: One row per bot run from `sessions.csv` (written when the bot stops, so a running session isn't there yet): length, balance at start and end, real P&L (from the wallet), tracked P&L (the bot's own sum of trades), the drift between them, fees, trades and win rate. Not affected by the version filter.
 - **Why it matters**: Drift should be within a few cents. A drift of $0.50 or more (shown red) means the bot's bookkeeping and the wallet disagree: compare that session's trades against Polymarket's history.
 
 ## Refreshing

@@ -56,6 +56,13 @@ BALANCE_CHECK_TRIES = 3         # token-balance reads after an uncertain buy
 UNKNOWN_FILL = "UNKNOWN_FILL"   # error prefix: couldn't tell whether a buy filled
 
 
+def _rejection_reason(code) -> str:
+    """Reason code for an order Polymarket refused with a known code: its code
+    when it's a short slug (e.g. "rejected_not_enough_balance"), else "rejected"."""
+    c = str(code or "").strip().lower()
+    return f"rejected_{c}" if c.replace("_", "").isalnum() and len(c) <= 30 else "rejected"
+
+
 def _optional_approval_targets() -> set:
     """Contracts whose approvals the bot doesn't need: Polymarket's perpetuals
     deposit contract and its auto-redeem operator (the bot redeems winnings
@@ -85,6 +92,10 @@ class OrderResult:
     error: str = ""
     dry_run: bool = True
     cost_estimated: bool = False   # fill not reported by the order response: cost guessed
+    # Why a buy didn't fill, as a short code for signals.csv: "no_fill",
+    # "price_cap", "too_small", "no_price", "not_initialized", "rejected" /
+    # "rejected_<code>", "api_error", "unknown_fill"
+    reason: str = ""
 
 
 def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
@@ -282,23 +293,23 @@ class Executor:
         amount_usd = round(float(amount_usd), 2)
         tok = token_id[:16] + "..."
         if amount_usd < MIN_AMOUNT_USD:
-            return OrderResult(success=False, status=REJECTED, side="BUY",
+            return OrderResult(success=False, status=REJECTED, side="BUY", reason="too_small",
                                error=f"Amount ${amount_usd:.2f} below min")
         cap = MAX_BUY_PRICE if max_price <= 0 else min(max_price, MAX_BUY_PRICE)
 
         if self.dry_run:
             if price <= 0:
                 return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok,
-                                   error="No market price for paper fill")
+                                   reason="no_price", error="No market price for paper fill")
             market_price = round(price, 2)
             if market_price > round(cap, 2):
                 return OrderResult(success=False, status=REJECTED, side="BUY", token_id=tok,
-                                   price=market_price,
+                                   price=market_price, reason="price_cap",
                                    error=f"Price ${market_price:.2f} above cap ${cap:.2f}")
             shares, spend = calculate_order_size(market_price, amount_usd)
             if shares < 1 or spend < POLY_MIN_NOTIONAL:
                 return OrderResult(success=False, status=REJECTED, side="BUY", token_id=tok,
-                                   price=market_price,
+                                   price=market_price, reason="too_small",
                                    error=f"Can't size an order ≥ ${POLY_MIN_NOTIONAL:.0f} "
                                          f"from ${amount_usd:.2f} at ${market_price:.2f}")
             print(f"  📊 Market price: ${market_price:.3f}/share → {int(shares)} shares for ${spend:.2f}")
@@ -307,9 +318,11 @@ class Executor:
                                token_id=tok, dry_run=True)
 
         if not self._initialized:
-            return OrderResult(success=False, status=FAILED, side="BUY", error="Not initialized")
+            return OrderResult(success=False, status=FAILED, side="BUY", reason="not_initialized",
+                               error="Not initialized")
         if amount_usd < POLY_MIN_NOTIONAL:
             return OrderResult(success=False, status=REJECTED, side="BUY", token_id=tok,
+                               reason="too_small",
                                error=f"Amount ${amount_usd:.2f} < ${POLY_MIN_NOTIONAL:.0f} min")
         cap = round(cap, 2)
         # Cost estimate for fills the response doesn't report: the book price
@@ -323,9 +336,11 @@ class Executor:
             )
         except pm_errors.UserInputError as e:      # refused locally: nothing was sent
             return OrderResult(success=False, status=REJECTED, side="BUY", token_id=tok,
+                               reason="rejected",
                                error=f"order not placed: {type(e).__name__}: {e}")
         except pm_errors.RequestRejectedError as e:  # refused by the server
             return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok,
+                               reason="api_error",
                                error=f"order not placed: {type(e).__name__}: {e}")
         except Exception as e:
             return self._after_uncertain_buy(token_id, est, e)
@@ -333,8 +348,10 @@ class Executor:
         if not resp.ok:
             # A rejection with a known reason (no fill, not enough balance,
             # market not ready...) isn't an API outage; only "unknown" counts.
-            return OrderResult(success=False, status=FAILED if resp.code == "unknown" else REJECTED,
-                               side="BUY", token_id=tok, error=f"{resp.code}: {resp.message}")
+            unknown = resp.code == "unknown"
+            return OrderResult(success=False, status=FAILED if unknown else REJECTED,
+                               side="BUY", token_id=tok, error=f"{resp.code}: {resp.message}",
+                               reason="api_error" if unknown else _rejection_reason(resp.code))
 
         spent, shares = float(resp.making_amount), float(resp.taking_amount)
         estimated = False
@@ -345,7 +362,8 @@ class Executor:
             spent, shares = shares, spent
         if shares < MIN_SHARES:
             return OrderResult(success=False, status=REJECTED, order_id=resp.order_id,
-                               side="BUY", token_id=tok, error="FAK order filled nothing")
+                               side="BUY", token_id=tok, reason="no_fill",
+                               error="FAK order filled nothing")
         return OrderResult(success=True, order_id=resp.order_id, status=FILLED, side="BUY",
                            price=spent / shares, amount_usd=spent, shares=shares,
                            token_id=tok, dry_run=False, cost_estimated=estimated)
@@ -389,6 +407,7 @@ class Executor:
                 break
         if held is None:
             return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok, price=est,
+                               reason="unknown_fill",
                                error=f"{UNKNOWN_FILL}: can't tell whether the order filled "
                                      f"({type(err).__name__}: {err})")
         if held >= MIN_SHARES:
@@ -399,7 +418,7 @@ class Executor:
                                dry_run=False, error=f"filled despite error: {err}",
                                cost_estimated=True)
         return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok,
-                           error=f"network: {type(err).__name__}: {err}")
+                           reason="api_error", error=f"network: {type(err).__name__}: {err}")
 
     def redeem(self, condition_id: str) -> Optional[str]:
         """Submit redemption of a resolved market's winning shares. A market is

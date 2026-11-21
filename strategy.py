@@ -212,6 +212,72 @@ def estimate_true_probability(
     return min(max(prob, 0.01), 0.99)
 
 
+# evaluate()'s checks, in the order it applies them
+ENTRY_CHECKS = ("delta_too_small", "price_out_of_range", "prob_below_min", "edge_below_min")
+
+
+@dataclass
+class EntryCheck:
+    """What evaluate() looked at for one moment, and the first check it failed."""
+    reason: str                 # one of ENTRY_CHECKS, "no_open_price", or "" (it would signal)
+    side: str = ""
+    btc_delta_pct: float = 0.0
+    market_price: float = 0.0
+    prob: float = 0.0
+    edge: float = 0.0
+
+    @property
+    def rank(self) -> tuple:
+        """How close this moment came to a signal: checks passed, then the
+        model probability. Higher is closer."""
+        if not self.reason:
+            passed = len(ENTRY_CHECKS)
+        elif self.reason in ENTRY_CHECKS:
+            passed = ENTRY_CHECKS.index(self.reason)
+        else:
+            passed = -1
+        return (passed, self.prob)
+
+
+def explain_entry(
+    btc_price: float,
+    opening_price: float,
+    up_market_price: float,
+    down_market_price: float,
+    seconds_remaining: float,
+    config: "StrategyConfig" = None,
+    realized_vol: float = None,
+) -> EntryCheck:
+    """Why evaluate() would or wouldn't signal right now, with the numbers it
+    used, for signal logging. Same checks in the same order as evaluate()
+    (a test keeps the two in step), except the entry-window timing check,
+    which is the caller's. reason "" means evaluate() would signal. The
+    probability and edge are filled in even when an earlier check fails.
+    """
+    if config is None:
+        config = StrategyConfig()
+    if opening_price <= 0:
+        return EntryCheck(reason="no_open_price")
+    btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
+    side = "UP" if btc_delta_pct > 0 else "DOWN"
+    market_price = up_market_price if btc_delta_pct > 0 else down_market_price
+    vol = realized_vol if realized_vol is not None else 0.12
+    prob = estimate_true_probability(btc_delta_pct, seconds_remaining, vol=vol)
+    edge = prob - market_price
+    if abs(btc_delta_pct) < config.min_btc_delta:
+        reason = "delta_too_small"
+    elif market_price > config.max_price or market_price < config.min_price:
+        reason = "price_out_of_range"
+    elif prob < config.min_prob:
+        reason = "prob_below_min"
+    elif edge < config.min_edge:
+        reason = "edge_below_min"
+    else:
+        reason = ""
+    return EntryCheck(reason=reason, side=side, btc_delta_pct=btc_delta_pct,
+                      market_price=market_price, prob=prob, edge=edge)
+
+
 def get_skip_reason(
     btc_price: float,
     opening_price: float,
@@ -221,32 +287,11 @@ def get_skip_reason(
     config: "StrategyConfig" = None,
     realized_vol: float = None,
 ) -> str:
-    """Return why evaluate() returned None, for signal logging.
-
-    Returns one of: "delta_too_small", "prob_below_min", "edge_below_min",
-    "price_out_of_range", or "" (no skip reason — should have traded).
-    "edge_gone_at_market" is set by the caller in bot.py after the live
-    price re-check.
-    """
-    if config is None:
-        config = StrategyConfig()
-    if opening_price <= 0:
-        return ""
-    btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
-    if abs(btc_delta_pct) < config.min_btc_delta:
-        return "delta_too_small"
-    side = "UP" if btc_delta_pct > 0 else "DOWN"
-    market_price = up_market_price if btc_delta_pct > 0 else down_market_price
-    if market_price > config.max_price or market_price < config.min_price:
-        return "price_out_of_range"
-    vol = realized_vol if realized_vol is not None else 0.12
-    true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining, vol=vol)
-    if true_prob < config.min_prob:
-        return "prob_below_min"
-    edge = true_prob - market_price
-    if edge < config.min_edge:
-        return "edge_below_min"
-    return ""
+    """explain_entry()'s reason alone ("" if it would signal; also "" without
+    an opening price, as before)."""
+    reason = explain_entry(btc_price, opening_price, up_market_price, down_market_price,
+                           seconds_remaining, config, realized_vol).reason
+    return "" if reason == "no_open_price" else reason
 
 
 def evaluate(
