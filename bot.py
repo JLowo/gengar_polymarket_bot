@@ -38,11 +38,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 from market import (get_current_market, current_window_ts, get_market_outcome,
                     get_book_price, PERIOD_SECONDS)
 from price_feed import BinancePriceFeed
-from strategy import evaluate, estimate_true_probability, get_skip_reason, StrategyConfig, TradingStats
+from strategy import evaluate, estimate_true_probability, explain_entry, StrategyConfig, TradingStats
 from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE, MIN_SHARES, UNKNOWN_FILL
 from polymarket.auth import BuilderApiKey
 from telegram_notifier import TelegramNotifier
 from tracker import Tracker
+from session_log import start_session_log
 
 
 BOT_VERSION = "2026.11.21"  # bump when trading logic changes; the dashboard groups by it
@@ -157,6 +158,7 @@ class PolyBot:
         self._session_cids: set = set()        # markets traded this session
         self._last_pusd: float = 0.0           # pUSD at the last full balance read
         self._fee_watch: dict = {}             # last live buy whose fee isn't measured yet
+        self._session_fees: float = 0.0        # fees measured this session (sessions.csv)
 
         # Exit state
         self._exited: bool = False
@@ -165,7 +167,7 @@ class PolyBot:
         self._residual_shares: float = 0.0  # Shares left after partial fill
         self._last_position_check: float = 0.0
         self._last_status_print: float = 0.0
-        self._last_tick_context: dict = {}   # last entry-window state, for window-end signal logging
+        self._closest_call: dict = {}        # this window's closest call, for window-end signal logging
         self._session_start_time: float = time.time()
         self._recent_window_deltas: list = []  # rolling signed close_delta_pct per window
         self._exit_retries: int = 0
@@ -365,18 +367,10 @@ class PolyBot:
             realized_vol=realized_vol,
         )
 
-        # Store context for window-end no-trade signal logging
-        self._last_tick_context = {
-            "btc_price": btc_price,
-            "up_price": up_price,
-            "down_price": down_price,
-            "seconds_remaining": seconds_remaining,
-            "window_ts": self._current_window,
-            "signal": signal_result,
-        }
-
         if signal_result:
-            self._execute_trade(signal_result, seconds_remaining)
+            self._execute_trade(signal_result, seconds_remaining, vol=realized_vol)
+        else:
+            self._note_closest_call(btc_price, up_price, down_price, seconds_remaining, realized_vol)
 
         if now - self._last_status_print >= 30:
             self._last_status_print = now
@@ -504,33 +498,25 @@ class PolyBot:
             self.stats.hourly.record_window(self._traded)
             if self._traded:
                 self._resolve_previous_trade()
-            elif self._last_tick_context:
-                # Log the no-trade signal for this window using last tick state
-                ctx = self._last_tick_context
-                skip_reason = get_skip_reason(
-                    btc_price=ctx["btc_price"],
-                    opening_price=self._opening_price,
-                    up_market_price=ctx["up_price"],
-                    down_market_price=ctx["down_price"],
-                    seconds_remaining=ctx["seconds_remaining"],
-                    config=self.strategy_config,
-                    realized_vol=self._compute_realized_vol(),
-                )
-                sig = ctx.get("signal")
+            elif self._closest_call and not self._trade_attempted:
+                # No signal all window: log its closest call (an attempt that
+                # didn't buy has already logged its own row)
+                c = self._closest_call
+                e = c["check"]
                 self.tracker.log_signal(
-                    window_ts=ctx["window_ts"],
-                    btc_price=ctx["btc_price"],
-                    opening_price=self._opening_price,
-                    up_price=ctx["up_price"],
-                    down_price=ctx["down_price"],
-                    seconds_remaining=ctx["seconds_remaining"],
-                    side=sig.side if sig else "",
-                    true_prob=sig.true_prob if sig else 0.0,
-                    market_price=sig.market_price if sig else 0.0,
-                    edge=sig.edge if sig else 0.0,
-                    kelly_size=sig.kelly_size if sig else 0.0,
+                    window_ts=c["window_ts"],
+                    btc_price=c["btc_price"],
+                    opening_price=c["opening_price"],
+                    up_price=c["up_price"],
+                    down_price=c["down_price"],
+                    seconds_remaining=c["seconds_remaining"],
+                    side=e.side,
+                    true_prob=e.prob,
+                    market_price=e.market_price,
+                    edge=e.edge,
                     action="no_signal",
-                    skip_reason=skip_reason,
+                    skip_reason=e.reason,
+                    vol=c["vol"],
                 )
 
             # Sync real money at window boundary (catches any drift), and
@@ -555,7 +541,7 @@ class PolyBot:
         self._current_window = window_ts
         self._opening_price = 0.0
         self._partial_window = False
-        self._last_tick_context = {}
+        self._closest_call = {}
         self._trade_id = 0
         self._traded = False
         self._trade_attempted = False
@@ -667,12 +653,67 @@ class PolyBot:
 
     # ── Entry ───────────────────────────────────────────────────────
 
-    def _execute_trade(self, sig, seconds_remaining: float):
+    def _note_closest_call(self, btc_price: float, up_price: float, down_price: float,
+                           seconds_remaining: float, vol: float):
+        """Keep the entry-window moment that came closest to a signal (most of
+        evaluate()'s checks passed, then the highest probability), so a window
+        without a trade is logged with why it didn't trade, not with the last
+        second's state, when the market has already settled."""
+        cfg = self.strategy_config
+        if not (cfg.entry_window_end <= seconds_remaining <= cfg.entry_window_start):
+            return   # evaluate() doesn't look outside the entry window either
+        check = explain_entry(btc_price, self._opening_price, up_price, down_price,
+                              seconds_remaining, cfg, vol)
+        best = self._closest_call.get("check")
+        if best is None or check.rank > best.rank:
+            self._closest_call = {
+                "check": check, "window_ts": self._current_window,
+                "btc_price": btc_price, "opening_price": self._opening_price,
+                "up_price": up_price, "down_price": down_price,
+                "seconds_remaining": seconds_remaining, "vol": vol,
+            }
+
+    def _log_attempt(self, sig, seconds_remaining: float, action: str, reason: str = "",
+                     actual_price: float = 0.0, fill_price: float = 0.0, vol: float = 0.0):
+        """signals.csv row for a trade attempt: "traded", or what stopped it.
+        market_price/edge are what the signal saw; actual_price is the book
+        price the bot checked (0 if it didn't get that far)."""
+        btc_approx = (self._opening_price * (1 + sig.btc_delta_pct / 100)
+                      if self._opening_price > 0 else 0)
+        self.tracker.log_signal(
+            window_ts=self._current_window,
+            btc_price=btc_approx,
+            opening_price=self._opening_price,
+            up_price=self._cached_up,
+            down_price=self._cached_down,
+            seconds_remaining=seconds_remaining,
+            side=sig.side,
+            true_prob=sig.true_prob,
+            market_price=sig.market_price,
+            edge=sig.edge,
+            kelly_size=sig.kelly_size,
+            action=action,
+            skip_reason=reason,
+            actual_price=actual_price,
+            actual_edge=sig.true_prob - actual_price if actual_price > 0 else 0.0,
+            fill_price=fill_price,
+            vol=vol,
+        )
+
+    def _execute_trade(self, sig, seconds_remaining: float, vol: float = 0.0):
+        """Try to buy on a signal: once per window. Every way it can stop is
+        logged to signals.csv with its reason (see _log_attempt)."""
         self._trade_attempted = True
+        vol = vol or self._compute_realized_vol()
+
+        def stopped(action, reason, actual_price=0.0):
+            self._log_attempt(sig, seconds_remaining, action, reason,
+                              actual_price=actual_price, vol=vol)
 
         # ── Circuit breaker: CLOB health check ───────────────────
         if self._clob_halted:
             print(f"  🔌 CLOB HALTED — skipping trade ({self._consecutive_buy_failures} consecutive failures)")
+            stopped("skipped_halted", "clob_halted")
             return
 
         # Live: reading pUSD is an authenticated CLOB call, so it doubles as the
@@ -689,6 +730,7 @@ class PolyBot:
                            f"consecutive health check failures — stopping trades until recovery")
                     print(f"\n  {msg}")
                     self.telegram.status_update({"alert": msg})
+                stopped("skipped_health_check", "health_check_failed")
                 return
 
         # ── Daily loss limit ─────────────────────────────────────
@@ -697,6 +739,7 @@ class PolyBot:
             print(f"  🛑 DAILY LOSS LIMIT — session P&L "
                   f"${self.stats.bankroll - self._session_start_balance:+.2f} "
                   f"exceeds -${self._daily_loss_limit:.0f}")
+            stopped("skipped_loss_limit", "daily_loss_limit")
             return
 
         session_pnl = self.stats.bankroll - self._session_start_balance
@@ -706,11 +749,13 @@ class PolyBot:
                    f"(limit -${self._daily_loss_limit:.0f}) — stopping trades")
             print(f"\n  {msg}")
             self.telegram.status_update({"alert": msg})
+            stopped("skipped_loss_limit", "daily_loss_limit")
             return
 
         market = self._window_market()
         if not market:
             print(f"  ⚠️  {sig.side} signal, but this window's market wasn't found — skipping")
+            stopped("skipped_no_market", "market_not_found")
             return
         token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
         self._trade_condition_id = market.condition_id
@@ -733,24 +778,7 @@ class PolyBot:
 
                 if actual_edge < self.strategy_config.min_edge:
                     print(f"  ⚠️  Edge gone at market price — skipping")
-                    btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-                    self.tracker.log_signal(
-                        window_ts=self._current_window,
-                        btc_price=btc_approx,
-                        opening_price=self._opening_price,
-                        up_price=self._cached_up,
-                        down_price=self._cached_down,
-                        seconds_remaining=seconds_remaining,
-                        side=sig.side,
-                        true_prob=sig.true_prob,
-                        market_price=actual_price,
-                        edge=actual_edge,
-                        kelly_size=sig.kelly_size,
-                        action="skipped_edge_gone",
-                        skip_reason="edge_gone_at_market",
-                        actual_price=actual_price,
-                        actual_edge=actual_edge,
-                    )
+                    stopped("skipped_edge_gone", "edge_gone_at_market", actual_price)
                     return
 
                 hint_price = actual_price
@@ -758,6 +786,7 @@ class PolyBot:
         # Slow API calls above can eat the time left; never order into the close
         if self._current_window + PERIOD_SECONDS[self.period] - time.time() < LATE_ORDER_GUARD:
             print(f"  ⏱  Too close to the window end after slow API calls — skipping")
+            stopped("skipped_too_late", "too_late", hint_price)
             return
 
         # Never pay more than leaves MIN_EDGE (executor also caps at MAX_BUY_PRICE)
@@ -780,24 +809,8 @@ class PolyBot:
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
             self._session_entries.append((result.price, sig.edge, sig.btc_delta_pct))
 
-            btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-            self.tracker.log_signal(
-                window_ts=self._current_window,
-                btc_price=btc_approx,
-                opening_price=self._opening_price,
-                up_price=self._cached_up,
-                down_price=self._cached_down,
-                seconds_remaining=seconds_remaining,
-                side=sig.side,
-                true_prob=sig.true_prob,
-                market_price=sig.market_price,
-                edge=sig.edge,
-                kelly_size=sig.kelly_size,
-                action="traded",
-                actual_price=result.price,
-                actual_edge=sig.true_prob - result.price,
-                fill_price=result.price,
-            )
+            self._log_attempt(sig, seconds_remaining, "traded", actual_price=result.price,
+                              fill_price=result.price, vol=vol)
             self._trade_id = self.tracker.open_trade(
                 window_ts=self._current_window,
                 side=sig.side,
@@ -811,6 +824,7 @@ class PolyBot:
                 entry_delta_pct=sig.btc_delta_pct,
                 entry_seconds_remaining=seconds_remaining,
                 version=BOT_VERSION,
+                vol=vol,
             )
             if pusd_before is not None and not result.cost_estimated:
                 self._fee_watch = {"trade_id": self._trade_id, "before": pusd_before,
@@ -828,12 +842,15 @@ class PolyBot:
             )
         else:
             print(f"  ❌ Buy failed: {result.error}")
+            stopped("buy_failed", result.reason or ("api_error" if result.status == FAILED
+                                                    else "rejected"), hint_price)
             if result.error.startswith(UNKNOWN_FILL):
                 self._unknown_fill = {
                     "token_id": token_id, "side": sig.side, "price": result.price,
                     "edge": sig.edge, "prob": sig.true_prob, "delta": sig.btc_delta_pct,
                     "seconds_remaining": seconds_remaining,
                     "condition_id": self._trade_condition_id,
+                    "sig": sig, "vol": vol,
                 }
                 self.telegram.error_alert(
                     f"Couldn't tell whether a {sig.side} buy filled; rechecking at the window end")
@@ -987,11 +1004,16 @@ class PolyBot:
         self._session_cids.add(uf["condition_id"])
         self.stats.hourly.record_trade(uf["edge"], uf["delta"])
         self._session_entries.append((uf["price"], uf["edge"], uf["delta"]))
+        if uf.get("sig") is not None:
+            # The window's buy_failed row is followed by this one, so it counts as traded
+            self._log_attempt(uf["sig"], uf["seconds_remaining"], "traded",
+                              actual_price=uf["price"], fill_price=uf["price"],
+                              vol=uf.get("vol", 0.0))
         self._trade_id = self.tracker.open_trade(
             window_ts=self._current_window, side=uf["side"], entry_price=uf["price"],
             entry_shares=held, entry_cost=cost, edge=uf["edge"], prob=uf["prob"],
             btc_delta=uf["delta"], seconds_remaining=uf["seconds_remaining"],
-            version=BOT_VERSION,
+            version=BOT_VERSION, vol=uf.get("vol", 0.0),
         )
 
     def _check_fee(self, force: bool = False, pusd: float = None):
@@ -1035,6 +1057,7 @@ class PolyBot:
         elif self._traded and self._trade_id == trade_id:
             self._trade_cost += fee
         self.stats.bankroll -= fee
+        self._session_fees += fee
         self.tracker.add_fee(trade_id, fee)
         print(f"  💸 Polymarket fee ${fee:.3f} on the ${spent:.2f} buy "
               f"(measured from pUSD): cost ${spent + fee:.2f}")
@@ -1203,7 +1226,8 @@ class PolyBot:
         print(f"  FINAL: {o['total_trades']} trades | "
               f"{o['wins']}W/{o['losses']}L | "
               f"WR: {o['win_rate']:.1f}%")
-        print(f"  Tracked P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
+        print(f"  Tracked P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}"
+              f"{f' | Fees: ${self._session_fees:.2f}' if self._session_fees else ''}")
         print(f"  💰 {'Real' if synced else 'Estimated'} P&L: ${real_pnl:+.2f} "
               f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})"
               f"{'' if synced else ' — final balances unreadable, so from the bot tracking'}")
@@ -1235,6 +1259,7 @@ class PolyBot:
             avg_entry_price=self._session_avg(0),
             avg_edge=self._session_avg(1),
             avg_delta=self._session_avg(2, absolute=True),
+            fees=self._session_fees,
         )
 
         time.sleep(1)
@@ -1242,5 +1267,9 @@ class PolyBot:
 
 
 if __name__ == "__main__":
+    # Copy everything printed (and errors) to logs/bot_<date>_<time>.log first,
+    # so the whole run is in the file, from the config messages on
+    load_dotenv()
+    start_session_log(os.getenv("LOG_DIR", "logs"))
     bot = PolyBot()
     bot.start()
