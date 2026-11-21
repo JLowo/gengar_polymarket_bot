@@ -25,6 +25,7 @@ Standard sections: **Strategy** (parameter/model/filter changes), **Bug fixes** 
 - **Auto-refresh** every 30s (can be switched off), redrawing only when the logs change and keeping the filter and open trade detail. New `/api/sessions` route.
 - Trade detail title showed the BTC open price instead of the entry price.
 - Labels for the new attempt reasons; **Quiet Windows: Closest Call** chart; **Fees** card and fee columns in Recent Trades and Sessions. Numbered schema archives are read too.
+- A trade without a result (bot stopped with it open, or no resolution in time) counted as a loss in the stats and charts; it's now left out of them and shown as "NO RESULT" in Recent Trades.
 
 ---
 

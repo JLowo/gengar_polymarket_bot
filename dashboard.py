@@ -493,7 +493,11 @@ function setFilter(version) {
   renderAll(trades, skipped);
 }
 
-function renderStats(trades, skipped) {
+// A trade row without a result (the bot stopped with it open, or Polymarket
+// hadn't resolved it in time) has no profit yet
+const hasResult = t => t.won_resolution === 'True' || t.won_resolution === 'False';
+
+function renderStats(trades, skipped, noResult = 0) {
   const bar = document.getElementById('stats-bar');
   const totalTrades = trades.length;
   const wins = trades.filter(t => t.won_resolution === 'True').length;
@@ -540,7 +544,7 @@ function renderStats(trades, skipped) {
   const roi = totalDeployed > 0 ? (pnl / totalDeployed * 100) : 0;
 
   bar.innerHTML = `
-    <div class="stat-card"><div class="label">Total Trades</div><div class="value">${totalTrades}</div><div class="sub">${wins}W / ${losses}L</div></div>
+    <div class="stat-card"><div class="label">Total Trades</div><div class="value">${totalTrades}</div><div class="sub">${wins}W / ${losses}L${noResult ? ` · ${noResult} without a result` : ''}</div></div>
     <div class="stat-card"><div class="label">Win Rate</div><div class="value ${wr >= 70 ? 'green' : wr >= 50 ? 'gold' : 'red'}">${wr.toFixed(0)}%</div><div class="sub">~70% breakeven</div></div>
     <div class="stat-card"><div class="label">Total P&L</div><div class="value ${pnl >= 0 ? 'green' : 'red'}">$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</div></div>
     <div class="stat-card"><div class="label">Profit Factor</div><div class="value ${pf >= 1.5 ? 'green' : pf >= 1 ? 'gold' : 'red'}">${pf === Infinity ? '∞' : pf.toFixed(2)}</div><div class="sub">${pf >= 2 ? 'Strong' : pf >= 1.5 ? 'Good' : pf >= 1 ? 'Marginal' : 'Negative'}</div></div>
@@ -904,10 +908,12 @@ function renderTradesTable(trades) {
       <td>$${parseFloat(t.entry_cost).toFixed(2)}</td>
       <td class="muted">${t.fee !== undefined && t.fee !== '' ? '$' + parseFloat(t.fee).toFixed(3) : ''}</td>
       <td>${parseFloat(t.entry_shares).toFixed(0)}</td>
+${hasResult(t) ? `
       <td class="${won ? 'won' : 'lost'}">${won ? 'WIN' : 'LOSS'}</td>
       <td class="${profit >= 0 ? 'won' : 'lost'}">$${profit >= 0 ? '+' : ''}${profit.toFixed(2)}</td>
       <td class="${ret >= 0 ? 'won' : 'lost'}">${ret >= 0 ? '+' : ''}${ret.toFixed(0)}%</td>
-      <td class="${portTotal >= startBankroll ? 'won' : 'lost'}" style="font-weight:600">$${portTotal.toFixed(2)}</td>
+      <td class="${portTotal >= startBankroll ? 'won' : 'lost'}" style="font-weight:600">$${portTotal.toFixed(2)}</td>` : `
+      <td class="muted" title="${esc(t.resolution_method || '')}">NO RESULT</td><td></td><td></td><td></td>`}
     </tr>`;
   });
   html += '</tbody></table>';
@@ -1022,12 +1028,14 @@ function showTradeDetail(row, scroll = true) {
 }
 
 function renderAll(trades, skipped) {
-  renderStats(trades, skipped);
-  renderEquityCurve(trades);
-  renderWinRate(trades);
-  renderPnL(trades);
-  renderWaterfall(trades);
-  renderEdge(trades);
+  // Stats and charts count only trades with a result; the table shows all
+  const booked = trades.filter(hasResult);
+  renderStats(booked, skipped, trades.length - booked.length);
+  renderEquityCurve(booked);
+  renderWinRate(booked);
+  renderPnL(booked);
+  renderWaterfall(booked);
+  renderEdge(booked);
   renderSkippedBar(skipped);
   renderSkippedPie(skipped);
   renderClosestCalls(skipped);
