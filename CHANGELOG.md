@@ -4,6 +4,22 @@ Standard sections: **Strategy** (parameter/model/filter changes), **Bug fixes** 
 
 ---
 
+## 2026.11.21 — Fixes from the first live session
+
+### Bug fixes
+- **Auto-redeemed wins counted twice**: the live bankroll now values every tracked position at the shares the Safe still holds, so a win counts once however it is redeemed. Buys no longer move the bankroll (positions are carried at their fill price); results move it by payout − cost.
+- **A failed positions lookup counted as $0**: it is now an unknown. That window's bankroll sync and redemptions are skipped, and start-up won't go live without it.
+- **Fees not recorded**: Polymarket's trading fee is measured from the pUSD change after each fill and included in the trade's cost and profit.
+- **Ctrl+C stopped Tor first**, so the final order cancel and balance read failed and the session summary was wrong. Tor now runs in its own process group and stops when the bot exits. Its log pipe is also drained, so it can't fill up and stall Tor.
+- **Window header** showed only booked results ("Trades: 0" with a trade waiting); it now shows fills, waiting results and the bankroll.
+- The hourly summary no longer resets the bankroll to pUSD alone.
+
+### Strategy
+- **Early results**: a finished window's decisive final price (≥ 0.95) values the waiting trade before Polymarket resolves it, so the daily loss limit reacts straight away. Booking still waits for the resolution.
+- The pre-trade CLOB check is now a pUSD read; no order is sent with under 5s of the window left.
+
+---
+
 ## 2026.11.19 — Bug-review fixes + v16 port
 
 ### Bug fixes

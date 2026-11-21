@@ -47,7 +47,7 @@ No stops. All trades hold to resolution. Data from 15 trades showed that probabi
 
 ### Circuit breaker — CLOB health check
 
-Before every trade, the bot checks that Polymarket's CLOB API answers. If it isn't responding:
+Before every live trade, the bot reads its pUSD balance from Polymarket's CLOB API (an authenticated call, so it shows the API is answering; the same reading is used to measure the trade's fee). If that fails:
 - Skip the trade immediately
 - Increment failure counter
 - After 3 consecutive failures, halt all trading and send a Telegram alert
@@ -65,7 +65,9 @@ Configurable via `DAILY_LOSS_LIMIT` in `.env` (default: $30). Compares session P
 - **Fill-and-kill buys**: each buy fills immediately at or below the highest price that still leaves `MIN_EDGE` (never above $0.90); anything unfilled is cancelled, so nothing rests on the book. The order response says what filled. If a request fails after possibly reaching the exchange, the bot checks its token balance once to find out.
 - **Results from Polymarket**: every trade is booked from the market's own resolution, not from Binance prices or balance changes.
 - **Winnings**: redeemed automatically when a builder API key is set (`preflight.py --create-builder-key`); otherwise claim them in the Polymarket UI.
-- **Window sync**: at every window boundary the bankroll is set to the real pUSD balance plus redeemable winnings plus stakes awaiting a result. Drift > $0.50 is logged.
+- **Fees**: Polymarket's trading fee (about 1–2% of a buy) isn't in the order response, so the bot measures it from the pUSD change after each fill and adds it to the trade's cost and profit in `trades.csv`.
+- **Early results**: a minute or so after a window closes, its market price usually shows the winner (e.g. 0.995) before Polymarket resolves it. The bot then values the trade at that price, so the bankroll and daily loss limit see a likely loss straight away, and prints "Likely WIN/LOSS". Results are still booked only from the resolution.
+- **Window sync**: at every window boundary the bankroll is set to real money: pUSD, plus each position the bot tracks at the shares the Safe still holds (so a win counts once, whether the bot or Polymarket's auto-redeem redeems it), plus other redeemable winnings. Drift > $0.50 is logged. If any of it can't be read (the positions lookup is sometimes rate-limited through Tor), that window's sync is skipped rather than counting $0.
 
 ## Quick start
 

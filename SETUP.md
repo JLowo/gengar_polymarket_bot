@@ -104,7 +104,7 @@ Since Polymarket's CLOB V2 upgrade (28 April 2026), trading uses **pUSD** (Polym
 3. If the UI asks you to enable trading, do it: that sets the V2 approvals the bot needs
 4. Recommended starting balance: **$50–$100**
 
-> **Note:** In live mode the bot uses your real pUSD balance (plus redeemable winnings and stakes awaiting a result) as its bankroll; `BANKROLL` in `.env` only matters for dry run.
+> **Note:** In live mode the bot uses your real money as its bankroll: pUSD plus the shares it holds and any redeemable winnings. `BANKROLL` in `.env` only matters for dry run.
 
 ---
 
@@ -282,7 +282,7 @@ The bot has several automatic safeguards:
 
 **Daily loss limit** — If your session P&L drops below `-DAILY_LOSS_LIMIT`, the bot halts and sends a Telegram alert. You must restart it manually to resume.
 
-**CLOB health check** — Before every trade, the bot checks that Polymarket's CLOB answers. Three consecutive failures → trading halts automatically. It auto-recovers when the API comes back.
+**CLOB health check** — Before every trade, the bot reads its pUSD balance from Polymarket's CLOB, which shows the API answers (and gives the figure the trade's fee is measured from). Three consecutive failures → trading halts automatically. It auto-recovers when the API comes back.
 
 **Safe-only trading** — Live trading only starts if the SDK recognises `SAFE_ADDRESS` as this key's Polymarket Safe and the V2 trading approvals are in place.
 
@@ -290,7 +290,9 @@ The bot has several automatic safeguards:
 
 **Results from Polymarket** — Each trade is booked from the market's own resolution (not from Binance prices or balance changes). Winnings are redeemed automatically if a builder API key is set.
 
-**Window-boundary balance sync** — Every 5 minutes, the bot sets its bankroll to your real pUSD balance plus redeemable winnings plus stakes awaiting a result. This corrects any accumulated drift.
+**Window-boundary balance sync** — Every 5 minutes, the bot sets its bankroll to your real money: pUSD, plus the shares it holds valued at their last known price or payout, plus other redeemable winnings. This corrects any accumulated drift. A window where something can't be read skips the sync.
+
+**Fees and early results** — Polymarket's trading fee is measured from the pUSD change after each buy and included in `trades.csv`. A finished window's final market price (e.g. 0.995) is used as the likely result until Polymarket resolves it, so the daily loss limit reacts straight away.
 
 ---
 
@@ -311,6 +313,9 @@ This is the float precision bug. Make sure you're on the latest `bot.py` — the
 - The CLOB API may be blocking your Tor exit node — restart the bot to get a new circuit
 - Check `https://status.polymarket.com` for outages
 - Verify your pUSD balance is sufficient (minimum $5 per order); `preflight.py` shows it
+
+### "Couldn't read your pUSD balance or Polymarket positions" at start-up
+The positions lookup (Polymarket's Data API) is sometimes rate-limited through Tor. The bot won't go live without it, because starting from an understated balance would loosen the daily loss limit. Wait a minute and run `./start.sh` again; it starts Tor with a fresh circuit.
 
 ### No trades firing in dry-run
 This is normal if BTC isn't moving significantly. The model requires an 80% probability signal, which only fires on genuine moves (0.10%+ within a 5-minute window). You may watch several empty windows before seeing a signal.

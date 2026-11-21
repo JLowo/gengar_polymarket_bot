@@ -133,8 +133,11 @@ def main():
 
         ex._initialized = True
         winnings = ex.redeemable_winnings()
-        total = sum(v for _, v in winnings)
-        print(f"  {NOTE} Redeemable winnings: ${total:.2f} in {len(winnings)} market(s)")
+        if check(winnings is not None, "Polymarket positions can be read",
+                 "Couldn't read your positions (Data API, often rate-limited through Tor): "
+                 "the bot needs them at start-up, so try again in a minute"):
+            total = sum(v for _, v in winnings)
+            print(f"  {NOTE} Redeemable winnings: ${total:.2f} in {len(winnings)} market(s)")
 
         # 4. Redeeming --------------------------------------------------------
         print("\nRedeeming winnings")
