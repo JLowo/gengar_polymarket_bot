@@ -7,6 +7,7 @@ Usage:
 """
 
 import csv
+import glob
 import json
 import os
 import sys
@@ -46,9 +47,11 @@ def get_all_trades():
     for row in load_csv(os.path.join(LOG_DIR, "trades_v14.csv")):
         row["version"] = "v14"
         trades.append(row)
-    # v15+ (includes schema migration archive if it exists)
-    for f in ["trades_pre_schema_change.csv", "trades.csv"]:
-        for row in load_csv(os.path.join(LOG_DIR, f)):
+    # v15+: archives from schema changes (numbered when there's more than one),
+    # then trades.csv
+    archives = sorted(glob.glob(os.path.join(LOG_DIR, "trades_pre_schema_change*.csv")))
+    for path in archives + [os.path.join(LOG_DIR, "trades.csv")]:
+        for row in load_csv(path):
             v = row.get("version", "15")
             row["version"] = f"v{v}" if not str(v).startswith("v") else v
             trades.append(row)
@@ -122,10 +125,13 @@ def get_skipped():
       moved too far) or "attempt_unlogged" (the attempt failed without
       logging why). Each gets Polymarket's result and what the buy would have
       made at the price the bot would have paid (the book price it checked,
-      else the price it saw), before fees.
-    - kind "quiet": no signal all window. The bot logs these at the window's
-      last second, when the market has already settled, so their logged skip
-      reason says nothing about the entry window and isn't used.
+      else the price it saw), before fees. Rows logged since the vol column
+      was added say what stopped every attempt (e.g. "no_fill",
+      "daily_loss_limit").
+    - kind "quiet": no signal all window. Rows with a vol are the window's
+      closest call, and their reason is the check it failed. Older rows were
+      logged at the window's last second, when the market had already
+      settled, so their logged reason isn't used ("no_signal").
 
     A legacy skipped.csv (older versions, with would_have_won) is used as is.
     """
@@ -147,11 +153,15 @@ def get_skipped():
         if specific:
             r = specific[0]
             picks.append(("near_miss", r, r.get("skip_reason") or r.get("action") or "unknown"))
+        elif rows[-1].get("vol"):
+            # Since the vol column: the window's closest call, with the check it failed
+            picks.append(("quiet", rows[-1], rows[-1].get("skip_reason") or "no_signal"))
         elif rows[-1].get("side"):
-            # The end-of-window row carries a signal only if the bot acted on
-            # it (after an attempt the window isn't evaluated again)
+            # Older rows: the end-of-window row carries a signal only if the bot
+            # acted on it (after an attempt the window isn't evaluated again)
             picks.append(("near_miss", rows[-1], "attempt_unlogged"))
         else:
+            # Older rows: logged at the window's last second, reason not meaningful
             picks.append(("quiet", rows[-1], "no_signal"))
 
     outcomes = window_outcomes([r.get("window_ts") for kind, r, _ in picks if kind == "near_miss"])
@@ -329,6 +339,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="chart-box full"><h3>Edge: Seen vs At Fill <span class="note" id="edge-note"></span></h3><canvas id="edgeChart"></canvas></div>
   <div class="chart-box"><h3>Near Misses by Reason</h3><canvas id="skippedBarChart"></canvas><div class="empty" id="skipped-bar-empty"></div></div>
   <div class="chart-box"><h3>Near Misses: Would-Have-Won Rate</h3><canvas id="skippedPieChart"></canvas><div class="empty" id="skipped-pie-empty"></div></div>
+  <div class="chart-box full"><h3>Quiet Windows: Closest Call <span class="note">(the check that stopped each quiet window's closest moment to a signal)</span></h3><canvas id="closestChart" style="max-height:220px"></canvas><div class="empty" id="closest-empty"></div></div>
   <div class="chart-box full"><h3>Near Misses <span class="note">(signals the bot tried but didn't buy, with Polymarket's result; P&L at the price it would have paid, before fees)</span></h3><div class="table-wrap" id="near-miss-table"></div></div>
   <div class="chart-box full"><h3>Recent Trades <span class="note">(click a row to see hold trajectory)</span></h3><div class="table-wrap" id="trades-table"></div><div id="trade-detail"><h4 id="detail-title"></h4><div class="detail-sub" id="detail-sub"></div><div class="detail-grid" id="detail-charts"></div></div></div>
   <div class="chart-box full"><h3>Sessions <span class="note">(all versions; a session appears when the bot stops)</span></h3><div class="table-wrap" id="sessions-table"></div></div>
@@ -383,10 +394,34 @@ const nearMisses = skipped => skipped.filter(s => s.kind !== 'quiet');
 const quietWindows = skipped => skipped.filter(s => s.kind === 'quiet');
 
 const REASON_LABELS = {
+  // attempts that didn't buy
   edge_gone_at_market: 'price moved too far',
   attempt_unlogged: 'attempt failed (no reason logged)',
+  clob_halted: 'trading halted (API failures)',
+  health_check_failed: 'balance check failed',
+  daily_loss_limit: 'daily loss limit',
+  market_not_found: 'market not found',
+  too_late: 'too close to window end',
+  no_fill: "order didn't fill",
+  price_cap: 'price above cap',
+  too_small: 'order too small',
+  no_price: 'no price',
+  not_initialized: 'not connected',
+  rejected: 'order rejected',
+  api_error: 'API error',
+  unknown_fill: 'fill unknown',
+  // closest call of a quiet window
+  delta_too_small: 'BTC move too small',
+  price_out_of_range: 'price out of range',
+  prob_below_min: 'probability below min',
+  edge_below_min: 'edge below min',
+  no_signal: 'not logged (older rows)',
 };
-const reasonLabel = r => REASON_LABELS[r] || String(r || 'unknown').replace(/_/g, ' ');
+const reasonLabel = r => REASON_LABELS[r]
+  || (String(r).startsWith('rejected_') ? `order rejected (${String(r).slice(9).replace(/_/g, ' ')})` : '')
+  || String(r || 'unknown').replace(/_/g, ' ');
+// Closest-call reasons, in the order evaluate() checks them
+const CLOSEST_CALL_ORDER = ['delta_too_small', 'price_out_of_range', 'prob_below_min', 'edge_below_min'];
 
 function groupByVersion(trades) {
   const groups = {};
@@ -473,6 +508,9 @@ function renderStats(trades, skipped) {
   const missedPnl = priced.reduce((s, m) => s + m.pnl_if_taken, 0);
   const missSub = skippedKnown ? `${skippedWon} of ${skippedKnown} would have won` : misses.length ? 'results pending' : 'none';
   const missPnlSub = priced.length ? `<div class="sub ${missedPnl >= 0 ? 'won' : 'lost'}">${money(missedPnl)} if taken</div>` : '';
+  // Fees: measured since the fee column was added (already in entry_cost and profit)
+  const feeTrades = trades.filter(t => t.fee !== undefined && t.fee !== '');
+  const fees = feeTrades.reduce((s, t) => s + parseFloat(t.fee || 0), 0);
 
   // Profit factor = gross wins / gross losses
   const grossWins = trades.filter(t => parseFloat(t.profit || 0) > 0).reduce((s, t) => s + parseFloat(t.profit), 0);
@@ -512,6 +550,9 @@ function renderStats(trades, skipped) {
     <div class="stat-card"><div class="label">ROI</div><div class="value ${roi >= 0 ? 'green' : 'red'}">${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%</div><div class="sub">on $${totalDeployed.toFixed(0)} deployed</div></div>
     <div class="stat-card"><div class="label">Near Misses</div><div class="value">${misses.length}</div><div class="sub">${missSub}</div>${missPnlSub}</div>
     <div class="stat-card"><div class="label">Quiet Windows</div><div class="value">${quiet}</div><div class="sub">no signal all window</div></div>
+    <div class="stat-card"><div class="label">Fees</div><div class="value">$${fees.toFixed(2)}</div><div class="sub">${feeTrades.length
+      ? `${feeTrades.length} of ${totalTrades} trades measured${grossWins > 0 ? ` · ${(fees / grossWins * 100).toFixed(0)}% of gross wins` : ''}`
+      : 'not logged for these trades'}</div></div>
   `;
 }
 
@@ -743,6 +784,32 @@ function renderEdge(trades) {
   });
 }
 
+function renderClosestCalls(skipped) {
+  const quiet = quietWindows(skipped);
+  const known = quiet.filter(q => CLOSEST_CALL_ORDER.includes(q.reason));
+  const older = quiet.length - known.length;
+  const canvas = document.getElementById('closestChart');
+  canvas.style.display = known.length ? '' : 'none';
+  document.getElementById('closest-empty').textContent = known.length
+    ? (older ? `Plus ${older} older quiet window(s), logged before closest calls were recorded.` : '')
+    : quiet.length ? 'These quiet windows are older: closest calls are recorded from the next run on.'
+    : 'No quiet windows for this filter.';
+  if (!known.length) return;
+  CHART_INSTANCES.closest = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: CLOSEST_CALL_ORDER.map(reasonLabel),
+      datasets: [{ data: CLOSEST_CALL_ORDER.map(r => known.filter(q => q.reason === r).length),
+                   backgroundColor: BLUE + 'cc', borderColor: BLUE, borderWidth: 1 }]
+    },
+    options: {
+      indexAxis: 'y',
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => `${ctx.raw} window(s)` } } },
+      scales: { x: { beginAtZero: true, ticks: { stepSize: 1 } } }
+    }
+  });
+}
+
 function renderNearMissTable(skipped) {
   const misses = nearMisses(skipped).slice(-30).reverse();
   const box = document.getElementById('near-miss-table');
@@ -777,7 +844,7 @@ function renderSessions(sessions) {
   const box = document.getElementById('sessions-table');
   if (!sessions.length) { box.innerHTML = '<div class="empty">No finished sessions yet.</div>'; return; }
   const when = s => new Date(String(s || '').replace(' ', 'T'));
-  let html = '<table><thead><tr><th>Started</th><th>Length</th><th>Balance</th><th>Real P&L</th><th>Tracked P&L</th><th>Drift</th><th>Trades</th><th>W / L</th><th>Win Rate</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Started</th><th>Length</th><th>Balance</th><th>Real P&L</th><th>Tracked P&L</th><th>Drift</th><th>Fees</th><th>Trades</th><th>W / L</th><th>Win Rate</th></tr></thead><tbody>';
   sessions.forEach(s => {
     const mins = (when(s.end_time) - when(s.start_time)) / 60000;
     const length = Number.isFinite(mins) ? (mins >= 60 ? `${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m` : `${Math.round(mins)}m`) : '';
@@ -790,6 +857,7 @@ function renderSessions(sessions) {
       <td class="${real >= 0 ? 'won' : 'lost'}" style="font-weight:600">${money(real)}</td>
       <td>${money(tracked)}</td>
       <td class="${Math.abs(drift) >= 0.5 ? 'lost' : 'muted'}" title="Real minus tracked P&L">${money(drift)}</td>
+      <td class="muted">${s.fees !== undefined && s.fees !== '' ? '$' + parseFloat(s.fees).toFixed(2) : ''}</td>
       <td>${trades}</td>
       <td>${esc(s.wins || 0)} / ${esc(s.losses || 0)}</td>
       <td>${trades ? parseFloat(s.win_rate || 0).toFixed(0) + '%' : ''}</td>
@@ -806,7 +874,7 @@ function renderTradesTable(trades) {
   trades.forEach(t => { running += parseFloat(t.profit || 0); cumBal.push(running); });
   const startIdx = Math.max(0, trades.length - 20);
   const recent = trades.slice(-20).reverse();
-  let html = '<table><thead><tr><th>Time</th><th>Ver</th><th>Side</th><th>BTC Open</th><th>BTC Move</th><th>Entry</th><th>Cost</th><th>Shares</th><th>Result</th><th>Profit</th><th>Return</th><th>Portfolio</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Time</th><th>Ver</th><th>Side</th><th>BTC Open</th><th>BTC Move</th><th>Entry</th><th>Cost</th><th>Fee</th><th>Shares</th><th>Result</th><th>Profit</th><th>Return</th><th>Portfolio</th></tr></thead><tbody>';
   recent.forEach((t, i) => {
     const won = t.won_resolution === 'True';
     const profit = parseFloat(t.profit || 0);
@@ -834,6 +902,7 @@ function renderTradesTable(trades) {
       <td><span class="${finalColor}">${finalMove}</span></td>
       <td>$${parseFloat(t.entry_price).toFixed(2)}</td>
       <td>$${parseFloat(t.entry_cost).toFixed(2)}</td>
+      <td class="muted">${t.fee !== undefined && t.fee !== '' ? '$' + parseFloat(t.fee).toFixed(3) : ''}</td>
       <td>${parseFloat(t.entry_shares).toFixed(0)}</td>
       <td class="${won ? 'won' : 'lost'}">${won ? 'WIN' : 'LOSS'}</td>
       <td class="${profit >= 0 ? 'won' : 'lost'}">$${profit >= 0 ? '+' : ''}${profit.toFixed(2)}</td>
@@ -869,8 +938,8 @@ function showTradeDetail(row, scroll = true) {
   const time = cells[0].textContent;
   const side = cells[2].textContent;
   const entry = cells[5].textContent;
-  const result = cells[8].textContent;
-  const profit = cells[9].textContent;
+  const result = cells[9].textContent;
+  const profit = cells[10].textContent;
 
   document.getElementById('detail-title').textContent = `${side} ${entry} @ ${time}`;
   document.getElementById('detail-sub').textContent = `${result} ${profit} | ${ticks.length} ticks recorded`;
@@ -961,6 +1030,7 @@ function renderAll(trades, skipped) {
   renderEdge(trades);
   renderSkippedBar(skipped);
   renderSkippedPie(skipped);
+  renderClosestCalls(skipped);
   renderNearMissTable(skipped);
   renderTradesTable(trades);
   renderSessions(ALL_SESSIONS);
