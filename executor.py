@@ -63,6 +63,15 @@ def _rejection_reason(code) -> str:
     return f"rejected_{c}" if c.replace("_", "").isalnum() and len(c) <= 30 else "rejected"
 
 
+def _is_no_match(err) -> bool:
+    """True for the server's refusal of a FAK/FOK order that found nothing to
+    match at or under its price cap ("no orders found to match with FAK
+    order..."): an ordinary no-fill, not a CLOB problem. The error carries no
+    code for it, so this goes by the message text, as the SDK itself does for
+    cancel-only mode."""
+    return "no orders found to match" in str(err).lower()
+
+
 def _optional_approval_targets() -> set:
     """Contracts whose approvals the bot doesn't need: Polymarket's perpetuals
     deposit contract and its auto-redeem operator (the bot redeems winnings
@@ -339,6 +348,10 @@ class Executor:
                                reason="rejected",
                                error=f"order not placed: {type(e).__name__}: {e}")
         except pm_errors.RequestRejectedError as e:  # refused by the server
+            if _is_no_match(e):
+                # REJECTED, not FAILED: the bot's CLOB halt counts only failures
+                return OrderResult(success=False, status=REJECTED, side="BUY", token_id=tok,
+                                   reason="no_fill", error=f"FAK order filled nothing: {e}")
             return OrderResult(success=False, status=FAILED, side="BUY", token_id=tok,
                                reason="api_error",
                                error=f"order not placed: {type(e).__name__}: {e}")
