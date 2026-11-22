@@ -7,6 +7,7 @@ Standard sections: **Strategy** (parameter/model/filter changes), **Bug fixes** 
 ## Unreleased
 
 ### Bug fixes
+- **A FAK buy that found nothing to match counted as a CLOB failure**: Polymarket refuses it with an HTTP error ("no orders found to match with FAK order"), which the executor logged as `api_error` and the bot counted toward the 3-failure CLOB halt, so three ordinary no-fills could halt trading with a false "CLOB HALTED". It's now a `no_fill` (rejected, not failed) and doesn't count toward the halt.
 - **A CSV schema change could delete an earlier archive**: the tracker renamed the old file to `*_pre_schema_change.csv`, overwriting one that already existed. Added columns are now filled in place (older rows blank); other header changes archive under a new name.
 - **A failed buy attempt could leave no reason**: every way an attempt can stop now logs a `signals.csv` row (`skipped_halted`, `skipped_health_check`, `skipped_loss_limit`, `skipped_no_market`, `skipped_too_late`, `buy_failed` with a reason such as `no_fill`). The executor returns that reason with each failed order. An "unknown fill" that turns out to have filled also gets a `traded` row.
 - **Quiet windows were logged at their last second**, when the market had settled, so the reason (usually "price out of range") said nothing about the entry window. The bot now logs the window's closest call: the entry-window moment that passed most checks, with the check it failed, at the vol in force then. No such row after an attempt, so no duplicate rows either.
